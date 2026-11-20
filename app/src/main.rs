@@ -150,7 +150,15 @@ fn pair_box(s: &Ui, t: Theme) -> Option<El> {
     // The input itself fills the box: a click anywhere in it focuses the field.
     let field = el().key("code-field").w(120.0).h(32.0).radius(radius::MD).fill(t.bg).border(1.0, t.card_border).center_y()
         .child(text_input(&s.code_input, type_::BODY).key("code-input").w_full().px(space::S2).py(6.0).label("페어링 코드").color(t.text).placeholder("000000", t.text_secondary)
-            .on_edit(|s: &mut Ui| &mut s.code_input).on_submit(submit));
+            .on_edit(|s: &mut Ui| &mut s.code_input).on_submit(submit)
+            // Codes are six digits: drop anything else as it is typed or pasted.
+            .on_input_change(|s: &mut Ui, _| {
+                let digits: String = s.code_input.text.chars().filter(char::is_ascii_digit).take(6).collect();
+                if digits != s.code_input.text {
+                    // In place (caret to the end): a new TextEdit would drop the field's focus.
+                    s.code_input.replace_text(digits);
+                }
+            }));
     Some(col().key("pair-box").w_full().gap(space::S2).padding(space::S3).radius(radius::MD).fill(t.card).border(1.0, t.card_border)
         .child(text(format!("{name}에 표시된 6자리 코드를 입력하세요")).font(type_::LABEL).color(t.text))
         .child(row().gap(space::S2).center_y().child(field)
@@ -330,5 +338,11 @@ mod tests {
             rt.frame(1.0 / 60.0);
         }
         assert_eq!(rt.state.code_input.text, "012");
+        rt.key(KeyEvent { key: Key::Text("a가-".into()), mods: Default::default() });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.code_input.text, "012", "letters are dropped");
+        rt.key(KeyEvent { key: Key::Text("34567".into()), mods: Default::default() });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.code_input.text, "012345", "and the code stops at six digits");
     }
 }
