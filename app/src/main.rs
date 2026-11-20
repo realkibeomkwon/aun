@@ -623,10 +623,12 @@ mod tests {
 
     #[test]
     fn a_status_message_goes_away_on_its_own() {
-        let mut ui = Ui::new(None, None);
-        ui.message = Some(("연결된 기기가 아니에요".into(), Instant::now() + MESSAGE_FOR));
-        let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        let mut rt = Runtime::new(Ui::new(None, None), view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        // A cold first frame took 15 s on a Windows CI runner: start the message's clock after it.
         rt.frame(0.0);
+        rt.state.message = Some(("연결된 기기가 아니에요".into(), Instant::now() + MESSAGE_FOR));
+        rt.invalidate();
+        rt.frame(1.0 / 60.0);
         assert!(rt.find("message").is_some(), "a fresh message shows");
         assert!(!rt.state.expire(), "and stays until its time");
         rt.state.message.as_mut().unwrap().1 = Instant::now() - Duration::from_millis(1);
