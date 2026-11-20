@@ -29,7 +29,6 @@ use crate::{clip, discovery};
 pub const PORT: u16 = 47810;
 const PING: Duration = Duration::from_secs(10);
 const DEAD: Duration = Duration::from_secs(35);
-const CODE_LIFE: Duration = Duration::from_secs(120);
 const CODE_TRIES: u32 = 3;
 const STACK: usize = 256 << 10;
 
@@ -79,7 +78,6 @@ struct Peer {
 
 struct Code {
     digits: String,
-    until: Instant,
     misses: u32,
 }
 
@@ -190,19 +188,19 @@ impl Node {
         self.0.clip_on.store(on, Ordering::Relaxed);
     }
 
-    /// Shows a fresh one-time code for a guest to type; valid for two minutes.
+    /// Shows a fresh one-time code for a guest to type. It stays valid until it pairs a device,
+    /// takes three wrong guesses, or is hidden.
     pub fn show_code(&self) -> String {
         let mut r = [0u8; 4];
         getrandom::fill(&mut r).expect("OS randomness");
         let digits = format!("{:06}", u32::from_le_bytes(r) % 1_000_000);
-        self.st().code = Some(Code { digits: digits.clone(), until: Instant::now() + CODE_LIFE, misses: 0 });
+        self.st().code = Some(Code { digits: digits.clone(), misses: 0 });
         (self.0.notify)(Note::Changed);
         digits
     }
 
-    /// The code on show and when it stops working.
-    pub fn code(&self) -> Option<(String, Instant)> {
-        self.st().code.as_ref().filter(|c| c.until > Instant::now()).map(|c| (c.digits.clone(), c.until))
+    pub fn code(&self) -> Option<String> {
+        self.st().code.as_ref().map(|c| c.digits.clone())
     }
 
     pub fn hide_code(&self) {
@@ -385,7 +383,7 @@ impl Node {
             }
             self.paired(remote, &name);
         } else if they_pair {
-            let code = self.st().code.as_ref().filter(|c| c.until > Instant::now()).map(|c| c.digits.clone()).ok_or_else(|| denied("no code"))?;
+            let code = self.code().ok_or_else(|| denied("no code"))?;
             let (s, msg) = Spake2::<Ed25519Group>::start_b(&Password::new(code.as_bytes()), &SpakeId::new(b"aun-guest"), &SpakeId::new(b"aun-host"));
             let Frame::Spake(theirs) = wire::read_frame(&mut r)? else { return Err(denied("spake")) };
             wire::write_frame(&mut w, &Frame::Spake(msg))?;

@@ -54,7 +54,7 @@ fn pair_send_and_reconnect() {
     assert!(host.peers().is_empty() && guest.peers().is_empty());
 
     // The right code pairs both sides and leaves the link up.
-    guest.pair(addr(&host), host.code().expect("one miss keeps the code").0);
+    guest.pair(addr(&host), host.code().expect("one miss keeps the code"));
     until("pairing", || connected(&host, &guest) && connected(&guest, &host));
     assert_eq!(host.code(), None, "a code works once");
     assert_eq!(host.peers()[0].name, "Guest");

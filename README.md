@@ -31,7 +31,7 @@ icon) to bring the window back.
   `[u32 len][u8 kind][payload]` packed into full Noise messages. One link per paired device.
   Frames: hello, spake, confirm, ping, clip, file start/data/end/abort. Pings every 10 s; 35 s of
   silence closes the link.
-- **Pairing**: the host shows a one-time code (2 minutes, 3 tries). SPAKE2 over the code yields a
+- **Pairing**: the host shows a one-time code (valid until used, hidden, or 3 wrong tries). SPAKE2 over the code yields a
   shared key; each side sends HMAC-SHA256(key, role ‖ Noise handshake hash), so a man in the middle
   fails and can't guess the code offline. The peer's static key is then pinned in `peers.txt`;
   unpaired keys are refused.

@@ -7,7 +7,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use aun_core::{Config, Id, Node, Note, PeerView};
 use rune::tok::{self, Theme, radius, space, type_};
@@ -26,7 +25,7 @@ struct Ui {
     node: Option<Node>,
     me: String,
     peers: Vec<PeerView>,
-    code: Option<(String, Instant)>,
+    code: Option<String>,
     /// The nearby device a code is being typed for, and the typing.
     pairing: Option<Id>,
     code_input: TextEdit,
@@ -183,24 +182,21 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
             s.refresh();
         }));
 
-    // A code past its time is hidden here; the wake set when it was shown redraws then.
-    let code = match s.code.as_ref().filter(|(_, until)| *until > Instant::now()).map(|(c, _)| c) {
+    let code = match &s.code {
         Some(c) => row().key("code").w_full().gap(space::S3).center_y().padding(space::S3).radius(radius::MD).fill(t.card).border(1.0, t.card_border)
             .child(col().grow(1.0).gap(2.0)
-                .child(text("다른 기기에서 이 코드를 입력하세요 (2분간 유효)").font(type_::LABEL).color(t.text_secondary))
+                .child(text("다른 기기에서 이 코드를 입력하세요").font(type_::LABEL).color(t.text_secondary))
                 .child(text(format!("{} {}", &c[..3], &c[3..])).key("code-digits").font(type_::TITLE).color(t.text)))
             .child(button("code-hide".into(), "닫기", t, false, |s, _| {
                 if let Some(n) = &s.node {
                     n.hide_code();
                 }
             })),
-        None => row().w_full().child(button("code-show".into(), "페어링 코드 표시", t, false, |s, tx| {
+        None => row().w_full().child(button("code-show".into(), "페어링 코드 표시", t, false, |s, _| {
             if let Some(n) = &s.node {
                 n.show_code();
             }
             s.refresh();
-            // Re-read when the code expires so it disappears on its own.
-            tx.wake_after(Duration::from_secs(121));
         })),
     };
 
@@ -246,7 +242,7 @@ fn demo(s: &mut Ui) {
     let peer = |n: u8, name: &str, paired, nearby, connected| PeerView { id: [n; 32], name: name.into(), addr: Some(([192, 168, 0, n], 47810).into()), paired, nearby, connected };
     s.me = "MacBook Pro".into();
     s.peers = vec![peer(1, "Windows 노트북", true, true, true), peer(2, "작업실 PC", true, false, false), peer(3, "Mac mini", false, true, false)];
-    s.code = Some(("482913".into(), Instant::now() + Duration::from_secs(120)));
+    s.code = Some("482913".into());
     s.pairing = Some([3; 32]);
     s.code_input = TextEdit::new("123 4");
     s.transfers = vec![
