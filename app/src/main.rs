@@ -149,11 +149,15 @@ fn pair_box(s: &Ui, t: Theme) -> Option<El> {
     };
     // The input itself fills the box: a click anywhere in it focuses the field.
     let field = el().key("code-field").w(120.0).h(32.0).radius(radius::MD).fill(t.bg).border(1.0, t.card_border).center_y()
-        .child(text_input(&s.code_input, type_::BODY).key("code-input").w_full().px(space::S2).py(6.0).label("페어링 코드").color(t.text).placeholder("000000", t.text_secondary)
+        .child(text_input(&s.code_input, type_::BODY).key("code-input").w_full().px(space::S2).py(6.0).label("페어링 코드").color(t.text).placeholder("000 000", t.text_secondary)
             .on_edit(|s: &mut Ui| &mut s.code_input).on_submit(submit)
-            // Codes are six digits: drop anything else as it is typed or pasted.
+            // Codes are six digits, shown "123 456" like the host shows them: drop anything else
+            // as it is typed or pasted. shortcut: the caret goes to the end after a reformat.
             .on_input_change(|s: &mut Ui, _| {
-                let digits: String = s.code_input.text.chars().filter(char::is_ascii_digit).take(6).collect();
+                let mut digits: String = s.code_input.text.chars().filter(char::is_ascii_digit).take(6).collect();
+                if digits.len() > 3 {
+                    digits.insert(3, ' ');
+                }
                 if digits != s.code_input.text {
                     // In place (caret to the end): a new TextEdit would drop the field's focus.
                     s.code_input.replace_text(digits);
@@ -244,7 +248,7 @@ fn demo(s: &mut Ui) {
     s.peers = vec![peer(1, "Windows 노트북", true, true, true), peer(2, "작업실 PC", true, false, false), peer(3, "Mac mini", false, true, false)];
     s.code = Some(("482913".into(), Instant::now() + Duration::from_secs(120)));
     s.pairing = Some([3; 32]);
-    s.code_input = TextEdit::new("12");
+    s.code_input = TextEdit::new("123 4");
     s.transfers = vec![
         Transfer { key: 1, label: "보고서.pdf → Windows 노트북".into(), done: 3 << 20, total: 8 << 20, finished: false, failed: false },
         Transfer { key: 2, label: "Windows 노트북 → 사진.zip".into(), done: 120 << 20, total: 120 << 20, finished: true, failed: false },
@@ -343,6 +347,13 @@ mod tests {
         assert_eq!(rt.state.code_input.text, "012", "letters are dropped");
         rt.key(KeyEvent { key: Key::Text("34567".into()), mods: Default::default() });
         rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.code_input.text, "012345", "and the code stops at six digits");
+        assert_eq!(rt.state.code_input.text, "012 345", "and the code stops at six digits, grouped 3 + 3");
+        rt.key(KeyEvent { key: Key::Backspace, mods: Default::default() });
+        rt.key(KeyEvent { key: Key::Backspace, mods: Default::default() });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.code_input.text, "012 3");
+        rt.key(KeyEvent { key: Key::Backspace, mods: Default::default() });
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.code_input.text, "012", "no trailing space once the second group is gone");
     }
 }
