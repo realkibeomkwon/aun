@@ -237,6 +237,11 @@ impl Node {
         }
     }
 
+    /// What discovery does with each announce from another device; public for tests.
+    pub fn saw(&self, id: Id, name: String, addr: SocketAddr) {
+        self.seen(id, name, addr, false);
+    }
+
     fn seen(&self, id: Id, name: String, addr: SocketAddr, is_new: bool) {
         let mut st = self.st();
         let p = st.peers.entry(id).or_default();
@@ -369,6 +374,9 @@ impl Node {
         let Frame::Hello { pair: they_pair, name } = wire::read_frame(&mut r)? else { return Err(denied("hello")) };
         let name = store::clean_name(&name);
 
+        // Marked paired only when the link registers below: in between, discovery would see a
+        // paired device with no link and dial a second one.
+        let mut just_paired = false;
         if let Some(code) = pair {
             let (s, msg) = Spake2::<Ed25519Group>::start_a(&Password::new(code.as_bytes()), &SpakeId::new(b"aun-guest"), &SpakeId::new(b"aun-host"));
             wire::write_frame(&mut w, &Frame::Spake(msg))?;
@@ -381,7 +389,7 @@ impl Node {
             if !verify(&k, b"H", &h, &c) {
                 return Err(denied("코드가 맞지 않아요"));
             }
-            self.paired(remote, &name);
+            just_paired = true;
         } else if they_pair {
             let code = self.code().ok_or_else(|| denied("no code"))?;
             let (s, msg) = Spake2::<Ed25519Group>::start_b(&Password::new(code.as_bytes()), &SpakeId::new(b"aun-guest"), &SpakeId::new(b"aun-host"));
@@ -405,7 +413,7 @@ impl Node {
             wire::write_frame(&mut w, &Frame::Confirm(confirm(&k, b"H", &h)))?;
             w.flush()?;
             self.st().code = None;
-            self.paired(remote, &name);
+            just_paired = true;
         } else if !self.st().peers.get(&remote).is_some_and(|p| p.paired) {
             return Err(denied("not paired"));
         }
@@ -413,25 +421,35 @@ impl Node {
         // Authenticated. Register, then run the writer on its own thread and read here.
         sock.set_read_timeout(Some(DEAD))?;
         let (tx, rx) = mpsc::sync_channel::<Frame>(4);
-        let conn = {
+        let (conn, dup) = {
             let mut st = self.st();
             st.next += 1;
             let conn = st.next;
             let initiator_id = if initiator { self.0.id } else { remote };
+            let link = Link { conn, initiator: initiator_id, tx: tx.clone(), sock: sock.try_clone()? };
             let p = st.peers.entry(remote).or_default();
             p.name = name.clone();
-            if let Some(old) = &p.link {
-                // Both sides dialled: both keep the link whose dialler has the smaller id. The same
-                // dialler again means it lost the old link (restart, sleep): the new one wins.
-                if old.initiator < initiator_id {
-                    return Err(denied("duplicate"));
-                }
+            p.paired |= just_paired;
+            // Both sides dialled: both keep the link whose dialler has the smaller id. The same
+            // dialler again means it lost the old link (restart, sleep): the new one wins.
+            let dup = p.link.as_ref().is_some_and(|old| old.initiator < initiator_id);
+            if !dup
+                && let Some(old) = p.link.replace(link)
+            {
                 let _ = old.sock.shutdown(std::net::Shutdown::Both);
             }
-            p.link = Some(Link { conn, initiator: initiator_id, tx: tx.clone(), sock: sock.try_clone()? });
-            conn
+            if just_paired {
+                self.save(&st);
+            }
+            (conn, dup)
         };
+        if just_paired {
+            (self.0.notify)(Note::Info(format!("{name}와(과) 페어링했어요")));
+        }
         (self.0.notify)(Note::Changed);
+        if dup {
+            return Ok(());
+        }
         let wsock = sock.try_clone()?;
         spawn("aun-write", move || writer(w, rx, wsock));
 
@@ -448,7 +466,13 @@ impl Node {
             }
         }
         (self.0.notify)(Note::Changed);
-        res
+        // Authenticated links end by closing; that is not a failed pairing.
+        if let Err(e) = res
+            && !matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
+        {
+            eprintln!("aun: link to {name}: {e}");
+        }
+        Ok(())
     }
 
     fn read_loop(&self, r: &mut impl Read, files: &mut Incoming) -> io::Result<()> {
@@ -470,16 +494,6 @@ impl Node {
                 _ => return Err(denied("unexpected frame")),
             }
         }
-    }
-
-    fn paired(&self, id: Id, name: &str) {
-        let mut st = self.st();
-        let p = st.peers.entry(id).or_default();
-        p.paired = true;
-        p.name = name.to_owned();
-        self.save(&st);
-        drop(st);
-        (self.0.notify)(Note::Info(format!("{name}와(과) 페어링했어요")));
     }
 }
 

@@ -120,3 +120,49 @@ fn throughput() {
     let _ = std::fs::remove_dir_all(dir("tp-host"));
     let _ = std::fs::remove_dir_all(src);
 }
+
+/// Discovery keeps announcing while a pairing completes. Sends made right after must neither
+/// fail nor find the device unconnected, and the pairing must not be reported as failed.
+#[test]
+fn sends_right_after_pairing_survive_discovery() {
+    for round in 0..10 {
+        let (host, _hn) = node(&format!("race-host-{round}"), "Host");
+        let (guest, gn) = node(&format!("race-guest-{round}"), "Guest");
+        let (hid, gid, haddr, gaddr) = (host.id(), guest.id(), addr(&host), addr(&guest));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let announce = |n: Node, id, a, stop: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    n.saw(id, "Peer".into(), a);
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+        let a = announce(host.clone(), gid, gaddr, stop.clone());
+        let b = announce(guest.clone(), hid, haddr, stop.clone());
+        guest.pair(haddr, host.show_code());
+        until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+        let src = dir(&format!("race-src-{round}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("f.bin");
+        std::fs::write(&file, vec![7u8; 2 << 20]).unwrap();
+        for _ in 0..5 {
+            guest.send_file(hid, file.clone());
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let (mut done, mut bad) = (0, Vec::new());
+        let end = Instant::now() + Duration::from_secs(10);
+        while done < 5 && Instant::now() < end {
+            match gn.recv_timeout(Duration::from_millis(200)) {
+                Ok(Note::Transfer { finished: true, failed: false, .. }) => done += 1,
+                Ok(n @ Note::Transfer { failed: true, .. }) | Ok(n @ Note::Info(_)) => bad.push(n),
+                _ => {}
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = (a.join(), b.join());
+        bad.retain(|n| !matches!(n, Note::Info(m) if m.contains("페어링했어요")));
+        assert!(bad.is_empty() && done == 5, "round {round}: {done}/5 done, {bad:?}");
+    }
+}
