@@ -1,0 +1,9 @@
+[package]
+name = "aun"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+aun-core = { path = "../crates/aun-core" }
+# No ogg audio or SVG: Aun plays and draws neither.
+rune = { workspace = true, default-features = false, features = ["accessibility", "embedded-fonts", "metal-backend", "native-file-dialog"] }

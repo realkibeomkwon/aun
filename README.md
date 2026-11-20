@@ -1,1 +1,43 @@
 # aun
+
+A Mac and a Windows PC working as one desk: pair them once with a 6-digit code, then clipboard
+text stays in sync and files dropped on a device land in its Downloads folder. Rust, with a
+[Rune](https://github.com/anomalyco/rune) UI. Inspired by [TwinDesk](https://github.com/inukaasith/twindesk);
+no code or protocol is shared with it.
+
+## Run
+
+```sh
+cargo run --release -p aun
+```
+
+Build on each machine (`cargo build --release -p aun`, Windows needs the MSVC build tools).
+Allow Aun through the firewall on first launch: TCP **47810** (links) and UDP **47811** (discovery).
+
+Closing the window keeps sync running and gives the GPU back. Launch Aun again (or click the Dock
+icon) to bring the window back.
+
+## Layout
+
+- `crates/aun-core`: the engine, no UI. Discovery, pairing, encrypted links, clipboard, files.
+  `cargo test -p aun-core` pairs two nodes over loopback and sends a 3 MB file.
+- `app`: the Rune window. `cargo run -p aun -- --snap aun.png --scene demo` renders it headless.
+
+## Protocol
+
+- **Discovery**: UDP broadcast on 47811 every 3 s: `AUN1 | id[32] | tcp port u16 | name_len u8 | name`.
+  The id is the device's X25519 static public key. A new device is answered at once.
+- **Link**: TCP 47810, `Noise_XX_25519_ChaChaPoly_BLAKE2s`, then a byte stream of frames
+  `[u32 len][u8 kind][payload]` packed into full Noise messages. One link per paired device.
+  Frames: hello, spake, confirm, ping, clip, file start/data/end/abort. Pings every 10 s; 35 s of
+  silence closes the link.
+- **Pairing**: the host shows a one-time code (2 minutes, 3 tries). SPAKE2 over the code yields a
+  shared key; each side sends HMAC-SHA256(key, role ‖ Noise handshake hash), so a man in the middle
+  fails and can't guess the code offline. The peer's static key is then pinned in `peers.txt`;
+  unpaired keys are refused.
+- **Files**: 256 KiB chunks, received as `name.part` and renamed when complete. Names from the
+  network are reduced to one safe component (no paths, no Windows reserved names) and made unique.
+- **Clipboard**: text only, up to 1 MiB. The OS change counter is polled every 300 ms
+  (`GetClipboardSequenceNumber`, `NSPasteboard.changeCount`); text is read only when it moved.
+
+State lives in `%APPDATA%\Aun` or `~/Library/Application Support/Aun`.

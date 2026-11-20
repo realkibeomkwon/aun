@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/aun-core", "app"]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+rune = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+
+# Rune's vendored crates; cargo doesn't inherit patches from a dependency (see rune's crates/rune/README.md).
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
