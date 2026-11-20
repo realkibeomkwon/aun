@@ -10,7 +10,7 @@ CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovern
 | C. 비밀번호 클립보드 제외 | 완료 | `5c4a2c9` | 이름 있는 페이스트보드로 Concealed/Transient 판정, Windows 플래그 판정 | 실제 비밀번호 관리자에서 복사 |
 | D. 클립보드 이미지 | 완료 | `10ed197` | 프레임 왕복, 종류별 크기 상한, PNG 왕복, 압축 폭탄 거부, 실제 스크린숏 인코딩 시간 | 두 기기 사이 실제 이미지 복사 |
 | E. 파일 받기 개선 | 완료 | `77e084f` | 취소 양방향 통합 테스트(`.part` 없음, 링크 유지), 80개 동시 전송, 스크롤, 헤드리스 PNG | "Finder/탐색기에서 보기" 실제 클릭, 폴더 선택 대화상자 |
-| F. 연결 견고성 | 대기 | | | |
+| F. 연결 견고성 | 완료 | `ebab287` | 브로드캐스트 주소 계산, 이 Mac 인터페이스 목록, 주소로 페어링한 기기의 자동 재연결(탐색 끔), 주소 입력 UI | 실제 두 네트워크, 실제 절전/해제, Windows `GetAdaptersAddresses` 실행(CI만) |
 | G. 성능·메모리 측정 | 대기 | | | |
 | H. KVM 설계 | 대기 | | | |
 
@@ -97,3 +97,22 @@ CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovern
   - 헤드리스 PNG에 취소 버튼, Finder에서 보기 버튼, 폴더 줄이 보이고 접근성 경고 없음.
 - 확인하지 못한 것: "Finder/탐색기에서 보기" 클릭(사용자 화면에 Finder 창이 뜨므로 실행하지 않았다), 폴더 선택 대화상자, Windows `explorer /select,` 동작(CI 컴파일만), 보내는 쪽이 취소했을 때 받는 쪽 줄은 "취소됨"이 아니라 "실패"로 보인다(`FileAbort`가 읽기 오류와 같은 프레임이라 구분하지 않았다).
 - 사용자가 해 볼 것: 큰 파일을 보내는 중에 받는 쪽에서 "취소" → 받은 폴더에 `.part`가 없는지. 파일 20~30개를 한꺼번에 끌어다 놓기. 받은 줄의 "Finder에서 보기". "폴더 변경"으로 바탕화면을 고르고 다시 받기, 앱을 껐다 켜도 유지되는지.
+
+## F. 연결 견고성
+
+- 바뀐 것
+  - 인터페이스별 directed broadcast: 3초마다 255.255.255.255에 더해, 켜져 있고 루프백이 아닌 IPv4 인터페이스마다 `주소 | !넷마스크`로 보낸다. 목록은 macOS `getifaddrs`, Windows `GetAdaptersAddresses`. /31, /32(점대점, Tailscale 같은 VPN)는 브로드캐스트가 없으므로 뺀다. 목록은 매번 다시 읽어 Wi-Fi 변화를 따라간다.
+  - IP로 페어링: 기기 목록 아래 "목록에 없나요? IP 주소로 페어링" 입력란. `192.168.0.5` 또는 `주소:포트`. 페어링 박스가 같은 코드 입력 흐름으로 열린다. 탐색이 보지 못한 기기를 주소로 페어링하면, 건 쪽이 그 주소를 `peers.txt` 셋째 칸에 저장하고(예전 형식 파일도 그대로 읽는다), 링크가 끊겨 있으면 5초마다 다시 건다(`aun-keep` 스레드).
+  - 절전 해제: 같은 스레드가 5초마다 벽시계(`SystemTime`)와 단조 시계(`Instant`)의 경과 차이를 본다. 벽시계가 10초 넘게 앞서면(macOS `Instant`는 `CLOCK_UPTIME_RAW`라 잠자는 동안 멈춘다) 잠들었다 깬 것으로 보고 모든 링크를 닫는다. 그러면 다음 탐색 알림(3초 이내)이나 재다이얼이 바로 새 링크를 만든다.
+  - 이것이 필요한 이유(코드로 분석, 실기기 미재현): 잠든 쪽은 깨어난 뒤에도 죽은 링크를 들고 있어 35초 무응답 전까지 다시 걸지 않는다. 그 사이 상대가 걸어 오면, 기존 링크를 건 쪽의 id가 더 작을 때 새 링크가 중복으로 버려진다(`dup` 규칙). 그래서 깨어난 뒤 최대 35초 이상 끊길 수 있다.
+- 확인한 것
+  - `directed_broadcasts_set_the_host_bits`, `this_machine_has_a_broadcast_address`: 이 Mac은 `[(192.168.0.4, /24), (192.168.0.8, /24), (100.98.146.73, /32)]` → `[192.168.0.255]`(이더넷과 Wi-Fi가 같은 서브넷, Tailscale은 제외). CI 러너에서도 같은 테스트가 돈다.
+  - `a_device_paired_by_address_reconnects_without_discovery`: 탐색을 끈 두 노드를 주소로 페어링하면 `peers.txt`에 주소가 남고, 게스트를 다시 시작하면 아무 호출 없이 다시 연결된다(변경 전에는 연결되지 않아 시간 초과로 실패한다).
+  - `a_typed_address_opens_the_code_box_for_it`: 입력란 클릭 → 주소 입력 → 페어링 버튼 → 코드 박스가 그 주소로 열림. `typed_addresses_take_aun_s_port_unless_given`, `a_sleep_shows_as_wall_time_running_ahead`.
+  - `peers.txt` 새 형식과 예전 형식 읽기(`identity_and_peers_persist`에 추가).
+- 확인하지 못한 것: 서로 다른 두 네트워크(이더넷/Wi-Fi가 다른 서브넷)에서 실제 탐색, 실제 절전과 해제, Windows에서 `Instant`가 잠자는 동안 멈추는지(멈추지 않으면 Windows에서는 감지가 일어나지 않고 예전처럼 35초 무응답으로 끊긴다), Windows `GetAdaptersAddresses` 결과(CI 테스트로만).
+- 사용자가 해 볼 것: Mac을 잠자기 → 1분 뒤 깨우고 Windows 쪽 "연결됨"까지 걸리는 시간(로그 `woke after N s asleep: closing links`, `link ... up`). Windows 노트북을 잠자기/깨우기로도 같은 시간 확인. Tailscale 주소(100.x)를 입력해 페어링해 보기(같은 LAN이 아니어도 된다).
+
+### CI에서 고친 테스트
+
+- `a_status_message_goes_away_on_its_own`(기존 테스트)이 Windows CI 한 번(작업 D 커밋)에서 실패했다. 로그 타임스탬프를 보면 Runtime을 쓰는 테스트 셋이 모두 시작 후 15.4초에 함께 끝났고, 앱 코드는 0.28초에 끝난 직전 실행과 같았다. 첫 프레임이 러너에서 15초 걸려 5초짜리 메시지가 확인 전에 만료된 것이다. 메시지 시계를 첫 프레임 뒤에 시작하도록 바꿨다(`4834688`). 단언은 하나도 빼지 않았다. 첫 프레임이 왜 15초 걸렸는지(러너의 글꼴 캐시 등)는 확인하지 못했다.
