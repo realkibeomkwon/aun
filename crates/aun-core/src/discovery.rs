@@ -41,7 +41,7 @@ pub fn decode(b: &[u8]) -> Option<(Id, u16, String)> {
 pub fn run(me: Id, tcp_port: u16, name: String, mut seen: impl FnMut(Id, String, SocketAddr, bool), mut lost: impl FnMut(Id)) {
     let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PORT)) {
         Ok(s) => s,
-        Err(e) => return eprintln!("aun: discovery off, UDP {PORT}: {e}"),
+        Err(e) => return crate::log(format_args!("discovery off, UDP {PORT}: {e}")),
     };
     let _ = sock.set_broadcast(true);
     let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));

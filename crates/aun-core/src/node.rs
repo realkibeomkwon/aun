@@ -112,6 +112,7 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) {
 impl Node {
     pub fn start(cfg: Config, notify: impl Fn(Note) + Send + Sync + 'static) -> io::Result<Node> {
         std::fs::create_dir_all(&cfg.dir)?;
+        crate::log_to(cfg.dir.join("aun.log"));
         let me = store::identity(&cfg.dir)?;
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, cfg.port)).or_else(|_| TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)))?;
         let port = listener.local_addr()?.port();
@@ -259,8 +260,9 @@ impl Node {
         if dial {
             let n = self.clone();
             spawn("aun-dial", move || {
-                if let Ok(sock) = TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
-                    n.clone().run_link(sock, true, None);
+                match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                    Ok(sock) => n.clone().run_link(sock, true, None),
+                    Err(e) => crate::log(format_args!("dial {addr}: {e}")),
                 }
                 n.st().dialing.remove(&id);
             });
@@ -353,10 +355,9 @@ impl Node {
     fn run_link(self, sock: TcpStream, initiator: bool, pair: Option<String>) {
         let peer_addr = sock.peer_addr().ok();
         if let Err(e) = self.link(sock, initiator, pair.clone()) {
+            crate::log(format_args!("link {peer_addr:?} (we dialled: {initiator}) refused before it was up: {e}"));
             if pair.is_some() {
                 (self.0.notify)(Note::Info(format!("페어링 실패: {e}")));
-            } else if e.kind() != io::ErrorKind::UnexpectedEof && e.kind() != io::ErrorKind::ConnectionReset {
-                eprintln!("aun: link {peer_addr:?}: {e}");
             }
         }
     }
@@ -367,7 +368,11 @@ impl Node {
         let (t, h, remote) = handshake(&sock, &self.0.key, initiator)?;
         let t = Arc::new(t);
         let mut w = SealWriter::new(t.clone(), sock.try_clone()?);
-        let mut r = OpenReader::new(t, BufReader::with_capacity(128 << 10, sock.try_clone()?));
+        // The timeout goes on the handle that reads: on Windows a duplicated socket handle kept
+        // the handshake's 10 s, which raced the peer's 10 s pings and closed idle links.
+        let rsock = sock.try_clone()?;
+        rsock.set_read_timeout(Some(DEAD))?;
+        let mut r = OpenReader::new(t, BufReader::with_capacity(128 << 10, rsock));
 
         wire::write_frame(&mut w, &Frame::Hello { pair: pair.is_some(), name: self.0.name.clone() })?;
         w.flush()?;
@@ -419,7 +424,6 @@ impl Node {
         }
 
         // Authenticated. Register, then run the writer on its own thread and read here.
-        sock.set_read_timeout(Some(DEAD))?;
         let (tx, rx) = mpsc::sync_channel::<Frame>(4);
         let (conn, dup) = {
             let mut st = self.st();
@@ -436,6 +440,7 @@ impl Node {
             if !dup
                 && let Some(old) = p.link.replace(link)
             {
+                crate::log(format_args!("link {} to {name} replaces link {}", conn, old.conn));
                 let _ = old.sock.shutdown(std::net::Shutdown::Both);
             }
             if just_paired {
@@ -447,9 +452,13 @@ impl Node {
             (self.0.notify)(Note::Info(format!("{name}와(과) 페어링했어요")));
         }
         (self.0.notify)(Note::Changed);
+        let peer_addr = sock.peer_addr().ok();
         if dup {
+            crate::log(format_args!("link {conn} to {name} at {peer_addr:?} dropped: a link dialled by the smaller id is up"));
             return Ok(());
         }
+        crate::log(format_args!("link {conn} to {name} at {peer_addr:?} up (we dialled: {initiator})"));
+        let up = Instant::now();
         let wsock = sock.try_clone()?;
         spawn("aun-write", move || writer(w, rx, wsock));
 
@@ -467,11 +476,8 @@ impl Node {
         }
         (self.0.notify)(Note::Changed);
         // Authenticated links end by closing; that is not a failed pairing.
-        if let Err(e) = res
-            && !matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted)
-        {
-            eprintln!("aun: link to {name}: {e}");
-        }
+        let why = res.err().map_or_else(|| "closed".into(), |e| format!("{:?}: {e}", e.kind()));
+        crate::log(format_args!("link {conn} to {name} down after {:.1} s: {why}", up.elapsed().as_secs_f64()));
         Ok(())
     }
 
@@ -551,7 +557,8 @@ fn writer(mut w: SealWriter<TcpStream>, rx: Receiver<Frame>, sock: TcpStream) {
             w.flush()?;
         }
     })();
-    if res.is_err() {
+    if let Err(e) = res {
+        crate::log(format_args!("writer to {:?} stopped: {:?}: {e}", sock.peer_addr().ok(), e.kind()));
         let _ = sock.shutdown(std::net::Shutdown::Both);
     }
 }

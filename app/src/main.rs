@@ -327,7 +327,7 @@ fn main() {
         match Node::start(cfg, move |note| h.update(move |s: &mut Ui, tx| s.apply(note, tx))) {
             Ok(n) => Some(n),
             Err(e) => {
-                eprintln!("aun: {e}");
+                aun_core::log(format_args!("start: {e}"));
                 None
             }
         }
