@@ -11,8 +11,8 @@ CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovern
 | D. 클립보드 이미지 | 완료 | `10ed197` | 프레임 왕복, 종류별 크기 상한, PNG 왕복, 압축 폭탄 거부, 실제 스크린숏 인코딩 시간 | 두 기기 사이 실제 이미지 복사 |
 | E. 파일 받기 개선 | 완료 | `77e084f` | 취소 양방향 통합 테스트(`.part` 없음, 링크 유지), 80개 동시 전송, 스크롤, 헤드리스 PNG | "Finder/탐색기에서 보기" 실제 클릭, 폴더 선택 대화상자 |
 | F. 연결 견고성 | 완료 | `ebab287` | 브로드캐스트 주소 계산, 이 Mac 인터페이스 목록, 주소로 페어링한 기기의 자동 재연결(탐색 끔), 주소 입력 UI | 실제 두 네트워크, 실제 절전/해제, Windows `GetAdaptersAddresses` 실행(CI만) |
-| G. 성능·메모리 측정 | 대기 | | | |
-| H. KVM 설계 | 대기 | | | |
+| G. 성능·메모리 측정 | 완료 | `98e70c7` | 프로파일(암호화가 바쁜 샘플의 약 80%), AES-GCM 전환으로 Mac 루프백 2배, 알려진 답 테스트, 메모리·CPU·깨어남 측정 | Windows 실기기 속도·메모리, 실제 네트워크 속도 |
+| H. KVM 설계 | 완료(문서) | `ab9068b` | `docs/kvm-design.md` | 구현 없음(설계 문서만) |
 
 ## A. CI
 
@@ -116,3 +116,59 @@ CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovern
 ### CI에서 고친 테스트
 
 - `a_status_message_goes_away_on_its_own`(기존 테스트)이 Windows CI 한 번(작업 D 커밋)에서 실패했다. 로그 타임스탬프를 보면 Runtime을 쓰는 테스트 셋이 모두 시작 후 15.4초에 함께 끝났고, 앱 코드는 0.28초에 끝난 직전 실행과 같았다. 첫 프레임이 러너에서 15초 걸려 5초짜리 메시지가 확인 전에 만료된 것이다. 메시지 시계를 첫 프레임 뒤에 시작하도록 바꿨다(`4834688`). 단언은 하나도 빼지 않았다. 첫 프레임이 왜 15초 걸렸는지(러너의 글꼴 캐시 등)는 확인하지 못했다.
+
+## G. 성능과 메모리 측정
+
+측정 환경: Mac mini, Apple M4 Pro, macOS 27.3, release 빌드. 사용자가 실행 중인 Aun과 설정을 건드리지 않도록 `HOME=<스크래치>`로 별도 인스턴스를 띄웠다(사용자 Aun이 47810/47811을 쓰고 있어 이 인스턴스는 임의 포트, 탐색 꺼짐).
+
+### 메모리와 유휴 비용
+
+| 상태 | phys_footprint | 유휴 CPU | 컨텍스트 전환/s | 비고 |
+|---|---|---|---|---|
+| 창 열림, 아무것도 안 함 | 28 MB | 0.1% 미만(30 s에 0.02 s) | 약 119 | |
+| `--background`(창을 한 번도 안 염) | 14 MB | 0.1% 미만 | 약 49 | 로그인 시 실행 상태 |
+| 클립보드 폴링만 돌리는 빈 프로세스 | | 0% | 약 5.8 | 잠만 자는 프로세스는 약 1 |
+| 노드 둘(링크 없음) → 링크 하나 추가 | | 0% | 14.2 → 14.7 | 링크 하나 유지 비용 약 0.5/s |
+
+- 창을 닫았을 때(`release_gpu_when_closed`)는 창을 연 뒤 닫는 조작이 필요한데, 접근성 권한이 없어 클릭할 수 없었다. 가장 가까운 상태로 `--background`(GPU를 만든 적 없음)를 쟀다.
+- 앱 전체의 유휴 깨어남 중 Aun 코드(클립보드 폴링 약 5/s, `aun-keep` 0.2/s, 링크 핑 0.1/s)는 일부다. 나머지(창 열림 약 110/s, 백그라운드 약 43/s)는 메인 스레드(rune/AppKit) 쪽이다. 스레드별로 어디서 깨어나는지는 `sample`로는 알 수 없었고(대기 위치만 보인다), rune 내부 프로파일링은 이번 범위에서 하지 않았다. 다음에 볼 곳으로 남긴다.
+- 클립보드 300 ms 폴링을 OS 알림으로 바꿀지: 폴링 단독 비용이 초당 약 5회 깨어남, CPU 0%로 측정됐다. 백그라운드 앱 전체(약 49/s)의 10% 정도다. macOS에는 변경 알림이 없어 폴링이 표준이고, Windows `AddClipboardFormatListener`는 메시지 전용 창과 메시지 루프 스레드가 하나 더 필요하다. 절약분(초당 약 4회)에 비해 이득이 작아 **바꾸지 않았다**. 더 줄이고 싶다면 더 간단한 방법은 연결된 기기가 없을 때 폴링 간격을 늘리는 것이다(구현하지 않음).
+
+### 전송 속도: 병목과 개선
+
+- 프로파일(`sample`, 심볼을 남긴 release 빌드, 512 MiB 루프백): 바쁜 샘플 중 ChaCha20 454, Poly1305 252, `memmove` 29, 소켓 송수신 약 140. **암호화가 약 80%**였다. 원인은 Apple Silicon에서 RustCrypto `chacha20` 0.9가 `--cfg chacha20_force_neon` 없이는 스칼라 구현을 쓰고, `poly1305` 0.8에는 ARM 가속이 없기 때문이다. 청크 크기, `BufWriter` 크기, 버퍼 복사(`memmove` 3%)는 병목이 아니어서 바꾸지 않았다.
+- 메모리 안에서 암호화+프레이밍만 잰 결과(`seal_open_speed`, 64 MiB, 단위 MB/s):
+
+  | 링크 암호 | 봉인(보내기) | 열기(받기) |
+  |---|---|---|
+  | ChaChaPoly, 스칼라(이전) | 535–641 | 632–643 |
+  | ChaChaPoly, `chacha20_force_neon` | 660–665 | 838–839 |
+  | AES-GCM, 플래그 없음(소프트웨어 AES) | 219 | 218 |
+  | **AES-GCM, `aes_armv8` + `polyval_armv8`(채택)** | **2342–2423** | **2188–2279** |
+
+- 그래서 링크 암호를 `Noise_XX_25519_AESGCM_BLAKE2s`로 바꾸고, Apple Silicon 빌드가 하드웨어 AES/PMULL을 쓰도록 `.cargo/config.toml`에 `[target.aarch64-apple-darwin] rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]`을 넣었다. x86(Windows)은 AES-NI를 실행 중에 감지하므로 플래그가 필요 없다. 새 의존성 없음(snow의 기본 리졸버가 이미 `aes-gcm`을 빌드한다).
+- 플래그가 실제로 적용됐는지는 환경 변수 없이 일반 `target/`에서 다시 재서 확인했다(위 표의 채택 줄). 플래그가 빠지면 AES-GCM이 219 MB/s로 오히려 느려지므로, README에 `RUSTFLAGS` 환경 변수를 쓰면 이 설정이 무시된다고 적었다.
+- 루프백 512 MiB(디스크 쓰기 포함, 같은 Mac): 이전 461–499 MB/s → **921–987 MB/s**.
+- 해석: 실제 두 기기는 1 GbE 또는 Wi-Fi로 연결되고 그 상한은 약 110 MB/s 이하라, 두 암호 모두 그보다 빠르다. 따라서 **실기기 전송 시간은 거의 그대로**이고, 바뀌는 것은 전송에 드는 CPU다. 100 MB를 보내는 데 드는 암호화 CPU 시간이 Mac에서 보내는 쪽 약 0.16–0.19 s → 약 0.04 s, 받는 쪽 약 0.16 s → 약 0.045 s(약 1/4)로 줄어, 노트북의 배터리와 발열에 유리하다. 루프백이나 10 GbE에서만 속도 자체가 빨라진다.
+- 호환성: 암호가 바뀌어 이전 빌드와는 링크가 맺어지지 않는다(이전 빌드 쪽 로그에 `refused before it was up`). 작업 D와 E의 새 프레임도 이전 빌드가 받으면 링크를 끊으므로, **두 기기를 함께 업데이트해야 한다.** 페어링(`identity.key`, `peers.txt`)은 그대로 유효하다(키 교환은 여전히 25519).
+- 상호 운용: Mac(ARMv8 AES)과 PC(AES-NI)가 같은 바이트를 내는지 `this_machine_s_aes_gcm_matches_the_standard`가 확인한다. NIST 벡터(`gcmEncryptExtIV256.rsp`, aes-gcm 크레이트 테스트에서 가져옴)와 비교하고, snow의 nonce 배치(0 4바이트 + 카운터 big-endian)도 맞춘다. 두 OS의 CI에서 돈다.
+- 파일마다 `sync_all`: 이 Mac에서 1 MiB 파일 80개가 페어링 포함 0.70–0.82 s(파일당 10 ms 미만)였다. Windows CI 러너에서는 파일당 약 0.5 s가 걸렸다(80개 테스트가 30 s에 55개). 러너 디스크 한 대의 숫자라 충돌 안전성(이름 바꾸기 전 동기화)을 빼지 않았다. 실제 PC에서 파일 여러 개를 받을 때 느리면 이것을 먼저 의심한다.
+- 클립보드 이미지 인코딩(작업 D): 1920×1080 실제 화면 캡처를 9.6 ms에 802 KB PNG로, 디코딩 11.7 ms.
+
+### 측정 도구로 남긴 것
+
+- `cargo test --release -p aun-core --lib -- --ignored --nocapture seal_open_speed`: 두 암호의 메모리 내 속도(CI에서도 두 OS 모두 실행).
+- `cargo test --release -p aun-core --test link -- --ignored --nocapture throughput`: 루프백 512 MiB.
+- `... --ignored --exact clip::tests::poll_alone` / `sleep_alone`, `... --test link -- --ignored --exact idle_nodes` / `idle_link`: `top -l 2 -s 30 -pid <pid> -stats pid,cpu,csw,idlew`로 보는 유휴 비용.
+- `AUN_SHOT=<png> cargo test --release -p aun-core --lib -- --ignored --nocapture png_speed`: 실제 스크린숏으로 PNG 속도.
+
+### 확인하지 못한 것과 해 볼 것
+
+- Windows 실기기의 메모리와 유휴 비용, 실제 전송 속도(작업 관리자 › 세부 정보의 메모리, `aun.log`의 링크 시간).
+- 두 기기 사이 실제 파일 전송에서 CPU 사용률이 이전보다 낮은지(Mac: 활동 모니터의 Aun CPU %, 같은 큰 파일).
+
+## H. 마우스·키보드 공유(KVM) 설계
+
+- 바뀐 것: `docs/kvm-design.md`(코드 없음). 화면 가장자리 판정(화면 합집합의 바깥 경계, 받는 쪽이 돌아오기를 판정), macOS 캡처(`CGEventTap`, 접근성·입력 모니터링 권한, 탭 타임아웃 재활성화, 보안 입력)와 주입(`CGEventPost`, 델타 필드, 클릭 횟수), Windows 캡처(`WH_MOUSE_LL`/`WH_KEYBOARD_LL`, 주입 표식으로 자기 입력 거르기, 훅 시간 제한, 보안 데스크톱)와 주입(`SendInput`, 스캔 코드), 선에는 USB HID 사용 코드, 프레임 목록(1단계는 기존 TCP 링크, 쓰기 큐에 입력 우선순위), 2단계 UDP 경로(누적 이동량, 번호 붙인 이벤트), 지연 목표 표, 입력을 돌려주는 안전장치 7가지, 단계별 계획(1단계는 주입만 하는 "원격 트랙패드"), 테스트 계획.
+- TwinDesk 문서(`docs/protocol.md`, `docs/full-kvm.md`)는 GitHub API로 읽고 개념만 참고했다. 코드는 보지도 가져오지도 않았다.
+- 확인하지 못한 것: 문서의 모든 OS 동작(권한 흐름, 타임아웃 값, 커서 분리 복구)은 실기기 확인 대상으로 표시했다.
