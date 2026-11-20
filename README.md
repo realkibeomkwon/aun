@@ -29,7 +29,13 @@ Settings live in `settings.txt` in the state folder.
 ## Protocol
 
 - **Discovery**: UDP broadcast on 47811 every 3 s: `AUN1 | id[32] | tcp port u16 | name_len u8 | name`.
-  The id is the device's X25519 static public key. A new device is answered at once.
+  The id is the device's X25519 static public key. A new device is answered at once. Sent to
+  255.255.255.255 and to the directed broadcast address of every IPv4 interface that is up
+  (`getifaddrs`, `GetAdaptersAddresses`), so a Mac on Ethernet and Wi-Fi reaches both.
+- **By address**: where discovery doesn't reach, pair by typing the other device's IP. The guest
+  keeps that address in `peers.txt` and redials it every 5 s while the link is down.
+- **Sleep**: when the wall clock runs more than 10 s ahead of the monotonic one (the machine slept),
+  every link is closed at once so the next announce or redial replaces it.
 - **Link**: TCP 47810, `Noise_XX_25519_ChaChaPoly_BLAKE2s`, then a byte stream of frames
   `[u32 len][u8 kind][payload]` packed into full Noise messages. One link per paired device.
   Frames: hello, spake, confirm, ping, clip, clip image, file start/data/end/abort. Frames are at

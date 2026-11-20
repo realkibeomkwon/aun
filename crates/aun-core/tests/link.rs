@@ -256,3 +256,17 @@ fn a_cancelled_transfer_leaves_no_part_file() {
         std::fs::remove_file(dl.join("small.txt")).unwrap();
     }
 }
+
+/// Paired by a typed address on a network where discovery finds nothing: the guest keeps the
+/// address and, after a restart, reconnects on its own.
+#[test]
+fn a_device_paired_by_address_reconnects_without_discovery() {
+    let (host, _hn) = node("typed-host", "Host");
+    let (guest, _gn) = node("typed-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let saved = std::fs::read_to_string(dir("typed-guest").join("cfg").join("peers.txt")).unwrap();
+    assert!(saved.contains(&addr(&host).to_string()), "the typed address is saved: {saved}");
+    let (guest2, _g2) = restart("typed-guest", "Guest");
+    until("a reconnect nobody asked for", || connected(&guest2, &host));
+}

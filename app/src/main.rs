@@ -10,6 +10,7 @@ mod autostart;
 mod settings;
 mod tray;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -39,7 +40,10 @@ struct Ui {
     peers: Vec<PeerView>,
     code: Option<String>,
     /// The nearby device a code is being typed for, and the typing.
-    pairing: Option<Id>,
+    /// The device (its name and address) a code is being typed for.
+    pairing: Option<(String, SocketAddr)>,
+    /// An address typed for a device discovery can't find.
+    ip_input: TextEdit,
     code_input: TextEdit,
     transfers: Vec<Transfer>,
     /// A status line and when it goes away.
@@ -59,7 +63,7 @@ impl Ui {
         let settings = dir.as_deref().map(Settings::load).unwrap_or_default();
         let autostart = dir.is_some() && autostart::enabled();
         let mut ui = Ui {
-            node, me, peers: vec![], code: None, pairing: None, code_input: TextEdit::new(""), transfers: vec![], message: None, over: None,
+            node, me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, over: None,
             dir, settings, autostart, handle: None, tray: None,
         };
         ui.refresh();
@@ -204,9 +208,12 @@ fn peer_row(p: &PeerView, s: &Ui, t: Theme) -> El {
                 n.forget(id);
             }
         }));
-    } else if p.addr.is_some() && s.pairing != Some(id) {
+    } else if let Some(addr) = p.addr
+        && s.pairing.as_ref().is_none_or(|(_, a)| *a != addr)
+    {
+        let name = p.name.clone();
         r = r.child(button(format!("pair-{k}"), "페어링", t, true, move |s, _| {
-            s.pairing = Some(id);
+            s.pairing = Some((name.clone(), addr));
             s.code_input = TextEdit::new("");
         }));
     }
@@ -214,14 +221,12 @@ fn peer_row(p: &PeerView, s: &Ui, t: Theme) -> El {
 }
 
 fn pair_box(s: &Ui, t: Theme) -> Option<El> {
-    let id = s.pairing?;
-    let name = s.peers.iter().find(|p| p.id == id).map_or("기기", |p| p.name.as_str());
+    let (name, _) = s.pairing.as_ref()?;
     let submit = |s: &mut Ui, tx: &mut Tx| {
-        let Some(id) = s.pairing.take() else { return };
+        let Some((_, addr)) = s.pairing.take() else { return };
         let code: String = s.code_input.text.chars().filter(char::is_ascii_digit).collect();
-        let addr = s.peers.iter().find(|p| p.id == id).and_then(|p| p.addr);
-        match (&s.node, addr, code.len()) {
-            (Some(n), Some(addr), 6) => {
+        match (&s.node, code.len()) {
+            (Some(n), 6) => {
                 n.pair(addr, code);
                 s.say("페어링 중…", tx);
             }
@@ -249,6 +254,29 @@ fn pair_box(s: &Ui, t: Theme) -> Option<El> {
         .child(row().gap(space::S2).center_y().child(field)
             .child(button("pair-go".into(), "연결", t, true, submit))
             .child(button("pair-cancel".into(), "취소", t, false, |s, _| s.pairing = None))))
+}
+
+/// `192.168.0.5` or `192.168.0.5:47810`; Aun's port when none is given.
+fn parse_addr(s: &str) -> Option<SocketAddr> {
+    let s = s.trim();
+    s.parse().ok().or_else(|| Some(SocketAddr::new(s.parse::<std::net::IpAddr>().ok()?, aun_core::node::PORT)))
+}
+
+/// For networks where discovery doesn't reach (another subnet, a VPN, broadcasts blocked).
+fn by_address(s: &Ui, t: Theme) -> El {
+    let go = |s: &mut Ui, tx: &mut Tx| match parse_addr(&s.ip_input.text) {
+        Some(addr) => {
+            s.pairing = Some((addr.ip().to_string(), addr));
+            s.code_input = TextEdit::new("");
+            s.ip_input = TextEdit::new("");
+        }
+        None => s.say("IP 주소를 확인하세요 (예: 192.168.0.5)", tx),
+    };
+    let field = el().key("ip-field").grow(1.0).h(28.0).radius(radius::MD).fill(t.bg).border(1.0, t.card_border).center_y()
+        .child(text_input(&s.ip_input, type_::LABEL).key("ip-input").w_full().px(space::S2).py(4.0).label("상대 기기 IP 주소").color(t.text)
+            .placeholder("목록에 없나요? IP 주소로 페어링 (예: 192.168.0.5)", t.text_secondary)
+            .on_edit(|s: &mut Ui| &mut s.ip_input).on_submit(go));
+    row().key("by-address").w_full().gap(space::S2).center_y().child(field).child(button("ip-go".into(), "페어링", t, false, go))
 }
 
 fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
@@ -309,7 +337,7 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
 
     // Scrolls once a pile of transfers outgrows the window.
     let mut root = col().key("root").w_full().h_full().scroll(ScrollSpec { stick_bottom: false }).padding(space::S6).gap(space::S3).fill(t.bg)
-        .child(header).child(prefs).child(folder).child(code).child(list);
+        .child(header).child(prefs).child(folder).child(code).child(list).child(by_address(s, t));
     if let Some(b) = pair_box(s, t) {
         root = root.child(b);
     }
@@ -387,7 +415,7 @@ fn demo(s: &mut Ui) {
     s.me = "MacBook Pro".into();
     s.peers = vec![peer(1, "Windows 노트북", true, true, true), peer(2, "작업실 PC", true, false, false), peer(3, "Mac mini", false, true, false)];
     s.code = Some("482913".into());
-    s.pairing = Some([3; 32]);
+    s.pairing = Some(("Mac mini".into(), ([192, 168, 0, 3], 47810).into()));
     s.code_input = TextEdit::new("123 4");
     s.transfers = vec![
         Transfer { key: 1, label: "보고서.pdf → Windows 노트북".into(), path: "보고서.pdf".into(), incoming: false, done: 3 << 20, total: 8 << 20, finished: false, failed: false, cancelled: false },
@@ -505,7 +533,7 @@ mod tests {
     fn a_clicked_code_field_takes_typed_digits() {
         let mut ui = Ui::new(None, None);
         ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: Some(([10, 0, 0, 3], 47810).into()), paired: false, nearby: true, connected: false }];
-        ui.pairing = Some([3; 32]);
+        ui.pairing = Some(("PC".into(), ([10, 0, 0, 3], 47810).into()));
         let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
         rt.frame(0.0);
         // Anywhere in the box, not only on the placeholder's glyphs.
@@ -564,6 +592,33 @@ mod tests {
         }
         let (_, y) = rt.find("t-3").unwrap();
         assert!(y < 560.0, "scrolled into view: {y}");
+    }
+
+    #[test]
+    fn a_typed_address_opens_the_code_box_for_it() {
+        let mut rt = Runtime::new(Ui::new(None, None), view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        assert!(rt.find("pair-box").is_none());
+        let (x, y) = rt.find("ip-field").expect("address field");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.key(KeyEvent { key: Key::Text("100.98.146.73".into()), mods: Default::default() });
+        rt.frame(1.0 / 60.0);
+        let (x, y) = rt.find("ip-go").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.pairing, Some(("100.98.146.73".into(), ([100, 98, 146, 73], aun_core::node::PORT).into())));
+        assert!(rt.find("pair-box").is_some());
+    }
+
+    #[test]
+    fn typed_addresses_take_aun_s_port_unless_given() {
+        assert_eq!(parse_addr(" 192.168.0.5 "), Some(([192, 168, 0, 5], aun_core::node::PORT).into()));
+        assert_eq!(parse_addr("10.0.0.2:5000"), Some(([10, 0, 0, 2], 5000).into()));
+        assert_eq!(parse_addr("my-pc"), None);
+        assert_eq!(parse_addr("192.168.0"), None);
     }
 
     #[test]

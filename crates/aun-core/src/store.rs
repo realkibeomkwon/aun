@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 pub type Id = [u8; 32];
@@ -50,13 +51,28 @@ pub fn identity(dir: &Path) -> io::Result<Identity> {
     Ok(Identity { private: kp.private, id: kp.public.try_into().unwrap() })
 }
 
-pub fn load_peers(dir: &Path) -> HashMap<Id, String> {
+/// A paired device: its name, and the address the user typed for it, if discovery can't find it.
+pub type Saved = (String, Option<SocketAddr>);
+
+/// `peers.txt`: `id \t name [\t address]` per line.
+pub fn load_peers(dir: &Path) -> HashMap<Id, Saved> {
     let text = fs::read_to_string(dir.join("peers.txt")).unwrap_or_default();
-    text.lines().filter_map(|l| l.split_once('\t')).filter_map(|(id, name)| Some((unhex(id)?, name.to_owned()))).collect()
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let id = unhex(f.next()?)?;
+            Some((id, (f.next()?.to_owned(), f.next().and_then(|a| a.parse().ok()))))
+        })
+        .collect()
 }
 
-pub fn save_peers<'a>(dir: &Path, peers: impl Iterator<Item = (&'a Id, &'a String)>) -> io::Result<()> {
-    let text: String = peers.map(|(id, name)| format!("{}\t{}\n", hex(id), clean_name(name))).collect();
+pub fn save_peers<'a>(dir: &Path, peers: impl Iterator<Item = (&'a Id, &'a str, Option<SocketAddr>)>) -> io::Result<()> {
+    let text: String = peers
+        .map(|(id, name, addr)| match addr {
+            Some(a) => format!("{}\t{}\t{a}\n", hex(id), clean_name(name)),
+            None => format!("{}\t{}\n", hex(id), clean_name(name)),
+        })
+        .collect();
     write_atomic(&dir.join("peers.txt"), text.as_bytes())
 }
 
@@ -130,9 +146,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let a = identity(&dir).unwrap();
         assert_eq!(identity(&dir).unwrap().id, a.id);
-        let peers = HashMap::from([(a.id, "맥\t북\n".to_owned())]);
-        save_peers(&dir, peers.iter()).unwrap();
-        assert_eq!(load_peers(&dir)[&a.id], "맥북");
+        let typed: SocketAddr = "100.98.146.73:47810".parse().unwrap();
+        save_peers(&dir, [(&a.id, "맥\t북\n", None), (&[9; 32], "PC", Some(typed))].into_iter()).unwrap();
+        let back = load_peers(&dir);
+        assert_eq!(back[&a.id], ("맥북".to_owned(), None));
+        assert_eq!(back[&[9; 32]], ("PC".to_owned(), Some(typed)));
+        // A file from before addresses were kept still loads.
+        fs::write(dir.join("peers.txt"), format!("{}\tOld\n", hex(&a.id))).unwrap();
+        assert_eq!(load_peers(&dir)[&a.id], ("Old".to_owned(), None));
         fs::remove_dir_all(dir).unwrap();
     }
 }

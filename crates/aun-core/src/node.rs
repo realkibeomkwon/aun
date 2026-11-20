@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -31,6 +31,8 @@ const PING: Duration = Duration::from_secs(10);
 const DEAD: Duration = Duration::from_secs(35);
 const CODE_TRIES: u32 = 3;
 const STACK: usize = 256 << 10;
+/// How often paired devices at a typed address are redialled, and a wake from sleep looked for.
+const KEEP: Duration = Duration::from_secs(5);
 
 pub struct Config {
     pub dir: PathBuf,
@@ -76,6 +78,8 @@ struct Peer {
     nearby: bool,
     paired: bool,
     link: Option<Link>,
+    /// The address the user typed to pair, kept for networks where discovery doesn't reach.
+    typed: Option<SocketAddr>,
 }
 
 struct Code {
@@ -131,8 +135,8 @@ impl Node {
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, cfg.port)).or_else(|_| TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)))?;
         let port = listener.local_addr()?.port();
         let mut st = St::default();
-        for (id, name) in store::load_peers(&cfg.dir) {
-            st.peers.insert(id, Peer { name, paired: true, ..Default::default() });
+        for (id, (name, typed)) in store::load_peers(&cfg.dir) {
+            st.peers.insert(id, Peer { name, paired: true, typed, addr: typed, ..Default::default() });
         }
         let node = Node(Arc::new(Shared {
             key: me.private,
@@ -162,6 +166,9 @@ impl Node {
                 discovery::run(n.0.id, n.0.port, n.0.name.clone(), move |id, name, addr, is_new| n.seen(id, name, addr, is_new), move |id| lost.lost(id))
             });
         }
+
+        let n = node.clone();
+        spawn("aun-keep", move || n.keep());
 
         let (tx, rx) = mpsc::channel();
         *node.0.clip_tx.lock().unwrap() = Some(tx);
@@ -254,7 +261,7 @@ impl Node {
     }
 
     fn save(&self, st: &St) {
-        let paired = st.peers.iter().filter(|(_, p)| p.paired).map(|(id, p)| (id, &p.name));
+        let paired = st.peers.iter().filter(|(_, p)| p.paired).map(|(id, p)| (id, p.name.as_str(), p.typed));
         if let Err(e) = store::save_peers(&self.0.dir, paired) {
             (self.0.notify)(Note::Info(format!("페어링 정보를 저장하지 못했어요: {e}")));
         }
@@ -280,14 +287,52 @@ impl Node {
             (self.0.notify)(Note::Changed);
         }
         if dial {
-            let n = self.clone();
-            spawn("aun-dial", move || {
-                match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
-                    Ok(sock) => n.clone().run_link(sock, true, None),
-                    Err(e) => crate::log(format_args!("dial {addr}: {e}")),
-                }
-                n.st().dialing.remove(&id);
-            });
+            self.dial(id, addr);
+        }
+    }
+
+    /// Dials a paired peer; the caller has put it in `dialing`.
+    fn dial(&self, id: Id, addr: SocketAddr) {
+        let n = self.clone();
+        spawn("aun-dial", move || {
+            match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                Ok(sock) => n.clone().run_link(sock, true, None),
+                Err(e) => crate::log(format_args!("dial {addr}: {e}")),
+            }
+            n.st().dialing.remove(&id);
+        });
+    }
+
+    /// Every few seconds: redial paired devices at a typed address, and after the machine slept,
+    /// close every link at once. A link from before the sleep is usually dead but would hold its
+    /// place (and block a new one) until 35 s of silence; closed, the next announce or redial
+    /// brings it back in seconds.
+    fn keep(&self) {
+        let mut then = (SystemTime::now(), Instant::now());
+        loop {
+            thread::sleep(KEEP);
+            let wall = then.0.elapsed().unwrap_or_default();
+            if slept(wall, then.1.elapsed()) {
+                crate::log(format_args!("woke after {:.0} s asleep: closing links", wall.saturating_sub(then.1.elapsed()).as_secs_f64()));
+                self.close_links();
+            }
+            then = (SystemTime::now(), Instant::now());
+            let due: Vec<_> = {
+                let mut st = self.st();
+                let due: Vec<_> = st.peers.iter().filter(|(_, p)| p.paired && p.link.is_none()).filter_map(|(id, p)| Some((*id, p.typed?))).collect();
+                due.into_iter().filter(|(id, _)| st.dialing.insert(*id)).collect()
+            };
+            for (id, addr) in due {
+                self.dial(id, addr);
+            }
+        }
+    }
+
+    fn close_links(&self) {
+        for p in self.st().peers.values() {
+            if let Some(l) = &p.link {
+                let _ = l.sock.shutdown(std::net::Shutdown::Both);
+            }
         }
     }
 
@@ -530,6 +575,11 @@ impl Node {
             let p = st.peers.entry(remote).or_default();
             p.name = name.clone();
             p.paired |= just_paired;
+            // Paired by a typed address (discovery hasn't seen it): keep the address to redial.
+            if just_paired && initiator && !p.nearby {
+                p.typed = sock.peer_addr().ok();
+                p.addr = p.typed;
+            }
             // Both sides dialled: both keep the link whose dialler has the smaller id. The same
             // dialler again means it lost the old link (restart, sleep): the new one wins.
             let dup = p.link.as_ref().is_some_and(|old| old.initiator < initiator_id);
@@ -598,6 +648,12 @@ impl Node {
             }
         }
     }
+}
+
+/// Whether the wall clock ran well past the monotonic one, which stops while the machine sleeps
+/// (macOS `CLOCK_UPTIME_RAW`). A clock set forward by more than the margin also counts.
+pub fn slept(wall: Duration, mono: Duration) -> bool {
+    wall > mono + Duration::from_secs(10)
 }
 
 fn file_name(path: &Path) -> String {
@@ -796,6 +852,14 @@ mod tests {
         let n = i.write_message(&[], &mut m).unwrap();
         r.read_message(&m[..n], &mut out).unwrap();
         (i.into_stateless_transport_mode().unwrap(), r.into_stateless_transport_mode().unwrap())
+    }
+
+    #[test]
+    fn a_sleep_shows_as_wall_time_running_ahead() {
+        let s = Duration::from_secs;
+        assert!(!slept(s(5), s(5)), "awake");
+        assert!(!slept(s(12), s(5)), "a scheduling hiccup or small clock step");
+        assert!(slept(s(65), s(5)), "a minute asleep");
     }
 
     #[test]
