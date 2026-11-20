@@ -7,3 +7,12 @@ edition.workspace = true
 aun-core = { path = "../crates/aun-core" }
 # No ogg audio or SVG: Aun plays and draws neither.
 rune = { workspace = true, default-features = false, features = ["accessibility", "embedded-fonts", "metal-backend", "native-file-dialog"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The menu bar status item; the same versions Rune builds, so no second copy.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSResponder", "NSMenu", "NSMenuItem", "NSImage", "NSCell"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }

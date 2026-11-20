@@ -6,6 +6,10 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod autostart;
+mod settings;
+mod tray;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,8 +17,9 @@ use std::time::{Duration, Instant};
 const MESSAGE_FOR: Duration = Duration::from_secs(5);
 
 use aun_core::{Config, Id, Node, Note, PeerView};
+use settings::Settings;
 use rune::tok::{self, Theme, radius, space, type_};
-use rune::{App, AppSpec, Cx, El, FileDialogOptions, TextEdit, Tx, col, el, row, text, text_input};
+use rune::{App, AppHandle, AppSpec, Cx, El, FileDialogOptions, TextEdit, Tx, col, el, row, text, text_input};
 
 struct Transfer {
     key: u64,
@@ -36,23 +41,66 @@ struct Ui {
     transfers: Vec<Transfer>,
     /// A status line and when it goes away.
     message: Option<(String, Instant)>,
-    clip: bool,
     over: Option<Id>,
+    /// Where `settings` is saved; None in headless runs.
+    dir: Option<PathBuf>,
+    settings: Settings,
+    autostart: bool,
+    handle: Option<AppHandle<Ui>>,
+    tray: Option<tray::Tray>,
 }
 
 impl Ui {
-    fn new(node: Option<Node>) -> Ui {
+    fn new(node: Option<Node>, dir: Option<PathBuf>) -> Ui {
         let me = node.as_ref().map_or_else(|| "시작하지 못했어요".into(), |n| n.name().to_owned());
-        let mut ui = Ui { node, me, peers: vec![], code: None, pairing: None, code_input: TextEdit::new(""), transfers: vec![], message: None, clip: true, over: None };
+        let settings = dir.as_deref().map(Settings::load).unwrap_or_default();
+        let autostart = dir.is_some() && autostart::enabled();
+        let mut ui = Ui {
+            node, me, peers: vec![], code: None, pairing: None, code_input: TextEdit::new(""), transfers: vec![], message: None, over: None,
+            dir, settings, autostart, handle: None, tray: None,
+        };
         ui.refresh();
         ui
+    }
+
+    /// The one way clipboard sharing changes: the header button, the tray menu.
+    fn set_clip(&mut self, on: bool, tx: &mut Tx) {
+        if let Some(n) = &self.node {
+            n.set_clipboard(on);
+        }
+        self.settings.clipboard = on;
+        if let Some(t) = &self.tray {
+            t.set_clip(on);
+        }
+        self.save(tx);
+    }
+
+    fn set_dock(&mut self, on: bool, tx: &mut Tx) {
+        self.settings.dock = on;
+        if let Some(h) = &self.handle {
+            h.set_dock_icon(on);
+        }
+        self.save(tx);
+    }
+
+    fn set_autostart(&mut self, on: bool, tx: &mut Tx) {
+        match autostart::set(on) {
+            Ok(()) => self.autostart = on,
+            Err(e) => self.say(format!("자동 실행을 바꾸지 못했어요: {e}"), tx),
+        }
+    }
+
+    fn save(&mut self, tx: &mut Tx) {
+        let Some(dir) = &self.dir else { return };
+        if let Err(e) = self.settings.save(dir) {
+            self.say(format!("설정을 저장하지 못했어요: {e}"), tx);
+        }
     }
 
     fn refresh(&mut self) {
         if let Some(n) = &self.node {
             self.peers = n.peers();
             self.code = n.code();
-            self.clip = n.clipboard();
         }
     }
 
@@ -194,12 +242,18 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         .child(col().grow(1.0).gap(2.0)
             .child(text("Aun").font(type_::TITLE).color(t.text))
             .child(text(format!("이 기기: {}", s.me)).font(type_::LABEL).color(t.text_secondary)))
-        .child(button("clip".into(), if s.clip { "클립보드 공유 켜짐" } else { "클립보드 공유 꺼짐" }, t, s.clip, |s, _| {
-            if let Some(n) = &s.node {
-                n.set_clipboard(!n.clipboard());
-            }
-            s.refresh();
+        .child(button("clip".into(), if s.settings.clipboard { "클립보드 공유 켜짐" } else { "클립보드 공유 꺼짐" }, t, s.settings.clipboard, |s, tx| {
+            s.set_clip(!s.settings.clipboard, tx)
         }));
+    let mut prefs = row().key("prefs").w_full().gap(space::S2)
+        .child(button("autostart".into(), if s.autostart { "로그인 시 실행 켜짐" } else { "로그인 시 실행 꺼짐" }, t, s.autostart, |s, tx| {
+            s.set_autostart(!s.autostart, tx)
+        }));
+    if cfg!(target_os = "macos") {
+        prefs = prefs.child(button("dock".into(), if s.settings.dock { "Dock 아이콘 표시" } else { "Dock 아이콘 숨김" }, t, s.settings.dock, |s, tx| {
+            s.set_dock(!s.settings.dock, tx)
+        }));
+    }
 
     let code = match &s.code {
         Some(c) => row().key("code").w_full().gap(space::S3).center_y().padding(space::S3).radius(radius::MD).fill(t.card).border(1.0, t.card_border)
@@ -228,7 +282,7 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     }
 
     let mut root = col().key("root").w_full().h_full().padding(space::S6).gap(space::S3).fill(t.bg)
-        .child(header).child(code).child(list);
+        .child(header).child(prefs).child(code).child(list);
     if let Some(b) = pair_box(s, t) {
         root = root.child(b);
     }
@@ -305,34 +359,69 @@ unsafe extern "C" {
     fn libc_gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
 }
 
+/// macOS, Dock icon hidden: Rune's default reopen does nothing for an accessory app, so a launch
+/// from Finder or Spotlight opens the window here.
+fn reopen(s: &mut Ui, visible: bool, _: &mut Tx) -> bool {
+    if s.settings.dock || visible {
+        return false;
+    }
+    if let Some(h) = &s.handle {
+        h.open();
+    }
+    true
+}
+
 fn main() {
     if !rune::single_instance("dev.aun.desk") {
         return;
     }
-    let headless = std::env::args().any(|a| a.starts_with("--snap") || a.starts_with("--tree") || a.starts_with("--script"));
-    let app = App::new(AppSpec::<Ui> {
+    let args: Vec<String> = std::env::args().collect();
+    let headless = args.iter().any(|a| a.starts_with("--snap") || a.starts_with("--tree") || a.starts_with("--script"));
+    let dir = config_dir();
+    let settings = if headless { Settings::default() } else { Settings::load(&dir) };
+    let mut app = App::new(AppSpec::<Ui> {
         scenes: &[("demo", demo)],
         min_size: Some((420.0, 360.0)),
         poll: Some(|s, _, _| s.expire()),
-        ..AppSpec::new("Aun", (480.0, 560.0), || Ui::new(None), view)
+        ..AppSpec::new("Aun", (480.0, 560.0), || Ui::new(None, None), view)
     })
     .keep_running()
     // Closed, the app is a few threads and sockets: give the GPU device back.
-    .release_gpu_when_closed();
+    .release_gpu_when_closed()
+    .on_reopen(reopen);
+    if !settings.dock {
+        app = app.accessory();
+    }
+    if args.iter().any(|a| a == autostart::BACKGROUND) {
+        app = app.windowless();
+    }
     let node = if headless {
         None
     } else {
+        // The login item names this executable: follow it if the app moved.
+        if autostart::enabled() {
+            let _ = autostart::set(true);
+        }
         let h = app.handle();
-        let cfg = Config { dir: config_dir(), downloads: downloads_dir(), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: true };
-        match Node::start(cfg, move |note| h.update(move |s: &mut Ui, tx| s.apply(note, tx))) {
+        let cfg = Config { dir: dir.clone(), downloads: downloads_dir(), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: settings.clipboard };
+        let node = match Node::start(cfg, move |note| h.update(move |s: &mut Ui, tx| s.apply(note, tx))) {
             Ok(n) => Some(n),
             Err(e) => {
                 aun_core::log(format_args!("start: {e}"));
                 None
             }
-        }
+        };
+        // Runs on the main thread once the loop starts, window or not.
+        let h = app.handle();
+        app.handle().update(move |s, _| {
+            s.tray = tray::Tray::new(h.clone(), s.settings.clipboard);
+            aun_core::log(format_args!("tray {}", if s.tray.is_some() { "up" } else { "unavailable" }));
+            s.handle = Some(h);
+        });
+        node
     };
-    app.init(move || Ui::new(node)).run();
+    let dir = (!headless).then_some(dir);
+    app.init(move || Ui::new(node, dir)).run();
 }
 
 #[cfg(test)]
@@ -342,7 +431,7 @@ mod tests {
 
     #[test]
     fn a_clicked_code_field_takes_typed_digits() {
-        let mut ui = Ui::new(None);
+        let mut ui = Ui::new(None, None);
         ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: Some(([10, 0, 0, 3], 47810).into()), paired: false, nearby: true, connected: false }];
         ui.pairing = Some([3; 32]);
         let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
@@ -374,8 +463,24 @@ mod tests {
     }
 
     #[test]
+    fn the_clipboard_switch_is_remembered_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("aun-ui-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rt = Runtime::new(Ui::new(None, Some(dir.clone())), view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        assert!(rt.state.settings.clipboard, "on by default");
+        let (x, y) = rt.find("clip").expect("clipboard button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(!rt.state.settings.clipboard);
+        assert!(!Ui::new(None, Some(dir.clone())).settings.clipboard, "the next start reads it back");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_status_message_goes_away_on_its_own() {
-        let mut ui = Ui::new(None);
+        let mut ui = Ui::new(None, None);
         ui.message = Some(("연결된 기기가 아니에요".into(), Instant::now() + MESSAGE_FOR));
         let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
         rt.frame(0.0);

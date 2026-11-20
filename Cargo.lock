@@ -409,7 +409,11 @@ name = "aun"
 version = "0.1.0"
 dependencies = [
  "aun-core",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "rune",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

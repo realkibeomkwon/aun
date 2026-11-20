@@ -27,7 +27,7 @@ fn unhex(s: &str) -> Option<Id> {
     Some(id)
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, data)?;
     #[cfg(unix)]
