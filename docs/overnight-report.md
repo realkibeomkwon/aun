@@ -3,16 +3,20 @@
 브랜치: `claude/overnight-a68e04` (문서의 `overnight/2026-11-21` 대신). `main`은 건드리지 않았다.
 CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovernight-a68e04>
 
+**먼저 알아 둘 것**: 새 프레임(클립보드 이미지, 전송 취소)이 생겨 이전 빌드와는 링크가 유지되지 않는다. Mac과 Windows를 **함께** 이 브랜치로 업데이트해야 한다. 페어링은 그대로 남는다. Windows 실행 파일은 CI 실행의 `aun-windows-latest` 아티팩트로 받을 수 있다.
+
 | 작업 | 상태 | 커밋 | 검증 | 미확인 |
 |---|---|---|---|---|
 | A. CI | 완료 | `92dcd33` | 두 OS에서 clippy·테스트·release 빌드·처리량 통과 | |
 | B. 트레이·자동 실행 | 완료 | `0774514` | 설정 저장/로드, LaunchAgent(`plutil -lint`), 헤드리스 PNG, macOS 메뉴 막대 아이콘 표시 | 메뉴 항목 클릭(접근성 권한 없음), Windows 트레이·Run 값 실기기 |
 | C. 비밀번호 클립보드 제외 | 완료 | `5c4a2c9` | 이름 있는 페이스트보드로 Concealed/Transient 판정, Windows 플래그 판정 | 실제 비밀번호 관리자에서 복사 |
 | D. 클립보드 이미지 | 완료 | `10ed197` | 프레임 왕복, 종류별 크기 상한, PNG 왕복, 압축 폭탄 거부, 실제 스크린숏 인코딩 시간 | 두 기기 사이 실제 이미지 복사 |
-| E. 파일 받기 개선 | 완료 | `77e084f` | 취소 양방향 통합 테스트(`.part` 없음, 링크 유지), 80개 동시 전송, 스크롤, 헤드리스 PNG | "Finder/탐색기에서 보기" 실제 클릭, 폴더 선택 대화상자 |
-| F. 연결 견고성 | 완료 | `ebab287` | 브로드캐스트 주소 계산, 이 Mac 인터페이스 목록, 주소로 페어링한 기기의 자동 재연결(탐색 끔), 주소 입력 UI | 실제 두 네트워크, 실제 절전/해제, Windows `GetAdaptersAddresses` 실행(CI만) |
-| G. 성능·메모리 측정 | 완료 | `98e70c7` | 프로파일(암호화가 바쁜 샘플의 약 80%), AES-GCM 전환으로 Mac 루프백 2배, 알려진 답 테스트, 메모리·CPU·깨어남 측정 | Windows 실기기 속도·메모리, 실제 네트워크 속도 |
+| E. 파일 받기 개선 | 완료 | `77e084f`, 테스트 `de08718` | 취소 양방향 통합 테스트(`.part` 없음, 링크 유지), 80개 동시 전송, 스크롤, 헤드리스 PNG | "Finder/탐색기에서 보기" 실제 클릭, 폴더 선택 대화상자 |
+| F. 연결 견고성 | 완료 | `ebab287`, 테스트 `4834688` | 브로드캐스트 주소 계산, 이 Mac 인터페이스 목록, 주소로 페어링한 기기의 자동 재연결(탐색 끔), 주소 입력 UI | 실제 두 네트워크, 실제 절전/해제, Windows `GetAdaptersAddresses` 실행(CI만) |
+| G. 성능·메모리 측정 | 완료 | `98e70c7`, `b39fee2` | 프로파일(암호화가 바쁜 샘플의 약 80%), ChaCha20 NEON으로 Mac 봉인 +25~40%, AES-GCM 시험 후 되돌림(Windows에서 느림), RFC 8439 알려진 답 테스트, 메모리·CPU·깨어남 측정 | Windows 실기기 속도·메모리, 실제 네트워크 속도, 메인 스레드 깨어남의 출처 |
 | H. KVM 설계 | 완료(문서) | `ab9068b` | `docs/kvm-design.md` | 구현 없음(설계 문서만) |
+
+보고서 커밋: `0c62472`, `844b2a0`, `a1be5b3`, `05974d5`, `3a94b8f`, 그리고 이 표를 고친 마지막 커밋. 테스트만 고친 커밋은 E·F 줄에 함께 적었다(`de08718`: E의 취소·다중 전송 테스트가 느린 CI에서 오래된 알림을 잡던 문제, `4834688`: 기존 상태 메시지 테스트가 Windows CI의 15초 첫 프레임에 걸리던 문제).
 
 ## A. CI
 
@@ -136,22 +140,25 @@ CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovern
 
 ### 전송 속도: 병목과 개선
 
-- 프로파일(`sample`, 심볼을 남긴 release 빌드, 512 MiB 루프백): 바쁜 샘플 중 ChaCha20 454, Poly1305 252, `memmove` 29, 소켓 송수신 약 140. **암호화가 약 80%**였다. 원인은 Apple Silicon에서 RustCrypto `chacha20` 0.9가 `--cfg chacha20_force_neon` 없이는 스칼라 구현을 쓰고, `poly1305` 0.8에는 ARM 가속이 없기 때문이다. 청크 크기, `BufWriter` 크기, 버퍼 복사(`memmove` 3%)는 병목이 아니어서 바꾸지 않았다.
-- 메모리 안에서 암호화+프레이밍만 잰 결과(`seal_open_speed`, 64 MiB, 단위 MB/s):
+- 프로파일(`sample`, 심볼을 남긴 release 빌드, 512 MiB 루프백): 바쁜 샘플 중 ChaCha20 454, Poly1305 252, `memmove` 29, 소켓 송수신 약 140. **암호화가 약 80%**였다. Apple Silicon에서 RustCrypto `chacha20` 0.9는 `--cfg chacha20_force_neon` 없이는 스칼라 구현을 쓰고, `poly1305` 0.8에는 ARM 가속이 없다. 청크 크기, `BufWriter` 크기, 버퍼 복사(`memmove` 3%)는 병목이 아니어서 바꾸지 않았다.
+- 메모리 안에서 암호화+프레이밍만 잰 결과(`seal_open_speed`, 64 MiB, MB/s, 봉인/열기):
 
-  | 링크 암호 | 봉인(보내기) | 열기(받기) |
-  |---|---|---|
-  | ChaChaPoly, 스칼라(이전) | 535–641 | 632–643 |
-  | ChaChaPoly, `chacha20_force_neon` | 660–665 | 838–839 |
-  | AES-GCM, 플래그 없음(소프트웨어 AES) | 219 | 218 |
-  | **AES-GCM, `aes_armv8` + `polyval_armv8`(채택)** | **2342–2423** | **2188–2279** |
+  | 링크 암호 | Mac 로컬(M4 Pro) | Mac CI 러너 | Windows CI 러너(x86) |
+  |---|---|---|---|
+  | ChaChaPoly, 스칼라(이전) | 535–641 / 632–643 | 340 / 327 | — |
+  | **ChaChaPoly, NEON(채택)** / x86은 AVX2 | **666–885 / 888–889** | (다음 CI) | 1061 / 1172 |
+  | AES-GCM, 플래그 없음(소프트웨어 AES) | 219 / 218 | | |
+  | AES-GCM, ARMv8 AES / x86 AES-NI | 2330–2446 / 2188–2388 | 1395 / 1420 | 942 / 1034 |
 
-- 그래서 링크 암호를 `Noise_XX_25519_AESGCM_BLAKE2s`로 바꾸고, Apple Silicon 빌드가 하드웨어 AES/PMULL을 쓰도록 `.cargo/config.toml`에 `[target.aarch64-apple-darwin] rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]`을 넣었다. x86(Windows)은 AES-NI를 실행 중에 감지하므로 플래그가 필요 없다. 새 의존성 없음(snow의 기본 리졸버가 이미 `aes-gcm`을 빌드한다).
-- 플래그가 실제로 적용됐는지는 환경 변수 없이 일반 `target/`에서 다시 재서 확인했다(위 표의 채택 줄). 플래그가 빠지면 AES-GCM이 219 MB/s로 오히려 느려지므로, README에 `RUSTFLAGS` 환경 변수를 쓰면 이 설정이 무시된다고 적었다.
-- 루프백 512 MiB(디스크 쓰기 포함, 같은 Mac): 이전 461–499 MB/s → **921–987 MB/s**.
-- 해석: 실제 두 기기는 1 GbE 또는 Wi-Fi로 연결되고 그 상한은 약 110 MB/s 이하라, 두 암호 모두 그보다 빠르다. 따라서 **실기기 전송 시간은 거의 그대로**이고, 바뀌는 것은 전송에 드는 CPU다. 100 MB를 보내는 데 드는 암호화 CPU 시간이 Mac에서 보내는 쪽 약 0.16–0.19 s → 약 0.04 s, 받는 쪽 약 0.16 s → 약 0.045 s(약 1/4)로 줄어, 노트북의 배터리와 발열에 유리하다. 루프백이나 10 GbE에서만 속도 자체가 빨라진다.
-- 호환성: 암호가 바뀌어 이전 빌드와는 링크가 맺어지지 않는다(이전 빌드 쪽 로그에 `refused before it was up`). 작업 D와 E의 새 프레임도 이전 빌드가 받으면 링크를 끊으므로, **두 기기를 함께 업데이트해야 한다.** 페어링(`identity.key`, `peers.txt`)은 그대로 유효하다(키 교환은 여전히 25519).
-- 상호 운용: Mac(ARMv8 AES)과 PC(AES-NI)가 같은 바이트를 내는지 `this_machine_s_aes_gcm_matches_the_standard`가 확인한다. NIST 벡터(`gcmEncryptExtIV256.rsp`, aes-gcm 크레이트 테스트에서 가져옴)와 비교하고, snow의 nonce 배치(0 4바이트 + 카운터 big-endian)도 맞춘다. 두 OS의 CI에서 돈다.
+- **AES-GCM으로 바꿨다가 되돌렸다**(`98e70c7` → `b39fee2`). Mac에서는 3.5배 빨랐지만:
+  1. Windows x86 러너에서는 AES-GCM이 ChaChaPoly보다 약 10% 느렸다(위 표). 두 기기 중 배터리가 있는 쪽은 Windows 노트북이고, 그쪽 CPU가 늘어난다(러너 수치, 노트북 CPU는 미확인).
+  2. 실제 두 기기는 1 GbE 또는 Wi-Fi(상한 약 110 MB/s 이하)로 연결되어 두 암호 모두 네트워크보다 빠르다. Mac의 이득은 속도로 나타나지 않고, 전원에 연결된 데스크톱의 CPU만 줄인다.
+  3. 실패했을 때의 손해가 다르다. Mac 빌드 플래그가 빠지면(예: 환경 변수 `RUSTFLAGS`) AES-GCM은 219 MB/s로 지금보다 2.5배 느려진다. ChaChaPoly는 플래그가 빠져도 이전 속도일 뿐이다.
+- 채택: 선(wire)은 ChaChaPoly 그대로, Apple Silicon 빌드는 `.cargo/config.toml`의 `[target.aarch64-apple-darwin] rustflags`에 `--cfg chacha20_force_neon`(그리고 측정용 AES 플래그)을 넣어 ChaCha20을 NEON으로 돌린다. 새 의존성 없음. 환경 변수 없이 일반 `target/`에서 측정해 플래그가 적용된 것을 확인했다(표의 채택 줄).
+- 루프백 512 MiB(디스크 쓰기 포함): 디스크 상태에 따라 밤사이 절대값이 크게 움직여(이른 시각 이전 빌드 461–499 MB/s, 늦은 시각 251–282 MB/s), 같은 시각에 번갈아 쟀다. **NEON 301–308 MB/s, 이전 251–282 MB/s(약 +10–20%)**. 100 MB당 봉인 CPU는 Mac에서 약 0.16–0.19 s → 약 0.11–0.15 s.
+- 상호 운용: Mac(NEON)과 PC(AVX2)가 같은 바이트를 내는지 `this_machine_s_chacha_poly_matches_the_standard`가 확인한다. RFC 8439 §2.8.2 벡터(chacha20poly1305 크레이트 테스트에서 가져옴)와 비교하고, snow의 ChaChaPoly nonce 배치(0 4바이트 + 카운터 little-endian)도 맞춘다. 두 OS의 CI에서 돈다.
+- 실제 노트북에서 판단하려면: `cargo test --release -p aun-core --lib -- --ignored --nocapture seal_open_speed`가 두 암호를 모두 잰다. 노트북에서 AES-GCM이 확실히 빠르면, `wire::NOISE` 한 줄과 알려진 답 테스트만 바꾸면 된다(양쪽 기기를 함께 업데이트).
+- 호환성: 암호는 그대로지만 작업 D(`ClipImage`)와 E(`FileCancel`)의 새 프레임을 이전 빌드가 받으면 `frame kind` 오류로 링크를 끊는다. **두 기기를 함께 업데이트해야 한다.** 페어링은 그대로 유효하다.
 - 파일마다 `sync_all`: 이 Mac에서 1 MiB 파일 80개가 페어링 포함 0.70–0.82 s(파일당 10 ms 미만)였다. Windows CI 러너에서는 파일당 약 0.5 s가 걸렸다(80개 테스트가 30 s에 55개). 러너 디스크 한 대의 숫자라 충돌 안전성(이름 바꾸기 전 동기화)을 빼지 않았다. 실제 PC에서 파일 여러 개를 받을 때 느리면 이것을 먼저 의심한다.
 - 클립보드 이미지 인코딩(작업 D): 1920×1080 실제 화면 캡처를 9.6 ms에 802 KB PNG로, 디코딩 11.7 ms.
 
