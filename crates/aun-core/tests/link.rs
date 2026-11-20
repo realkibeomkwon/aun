@@ -186,7 +186,8 @@ fn many_files_dropped_at_once_all_arrive() {
         .collect();
     guest.send_files(host.id(), files);
     let (mut done, mut bad) = (0, Vec::new());
-    let end = Instant::now() + Duration::from_secs(30);
+    // Generous: a Windows CI runner's disk took 0.5 s a file (each is synced before its rename).
+    let end = Instant::now() + Duration::from_secs(120);
     while done < 80 && Instant::now() < end {
         match gn.recv_timeout(Duration::from_millis(200)) {
             Ok(Note::Transfer { finished: true, failed: false, .. }) => done += 1,
@@ -234,20 +235,29 @@ fn a_cancelled_transfer_leaves_no_part_file() {
             }
         }
     };
-    let moving = |incoming| move |n: &Note| matches!(n, Note::Transfer { incoming: i, done, finished: false, .. } if *i == incoming && *done > 0);
-    let stopped = |incoming| move |n: &Note| matches!(n, Note::Transfer { incoming: i, finished: true, failed: true, .. } if *i == incoming);
-
+    // Only this round's big.bin: a slow machine leaves earlier progress notes in the queue (the
+    // small file's, once, which the cancel then hit instead).
+    let big_after = |incoming: bool, after: u64| {
+        move |n: &Note| matches!(n, Note::Transfer { incoming: i, key, file, .. } if *i == incoming && *key > after && file == "big.bin")
+    };
+    let (mut after_in, mut after_out) = (0, 0);
     for by_receiver in [true, false] {
         guest.send_file(host.id(), big.clone());
+        let moving_in = |n: &Note| big_after(true, after_in)(n) && matches!(n, Note::Transfer { done, finished: false, .. } if *done > 0);
+        let moving_out = |n: &Note| big_after(false, after_out)(n) && matches!(n, Note::Transfer { done, finished: false, .. } if *done > 0);
+        let (k_in, k_out);
         if by_receiver {
-            host.cancel(wait(&hn, "bytes arriving", &moving(true)));
-            wait(&hn, "the receiver to stop", &|n| matches!(n, Note::Transfer { incoming: true, cancelled: true, .. }));
-            wait(&gn, "the sender to stop", &|n| matches!(n, Note::Transfer { incoming: false, cancelled: true, .. }));
+            k_in = wait(&hn, "bytes arriving", &moving_in);
+            host.cancel(k_in);
+            wait(&hn, "the receiver to stop", &|n| matches!(n, Note::Transfer { key, cancelled: true, .. } if *key == k_in));
+            k_out = wait(&gn, "the sender to stop", &|n| big_after(false, after_out)(n) && matches!(n, Note::Transfer { cancelled: true, .. }));
         } else {
-            guest.cancel(wait(&gn, "bytes leaving", &moving(false)));
-            wait(&gn, "the sender to stop", &|n| matches!(n, Note::Transfer { incoming: false, cancelled: true, .. }));
-            wait(&hn, "the receiver to drop it", &stopped(true));
+            k_out = wait(&gn, "bytes leaving", &moving_out);
+            guest.cancel(k_out);
+            wait(&gn, "the sender to stop", &|n| matches!(n, Note::Transfer { key, cancelled: true, .. } if *key == k_out));
+            k_in = wait(&hn, "the receiver to drop it", &|n| big_after(true, after_in)(n) && matches!(n, Note::Transfer { finished: true, failed: true, .. }));
         }
+        (after_in, after_out) = (k_in, k_out);
         until("the .part to go", || !dir_has_part(&dl));
         assert!(!dl.join("big.bin").exists(), "by receiver: {by_receiver}");
         assert!(connected(&guest, &host) && connected(&host, &guest), "the link survives");
