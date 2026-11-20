@@ -22,8 +22,8 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-# Snow's own AES-GCM, for a known-answer test of this machine's AES backend.
-aes-gcm = "0.10"
+# Snow's own ChaCha20-Poly1305, for a known-answer test of this machine's backend.
+chacha20poly1305 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2 = "0.6"

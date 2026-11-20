@@ -36,9 +36,9 @@ Settings live in `settings.txt` in the state folder.
   keeps that address in `peers.txt` and redials it every 5 s while the link is down.
 - **Sleep**: when the wall clock runs more than 10 s ahead of the monotonic one (the machine slept),
   every link is closed at once so the next announce or redial replaces it.
-- **Link**: TCP 47810, `Noise_XX_25519_AESGCM_BLAKE2s` (AES-NI / ARMv8 AES; on Apple Silicon this
-  needs the `--cfg aes_armv8 --cfg polyval_armv8` in `.cargo/config.toml`, which a `RUSTFLAGS`
-  environment variable would override), then a byte stream of frames
+- **Link**: TCP 47810, `Noise_XX_25519_ChaChaPoly_BLAKE2s` (ChaCha20 on NEON on Apple Silicon via
+  `--cfg chacha20_force_neon` in `.cargo/config.toml`, which a `RUSTFLAGS` environment variable
+  would override; AVX2 on x86), then a byte stream of frames
   `[u32 len][u8 kind][payload]` packed into full Noise messages. One link per paired device.
   Frames: hello, spake, confirm, ping, clip, clip image, file start/data/end/abort. Frames are at
   most 4 MiB, clipboard images 16 MiB (checked from the kind byte before allocating). Pings every 10 s; 35 s of
