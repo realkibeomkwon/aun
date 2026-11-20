@@ -14,8 +14,11 @@ cargo run --release -p aun
 Build on each machine (`cargo build --release -p aun`, Windows needs the MSVC build tools).
 Allow Aun through the firewall on first launch: TCP **47810** (links) and UDP **47811** (discovery).
 
-Closing the window keeps sync running and gives the GPU back. Launch Aun again (or click the Dock
-icon) to bring the window back.
+Closing the window keeps sync running and gives the GPU back. The menu bar item (macOS) or tray
+icon (Windows) opens the window, switches clipboard sharing and quits; launching Aun again or
+clicking the Dock icon also brings the window back. "로그인 시 실행" starts Aun at login without
+its window (a LaunchAgent, or the `HKCU\...\Run` value). On macOS the Dock icon can be hidden.
+Settings live in `settings.txt` in the state folder.
 
 ## Layout
 
@@ -29,7 +32,8 @@ icon) to bring the window back.
   The id is the device's X25519 static public key. A new device is answered at once.
 - **Link**: TCP 47810, `Noise_XX_25519_ChaChaPoly_BLAKE2s`, then a byte stream of frames
   `[u32 len][u8 kind][payload]` packed into full Noise messages. One link per paired device.
-  Frames: hello, spake, confirm, ping, clip, file start/data/end/abort. Pings every 10 s; 35 s of
+  Frames: hello, spake, confirm, ping, clip, clip image, file start/data/end/abort. Frames are at
+  most 4 MiB, clipboard images 16 MiB (checked from the kind byte before allocating). Pings every 10 s; 35 s of
   silence closes the link.
 - **Pairing**: the host shows a one-time code (valid until used, hidden, or 3 wrong tries). SPAKE2 over the code yields a
   shared key; each side sends HMAC-SHA256(key, role ‖ Noise handshake hash), so a man in the middle
@@ -37,7 +41,11 @@ icon) to bring the window back.
   unpaired keys are refused.
 - **Files**: 256 KiB chunks, received as `name.part` and renamed when complete. Names from the
   network are reduced to one safe component (no paths, no Windows reserved names) and made unique.
-- **Clipboard**: text only, up to 1 MiB. The OS change counter is polled every 300 ms
-  (`GetClipboardSequenceNumber`, `NSPasteboard.changeCount`); text is read only when it moved.
+- **Clipboard**: text up to 1 MiB, or an image as PNG (fdeflate "fast", encoded off the
+  clipboard thread; decoded images are capped at 128 MiB of pixels). The OS change counter is
+  polled every 300 ms (`GetClipboardSequenceNumber`, `NSPasteboard.changeCount`); the clipboard is
+  read only when it moved. Copies marked private are never read or sent: the nspasteboard.org
+  Concealed/Transient types on macOS, and on Windows `ExcludeClipboardContentFromMonitorProcessing`
+  or `CanIncludeInClipboardHistory` / `CanUploadToCloudClipboard` = 0.
 
 State lives in `%APPDATA%\Aun` or `~/Library/Application Support/Aun`.

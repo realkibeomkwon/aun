@@ -97,7 +97,7 @@ struct Shared {
     dir: PathBuf,
     downloads: PathBuf,
     clip_on: AtomicBool,
-    clip_tx: Mutex<Option<Sender<String>>>,
+    clip_tx: Mutex<Option<Sender<clip::Content>>>,
     st: Mutex<St>,
     notify: Box<dyn Fn(Note) + Send + Sync>,
 }
@@ -152,7 +152,7 @@ impl Node {
         let (tx, rx) = mpsc::channel();
         *node.0.clip_tx.lock().unwrap() = Some(tx);
         let n = node.clone();
-        spawn("aun-clip", move || clip::run(rx, move |text| n.broadcast_clip(text)));
+        spawn("aun-clip", move || clip::run(rx, move |c| n.broadcast_clip(c)));
         Ok(node)
     }
 
@@ -285,13 +285,26 @@ impl Node {
         });
     }
 
-    fn broadcast_clip(&self, text: String) {
+    fn broadcast_clip(&self, content: clip::Content) {
         if !self.clipboard() {
             return;
         }
+        let frame = match content {
+            clip::Content::Text(t) => Frame::Clip(t),
+            clip::Content::Png(png) if png.len() < wire::MAX_IMAGE => Frame::ClipImage(png),
+            clip::Content::Png(png) => return crate::log(format_args!("clipboard image not sent: {} KB PNG is past the limit", png.len() >> 10)),
+        };
         let txs: Vec<_> = self.st().peers.values().filter_map(|p| p.link.as_ref().map(|l| l.tx.clone())).collect();
         for tx in txs {
-            let _ = tx.try_send(Frame::Clip(text.clone()));
+            let _ = tx.try_send(frame.clone());
+        }
+    }
+
+    fn to_clipboard(&self, c: clip::Content) {
+        if self.clipboard()
+            && let Some(tx) = self.0.clip_tx.lock().unwrap().as_ref()
+        {
+            let _ = tx.send(c);
         }
     }
 
@@ -485,14 +498,9 @@ impl Node {
         loop {
             match wire::read_frame(r)? {
                 Frame::Ping => {}
-                Frame::Clip(text) => {
-                    if self.clipboard()
-                        && text.len() <= clip::MAX_TEXT
-                        && let Some(tx) = self.0.clip_tx.lock().unwrap().as_ref()
-                    {
-                        let _ = tx.send(text);
-                    }
-                }
+                Frame::Clip(text) if text.len() <= clip::MAX_TEXT => self.to_clipboard(clip::Content::Text(text)),
+                Frame::Clip(_) => {}
+                Frame::ClipImage(png) => self.to_clipboard(clip::Content::Png(png)),
                 Frame::FileStart { id, size, name } => files.start(id, size, &name)?,
                 Frame::FileData { id, data } => files.data(id, &data)?,
                 Frame::FileEnd { id } => files.end(id),

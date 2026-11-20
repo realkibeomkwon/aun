@@ -15,9 +15,13 @@ const TAG: usize = 16;
 const PLAIN_MAX: usize = NOISE_MAX - TAG;
 /// The largest frame a peer may send; bigger ones end the link (trust boundary).
 pub const MAX_FRAME: usize = 4 << 20;
+/// Clipboard images only: a Retina screenshot as PNG is often past 4 MiB. Checked from the kind
+/// byte before the frame is allocated, so other frames keep the small bound.
+pub const MAX_IMAGE: usize = 16 << 20;
+const CLIP_IMAGE: u8 = 9;
 pub const FILE_CHUNK: usize = 256 << 10;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     Hello { pair: bool, name: String },
     Spake(Vec<u8>),
@@ -28,6 +32,8 @@ pub enum Frame {
     FileData { id: u32, data: Vec<u8> },
     FileEnd { id: u32 },
     FileAbort { id: u32 },
+    /// A PNG.
+    ClipImage(Vec<u8>),
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -51,6 +57,11 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
         w.write_all(&head)?;
         return w.write_all(data);
     }
+    if let Frame::ClipImage(png) = f {
+        w.write_all(&((1 + png.len()) as u32).to_be_bytes())?;
+        w.write_all(&[CLIP_IMAGE])?;
+        return w.write_all(png);
+    }
     let mut b = Vec::with_capacity(64);
     match f {
         Frame::Hello { pair, name } => {
@@ -70,7 +81,7 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
         }
         Frame::FileEnd { id } => (b.push(7), b.extend_from_slice(&id.to_be_bytes())).1,
         Frame::FileAbort { id } => (b.push(8), b.extend_from_slice(&id.to_be_bytes())).1,
-        Frame::FileData { .. } => unreachable!(),
+        Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
     w.write_all(&(b.len() as u32).to_be_bytes())?;
     w.write_all(&b)
@@ -80,11 +91,17 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
-    if len == 0 || len > MAX_FRAME {
+    if len == 0 {
+        return Err(bad("frame size"));
+    }
+    let mut kind = [0u8];
+    r.read_exact(&mut kind)?;
+    if len > if kind[0] == CLIP_IMAGE { MAX_IMAGE } else { MAX_FRAME } {
         return Err(bad("frame size"));
     }
     let mut b = vec![0u8; len];
-    r.read_exact(&mut b)?;
+    b[0] = kind[0];
+    r.read_exact(&mut b[1..])?;
     let u32_at = |b: &[u8], i: usize| b.get(i..i + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap())).ok_or_else(|| bad("short"));
     let str_at = |b: &[u8], i: usize| -> io::Result<String> {
         let n = b.get(i..i + 2).map(|s| u16::from_be_bytes([s[0], s[1]]) as usize).ok_or_else(|| bad("short"))?;
@@ -108,6 +125,10 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
         }
         7 => Frame::FileEnd { id: u32_at(&b, 1)? },
         8 => Frame::FileAbort { id: u32_at(&b, 1)? },
+        CLIP_IMAGE => {
+            b.remove(0);
+            Frame::ClipImage(b)
+        }
         _ => return Err(bad("frame kind")),
     })
 }
@@ -223,6 +244,20 @@ mod tests {
         round(Frame::FileData { id: 7, data: vec![5; 1000] });
         round(Frame::FileEnd { id: 7 });
         round(Frame::FileAbort { id: 7 });
+        round(Frame::ClipImage(vec![0x89, b'P', b'N', b'G']));
+    }
+
+    #[test]
+    fn only_images_may_pass_the_frame_bound_and_not_by_much() {
+        let head = |len: usize, kind: u8| [&(len as u32).to_be_bytes()[..], &[kind]].concat();
+        let refused = |b: Vec<u8>| matches!(read_frame(&mut &b[..]), Err(e) if e.kind() == io::ErrorKind::InvalidData);
+        // Refused from the header alone, before the body is read or allocated.
+        assert!(refused(head(MAX_FRAME + 1, 4)), "a clip text past 4 MiB");
+        assert!(refused(head(MAX_IMAGE + 1, CLIP_IMAGE)), "an image past 16 MiB");
+        let big = vec![7u8; MAX_FRAME + 10];
+        let mut b = Vec::new();
+        write_frame(&mut b, &Frame::ClipImage(big.clone())).unwrap();
+        assert_eq!(read_frame(&mut &b[..]).unwrap(), Frame::ClipImage(big), "an image past 4 MiB is fine");
     }
 
     #[test]
