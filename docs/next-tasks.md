@@ -1,105 +1,73 @@
-# Aun 다음 작업 (야간 배치)
+# Aun 다음 작업
 
-작성: 2026-11-20. 기준 커밋: `5d51dbd` (`main`).
-대상: 사람 없이 밤새 진행하는 Claude 세션. 사용자는 08:00에 결과를 확인한다.
+작성: 2026-11-21. 기준 커밋: `34c56dc` (`main`, 야간 배치 병합 후).
+이전 계획(야간 배치 A–H)의 결과는 `docs/overnight-report.md`에 있다.
 
 ## 현재 상태
 
-MVP는 Mac(Kibeoms-Mac-mini)과 Windows(KIBEOMKWON) 실기기에서 모두 확인했다.
-탐색(UDP 47811), 6자리 코드 페어링(SPAKE2 + Noise XX), 암호화 링크(TCP 47810), 클립보드 텍스트 동기화,
-파일 전송, 창을 닫은 뒤 백그라운드 동작이 동작한다. 구조와 프로토콜은 `README.md`에 있다.
+- 야간 배치(CI, 트레이·자동 실행, 비밀번호 클립보드 제외, 클립보드 이미지, 파일 받기 개선, 연결 견고성, 성능 측정, KVM 설계)는 `main`에 병합했다. CI는 macOS와 Windows에서 통과한다.
+- 실기기에서 확인한 것: 클립보드 이미지 동기화(Mac ↔ Windows). Mac 로그 `clipboard image 1536x2048 to 1710 KB PNG in 12 ms`.
+- Mac에서 실행 중인 Aun은 워크트리 `.claude/worktrees/overnight-a68e04`의 release 빌드다(`main`과 같은 코드). 워크트리를 지우기 전에 `main` 체크아웃에서 다시 빌드해 실행한다.
+- 링크 로그: `~/Library/Application Support/Aun/aun.log`, `%APPDATA%\Aun\aun.log`.
+- 사용자의 우선순위: **성능, 속도, 낮은 메모리 사용량, 최적화**. 대상은 macOS와 Windows뿐이다.
 
-- `crates/aun-core`: UI 없는 엔진. `cargo test -p aun-core`
-- `app`: rune UI. `cargo test -p aun`, `cargo run -p aun -- --snap out.png --scene demo` (헤드리스 렌더는 debug 빌드에서만 된다)
-- 링크 로그: `~/Library/Application Support/Aun/aun.log`, `%APPDATA%\Aun\aun.log`
-- 사용자의 우선순위: **성능, 속도, 낮은 메모리 사용량, 최적화**. 대상은 macOS와 Windows뿐이다(모바일, Linux 제외).
+### 조사했지만 원인을 찾지 못한 것
+
+- Quick Look에서 ⌘C를 여러 번 눌렀을 때 "An error occurred with the preview of this document."가 한 번 나타났다. 공유를 켜고 끈 두 조건에서 다시 시험했을 때는 재현되지 않았다. 클립보드 감시(형식만 기록) 중 Aun이 Mac 클립보드를 쓴 흔적은 없었다. 다시 나타나면 시각을 받아 `aun.log`와 맞춰 본다.
+
+### 설계상 동작(버그 아님)
+
+- 탐색기나 Finder에서 **파일**을 복사하면 클립보드에는 파일 참조(`CF_HDROP`, `public.file-url`)와 파일 이름 텍스트가 들어간다. Aun은 텍스트와 이미지 픽셀만 보내므로, 상대 기기에는 파일 이름 텍스트만 간다(Mac → Windows). Windows의 파일 참조는 텍스트도 없어 아무것도 가지 않는다.
 
 ## 작업 규칙
 
-1. 새 브랜치 `overnight/2026-11-21`에서 작업한다. **`main`에 병합하거나 `main`에 푸시하지 않는다.** 브랜치 푸시는 해도 된다(CI 확인용).
-2. 작업 하나마다 커밋 하나. 커밋 전에 `cargo clippy --workspace --all-targets` 경고 0, `cargo test --workspace` 통과.
-3. `~/.claude/CLAUDE.md` 규칙을 따른다. 특히: 원인을 추측하지 말고 재현한 뒤 고친다. 테스트는 실제 버그나 요구사항에서 실패해야 한다. 기존 테스트를 약하게 만들거나 지우지 않는다.
-4. 새 의존성은 꼭 필요할 때만 추가한다. rune의 `Cargo.lock`에 이미 있는 크레이트와 버전을 먼저 쓴다(`~/.cargo/git/checkouts/rune-*/07f1ddd/Cargo.lock`).
-5. UI를 바꾸면 헤드리스 PNG로 확인하고 접근성 경고(`rune: a focusable ...`)를 남기지 않는다.
-6. Windows 전용 코드는 이 Mac에서 실행할 수 없다. 작업 A의 CI로 컴파일과 테스트를 확인하고, 실기기 동작은 "미확인"으로 보고한다.
-7. 한 작업이 두 번 막히면 그 작업을 건너뛰고 이유를 보고서에 남긴 뒤 다음 작업으로 간다.
-8. 진행 상황은 `docs/overnight-report.md`에 작업마다 갱신한다(완료/부분/건너뜀, 커밋, 검증한 것, 미확인인 것). 세션이 중간에 끊겨도 남도록 작업마다 커밋한다.
-9. 사용자의 실행 중인 Aun(Mac, 스크래치 폴더의 `Aun.app`)과 `~/Library/Application Support/Aun`의 페어링 정보는 건드리지 않는다. 테스트는 임시 폴더와 `port: 0`, `discovery: false`로 한다.
+1. 작업 하나마다 커밋 하나. 커밋 전에 `cargo clippy --workspace --all-targets -- -D warnings` 경고 0, `cargo test --workspace` 통과.
+2. `~/.claude/CLAUDE.md` 규칙을 따른다. 원인을 추측하지 말고 재현한 뒤 고친다. 테스트는 실제 버그에서 실패해야 한다. 기존 테스트를 약하게 만들거나 지우지 않는다.
+3. 사용자는 PR 없이 `main`에 바로 병합하는 쪽을 원한다. 다만 병합과 푸시는 사용자에게 확인을 받고 한다.
+4. Windows 전용 코드는 이 Mac에서 실행할 수 없다. CI로 컴파일과 테스트를 확인하고, 실기기 동작은 사용자에게 시험을 부탁한다.
+5. 사용자의 실행 중인 Aun과 `~/Library/Application Support/Aun`의 페어링 정보는 사용자 동의 없이 건드리지 않는다. 테스트는 임시 폴더와 `port: 0`, `discovery: false`로 한다.
 
-## 작업 목록 (우선순위 순)
+## 작업 목록 (순서대로)
 
-### A. CI: macOS와 Windows에서 빌드와 테스트
+### 1. 실기기 점검 (사용자가 시험, 세션은 안내와 로그 확인)
 
-이 Mac에서는 Windows용 앱을 컴파일할 수 없다(rune의 stacker/psm이 Windows SDK 헤더를 요구). CI가 있으면 이후 모든 작업의 Windows 검증이 된다.
+야간 배치에서 실기기로 확인하지 못한 항목이다. 사용자가 시험하고, 문제가 나오면 로그로 원인을 재현한 뒤 고친다. 문제가 나온 항목부터 고친다.
 
-- `.github/workflows/ci.yml`: `macos-latest`, `windows-latest`에서 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo build --release -p aun`.
-- 툴체인은 `rust-toolchain.toml`(1.99.1)을 따른다. `Swatinem/rust-cache`로 캐시한다. rune 첫 빌드가 길다(Windows release 약 6분 30초).
-- `throughput` 테스트(`#[ignore]`)는 release로 따로 돌려 MB/s를 로그에 남긴다.
-- 완료 기준: 브랜치를 푸시하고 `gh run watch`로 두 OS 모두 통과를 확인한다. 실패하면 로그를 읽고 고친다.
+| 항목 | 시험 방법 | 기대 결과 |
+|---|---|---|
+| 비밀번호 클립보드 제외 | 쓰는 비밀번호 관리자에서 비밀번호 복사 | 상대 기기 클립보드가 바뀌지 않는다. 일반 텍스트는 여전히 간다 |
+| 전송 취소 | 큰 파일을 보내는 중에 받는 쪽에서 "취소", 보내는 쪽에서도 한 번 | 받은 폴더에 `.part`와 완성 파일이 없다. 링크가 유지되고 다음 파일이 간다 |
+| 여러 파일 전송 | 파일 20~30개를 한꺼번에 끌어다 놓기 | 진행률이 한 줄씩 표시되고 모두 도착한다 |
+| 받은 파일 보기 | 받은 줄의 "Finder에서 보기"/"탐색기에서 보기" | 파일이 선택된 채로 폴더가 열린다 |
+| 저장 폴더 | "폴더 변경"으로 바탕화면을 고르고 받기, 앱 재시작 | 바탕화면에 저장되고 재시작 후에도 유지된다 |
+| Windows 트레이 | 알림 영역 아이콘의 메뉴(열기, 클립보드 공유, 종료) | 각 항목이 동작한다 |
+| 로그인 시 자동 실행 | 켜고 로그아웃/로그인(Mac, Windows 각각) | 로그인 후 Aun이 떠 있다 |
+| Mac 메뉴 막대 메뉴 | 상태 아이템 메뉴 항목 클릭 | 각 항목이 동작한다(야간 배치는 표시만 확인) |
+| 절전 해제 재연결 | Mac 잠자기 1분 → 깨우기. Windows 노트북도 같은 방법 | 로그 `woke after N s asleep: closing links` 뒤 수 초 안에 `link ... up` |
+| 주소로 페어링 | IP 직접 입력으로 페어링(가능하면 Tailscale 100.x) | 탐색 없이 연결되고 재시작 후 재연결된다 |
 
-### B. 로그인 시 자동 실행과 트레이 아이콘
+완료 기준: 표의 항목마다 결과(통과/실패/미시험)를 `docs/device-check.md`에 남기고, 실패 항목은 고쳐서 같은 시험으로 다시 확인한다.
 
-매일 쓰려면 가장 먼저 필요하다. 지금은 창을 닫으면 다시 실행해야만 창이 돌아온다.
+### 2. 유휴 상태 깨어남 줄이기 (다음 개발 작업)
 
-- macOS: 메뉴 막대 상태 아이템(열기, 클립보드 공유 켜기/끄기, 종료). `App::accessory()`로 Dock 아이콘 없이 상주하는 옵션.
-- Windows: 알림 영역 트레이 아이콘(같은 메뉴).
-- rune은 트레이를 제공하지 않는다(`crates/rune/README.md`의 "Compact tray-controlled windows"). `AppHandle`은 다른 스레드에서 `open()`, `quit()`, `update()`를 부를 수 있다. 크레이트는 `tray-icon`을 우선 검토하되, rune이 이미 쓰는 `objc2-app-kit`, `windows-sys`로 직접 만드는 쪽이 더 가벼우면 그쪽을 택하고 이유를 보고서에 쓴다.
-- 로그인 시 자동 실행: macOS는 LaunchAgent plist(`~/Library/LaunchAgents/dev.aun.desk.plist`) 또는 `SMAppService`, Windows는 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. UI에 켜기/끄기 토글을 둔다.
-- 설정(클립보드 공유 여부, 자동 실행)을 설정 폴더에 저장한다. 지금은 클립보드 토글이 재시작하면 초기화된다.
-- 완료 기준: 설정 저장과 로드 테스트, 헤드리스 렌더, macOS에서 실제 실행해 상태 아이템과 메뉴가 동작하는지 확인. Windows는 CI 빌드만.
+야간 측정에서 앱 전체가 창을 열었을 때 초당 약 110번, 창을 닫은 백그라운드에서 초당 약 43번 깨어났다. 이 중 Aun 코드(클립보드 폴링 약 5/s, `aun-keep` 0.2/s, 링크 핑 0.1/s)는 일부이고 나머지는 메인 스레드(rune/AppKit) 쪽이다(`docs/overnight-report.md` G).
 
-### C. 클립보드 보안: 비밀번호는 동기화하지 않기
+- 어디서 깨어나는지 찾는다. 예: Instruments의 System Trace 또는 `dtrace`/`powermetrics`로 스레드별 wakeup 원인, rune의 프레임 스케줄링과 `poll` 훅, `release_gpu_when_closed` 이후의 이벤트 루프 타이머.
+- rune 설정으로 줄일 수 있으면 그렇게 하고, rune을 고쳐야 하면 패치 범위와 근거를 정리해 사용자에게 먼저 묻는다.
+- 완료 기준: 바꾸기 전후 깨어남 횟수(창 열림/닫힘), 유휴 CPU, 메모리를 표로 남긴다. 줄지 않으면 바꾸지 않는다. Windows는 가능하면 사용자에게 작업 관리자 수치를 부탁한다.
 
-지금은 비밀번호 관리자에서 복사한 비밀번호도 상대 기기로 간다.
+### 3. 작은 개선
 
-- macOS: 페이스트보드에 `org.nspasteboard.ConcealedType` 또는 `org.nspasteboard.TransientType`이 있으면 보내지 않는다.
-- Windows: `ExcludeClipboardContentFromMonitorProcessing` 형식이 있거나 `CanIncludeInClipboardHistory`가 0이면 보내지 않는다.
-- `crates/aun-core/src/clip.rs`에 플랫폼별 판정 함수를 두고, 판정 로직은 테스트 가능한 형태로 분리한다.
-- 완료 기준: macOS에서 `NSPasteboard`에 concealed 형식을 넣는 테스트(사용자의 클립보드를 건드리지 않도록 이름 있는 별도 페이스트보드 사용). Windows는 CI 컴파일만.
+- **이미지가 텍스트에 밀리는 경우**: 이미지를 복사할 때 클립보드에 텍스트(파일 이름이나 URL)도 함께 들어가면 지금 코드(`clip.rs`의 `run`)는 텍스트만 보낸다. 브라우저의 "이미지 복사" 등에서 실제로 그런지 먼저 재현하고, 그렇다면 이미지 형식이 있을 때 이미지를 우선하도록 고친다.
+- **연결된 기기가 없을 때 클립보드 폴링 간격 늘리기**: 야간 측정에서 폴링 단독 비용은 초당 약 5회 깨어남이었다. 2번 결과를 보고 할 가치가 있을 때만 한다.
+- (사용자 결정 필요) 파일을 복사하면 상대 기기로 파일 전송을 시작하는 기능. 새 기능이므로 하기 전에 묻는다.
 
-### D. 클립보드 이미지 동기화
+### 4. 배포 형태 (사용자와 상의 후)
 
-- 스크린샷 같은 이미지(PNG)를 양방향으로 동기화한다. 새 프레임 종류(`ClipImage`)를 추가하고 `MAX_FRAME`(4 MiB)을 넘는 이미지는 보내지 않거나, 필요하면 프레임 상한을 이미지에만 올린다(근거를 보고서에).
-- `arboard`의 `image-data` 기능을 켠다. 인코딩은 rune이 이미 쓰는 `png` 크레이트로 한다.
-- 성능: 변경 카운터가 바뀐 경우에만 읽는다(지금 구조 유지). 큰 이미지 인코딩은 클립보드 스레드를 막지 않게 한다.
-- 완료 기준: 프레임 왕복 테스트, 인코딩/디코딩 테스트, 크기 상한 테스트.
+- Mac: `.app` 번들(아이콘, `Info.plist`, `LSUIElement` 검토), 서명과 공증 여부. 서명이 없으면 Gatekeeper 경고가 뜬다.
+- Windows: 아이콘과 버전 정보가 들어간 exe, 설치 방식(설치 파일 또는 단일 exe).
+- CI에서 두 산출물을 아티팩트로 만든다.
 
-### E. 파일 받기 개선
+### 5. 마우스·키보드 공유(KVM) 구현 (사용자가 지켜보는 상태에서만)
 
-- 받은 파일 줄에 "Finder에서 보기"/"탐색기에서 보기" 버튼(macOS `open -R`, Windows `explorer /select,`).
-- 진행 중인 전송 취소 버튼(보내는 쪽 `FileAbort`, 받는 쪽은 `.part` 삭제). 받는 쪽도 취소할 수 있게 새 프레임이 필요하면 추가한다.
-- 저장 폴더 선택(`tx.open_folder`), 설정에 저장.
-- 여러 파일을 한 번에 끌어다 놓을 때 진행률이 한 줄씩 정상 표시되는지 확인.
-- 완료 기준: 취소 시 `.part`가 남지 않는 통합 테스트, 헤드리스 렌더.
-
-### F. 연결 견고성
-
-- 탐색: 인터페이스별 directed broadcast(지금은 255.255.255.255 하나). 이더넷과 Wi-Fi를 둘 다 쓰는 Mac에서 필요하다. 인터페이스 목록은 `getifaddrs`(macOS), `GetAdaptersAddresses`(Windows).
-- 수동 연결: 탐색이 막힌 네트워크용으로 IP를 직접 입력해 페어링하는 입력란.
-- 절전 해제 후 재연결이 빠른지 확인(지금은 35초 무응답 후 끊기고 3초마다 재시도).
-- 완료 기준: 인터페이스 목록과 브로드캐스트 주소 계산 테스트.
-
-### G. 성능과 메모리 측정
-
-사용자의 최우선 요구사항이다. 숫자로 남긴다.
-
-- 기준 측정: 창을 연 상태와 닫은 상태(`release_gpu_when_closed`)의 메모리(`footprint`), 유휴 CPU, 링크 1개 유지 시 초당 깨어나는 횟수.
-- 루프백 전송 속도(지금 Mac release 330 MB/s). 병목을 프로파일링하고(`cargo instruments` 또는 `samply`), 개선 여지가 있으면 고친다. 예: 청크 크기, `BufWriter` 크기, 암호화 버퍼 복사, `fsync` 위치.
-- 클립보드 300 ms 폴링을 OS 알림으로 바꿀 가치가 있는지 측정으로 판단한다(macOS는 알림이 없어 폴링이 표준이다. Windows는 `AddClipboardFormatListener`).
-- 완료 기준: 측정 전후 숫자를 보고서에 표로 남긴다. 개선이 없으면 바꾸지 않는다.
-
-### H. (시간이 남으면) 마우스·키보드 공유(KVM) 설계
-
-구현하지 말고 설계 문서만 쓴다. 실기기 검증 없이 입력을 가로채는 코드는 위험하다.
-
-- `docs/kvm-design.md`: 화면 가장자리 판정, macOS 입력 캡처(`CGEventTap`, 접근성 권한)와 주입(`CGEventPost`), Windows 캡처(`SetWindowsHookEx` 저수준 훅)와 주입(`SendInput`), 프로토콜 프레임(상대 이동량 누적, 키 코드 매핑), 지연 목표, 실패 시 입력을 되돌려 주는 안전장치.
-- 참고: TwinDesk의 `docs/protocol.md`(tdv1/tdv2)와 `docs/full-kvm.md`. 코드는 복사하지 않는다(GPL-3.0).
-
-## 아침 보고 형식
-
-`docs/overnight-report.md` 맨 위에 요약 표를 둔다.
-
-| 작업 | 상태 | 커밋 | 검증 | 미확인 |
-|---|---|---|---|---|
-
-그 아래 작업마다 바뀐 것, 확인한 것, 확인하지 못한 것, 사용자가 실기기에서 해 볼 것을 적는다.
+설계는 `docs/kvm-design.md`에 있다. 입력을 가로채는 기능이므로 무인으로 진행하지 않는다. 단계마다 실기기에서 사용자와 함께 확인하고, 실패하면 입력을 되돌려 주는 안전장치를 먼저 만든다.
