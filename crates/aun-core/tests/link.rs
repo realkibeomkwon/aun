@@ -280,3 +280,23 @@ fn a_device_paired_by_address_reconnects_without_discovery() {
     let (guest2, _g2) = restart("typed-guest", "Guest");
     until("a reconnect nobody asked for", || connected(&guest2, &host));
 }
+
+/// `-- --ignored --exact idle_nodes` / `idle_link`, watched with `top -stats csw`: what one idle
+/// link adds to two nodes.
+#[test]
+#[ignore]
+fn idle_nodes() {
+    let (_a, _an) = node("idle-a", "A");
+    let (_b, _bn) = node("idle-b", "B");
+    std::thread::sleep(Duration::from_secs(45));
+}
+
+#[test]
+#[ignore]
+fn idle_link() {
+    let (host, _hn) = node("idle-host", "Host");
+    let (guest, _gn) = node("idle-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host));
+    std::thread::sleep(Duration::from_secs(45));
+}

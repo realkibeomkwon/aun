@@ -22,6 +22,8 @@ jobs:
       - run: cargo build --release -p aun
       - name: throughput (release, loopback)
         run: cargo test --release -p aun-core --test link -- --ignored --nocapture throughput
+      - name: cipher speed (release, in memory)
+        run: cargo test --release -p aun-core --lib -- --ignored --nocapture seal_open_speed
       - uses: actions/upload-artifact@v4
         with:
           name: aun-${{ matrix.os }}

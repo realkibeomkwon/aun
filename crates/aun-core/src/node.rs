@@ -840,7 +840,11 @@ mod tests {
     use super::*;
 
     fn transports() -> (StatelessTransportState, StatelessTransportState) {
-        let b = || snow::Builder::new(wire::NOISE.parse().unwrap());
+        transports_for(wire::NOISE)
+    }
+
+    fn transports_for(noise: &str) -> (StatelessTransportState, StatelessTransportState) {
+        let b = || snow::Builder::new(noise.parse().unwrap());
         let (ka, kb) = (b().generate_keypair().unwrap(), b().generate_keypair().unwrap());
         let mut i = b().local_private_key(&ka.private).build_initiator().unwrap();
         let mut r = b().local_private_key(&kb.private).build_responder().unwrap();
@@ -852,6 +856,39 @@ mod tests {
         let n = i.write_message(&[], &mut m).unwrap();
         r.read_message(&m[..n], &mut out).unwrap();
         (i.into_stateless_transport_mode().unwrap(), r.into_stateless_transport_mode().unwrap())
+    }
+
+    /// `cargo test --release -p aun-core --lib -- --ignored --nocapture seal_open_speed`: the link's
+    /// framing and encryption alone, in memory, one direction at a time (no socket, no disk).
+    #[test]
+    #[ignore]
+    fn seal_open_speed() {
+        for noise in ["Noise_XX_25519_ChaChaPoly_BLAKE2s", "Noise_XX_25519_AESGCM_BLAKE2s"] {
+            seal_open(noise);
+        }
+    }
+
+    fn seal_open(noise: &str) {
+        let (ti, tr) = transports_for(noise);
+        let chunk = vec![0x5au8; wire::FILE_CHUNK];
+        let n = 256; // 64 MiB
+        let mut sealed = Vec::with_capacity(n * (wire::FILE_CHUNK + 1024));
+        let mut w = SealWriter::new(Arc::new(ti), &mut sealed);
+        let t = Instant::now();
+        for _ in 0..n {
+            wire::write_frame(&mut w, &Frame::FileData { id: 1, data: chunk.clone() }).unwrap();
+        }
+        w.flush().unwrap();
+        let seal = t.elapsed().as_secs_f64();
+        drop(w);
+        let mut r = OpenReader::new(Arc::new(tr), &sealed[..]);
+        let t = Instant::now();
+        for _ in 0..n {
+            assert!(matches!(wire::read_frame(&mut r).unwrap(), Frame::FileData { .. }));
+        }
+        let open = t.elapsed().as_secs_f64();
+        let mb = (n * wire::FILE_CHUNK) as f64 / 1e6;
+        println!("{noise}: seal {:.0} MB/s, open {:.0} MB/s", mb / seal, mb / open);
     }
 
     #[test]

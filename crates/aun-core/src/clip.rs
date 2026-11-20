@@ -280,6 +280,22 @@ mod tests {
         println!("{w}x{h}: {} KB RGBA -> {} KB PNG (source {} KB), encode {enc:?}, decode {:?}", rgba.len() >> 10, ours.len() >> 10, png.len() >> 10, t.elapsed());
     }
 
+    /// Run alone (`-- --ignored --exact clip::tests::poll_alone`) and watch the process with
+    /// `top -stats csw,idlew`: what the 300 ms poll costs by itself.
+    #[test]
+    #[ignore]
+    fn poll_alone() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || run(rx, |_| {}));
+        std::thread::sleep(Duration::from_secs(40));
+    }
+
+    #[test]
+    #[ignore]
+    fn sleep_alone() {
+        std::thread::sleep(Duration::from_secs(40));
+    }
+
     #[test]
     fn a_png_claiming_a_huge_canvas_is_refused() {
         let png = encode_png(1024, 1024, &vec![0; 1024 * 1024 * 4]).unwrap();

@@ -1,0 +1,6 @@
+# The link cipher is AES-256-GCM. On Apple Silicon the RustCrypto crates use the CPU's AES and
+# PMULL instructions only with these flags (x86 detects AES-NI at run time). Without them a Mac
+# encrypts about 10x slower. A build with RUSTFLAGS set in the environment skips this file's
+# rustflags, so add the flags there too.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

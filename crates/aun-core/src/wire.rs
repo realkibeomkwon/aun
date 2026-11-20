@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use snow::StatelessTransportState;
 
-pub const NOISE: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+/// AES-GCM rather than ChaChaPoly: with the CPU's AES instructions (AES-NI, ARMv8; see
+/// `.cargo/config.toml`) it seals and opens about 3x faster on an M4 Pro, so a transfer costs a
+/// third of the CPU time.
+pub const NOISE: &str = "Noise_XX_25519_AESGCM_BLAKE2s";
 const NOISE_MAX: usize = 65535;
 const TAG: usize = 16;
 const PLAIN_MAX: usize = NOISE_MAX - TAG;
@@ -263,6 +266,30 @@ mod tests {
         let mut b = Vec::new();
         write_frame(&mut b, &Frame::ClipImage(big.clone())).unwrap();
         assert_eq!(read_frame(&mut &b[..]).unwrap(), Frame::ClipImage(big), "an image past 4 MiB is fine");
+    }
+
+    /// The Mac (ARMv8 AES) and the PC (AES-NI) must produce the same bytes: a NIST vector
+    /// (aes-gcm's `gcmEncryptExtIV256.rsp`), then snow's cipher against it at the nonce layout
+    /// Noise uses (4 zero bytes, then the counter big-endian).
+    #[test]
+    fn this_machine_s_aes_gcm_matches_the_standard() {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use snow::params::CipherChoice;
+        use snow::resolvers::{CryptoResolver, DefaultResolver};
+        let h = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let key = h("37ccdba1d929d6436c16bba5b5ff34deec88ed7df3d15d0f4ddf80c0c731ee1f");
+        let (msg, aad) = (h("ad4260e3cdc76bcc10c7b2c06b80b3be948258e5ef20c508a81f51e96a518388"), h("22ed235946235a85a45bc5fad7140bfa"));
+        let aes = aes_gcm::Aes256Gcm::new_from_slice(&key).unwrap();
+        let out = aes.encrypt(h("5c1b21c8998ed6299006d3f9")[..].into(), Payload { msg: &msg, aad: &aad }).unwrap();
+        assert_eq!(out, h("3b335f8b08d33ccdcad228a74700f1007542a4d1e7fc1ebe3f447fe71af298161fbf49cc46f458bf6e88f6370975e6d4"));
+
+        assert!(NOISE.contains("AESGCM"));
+        let mut c = DefaultResolver.resolve_cipher(&CipherChoice::AESGCM).unwrap();
+        c.set(&key);
+        let mut sealed = vec![0u8; msg.len() + TAG];
+        let n = c.encrypt(7, &aad, &msg, &mut sealed);
+        let iv = [&[0u8; 4][..], &7u64.to_be_bytes()].concat();
+        assert_eq!(&sealed[..n], aes.encrypt(iv[..].into(), Payload { msg: &msg, aad: &aad }).unwrap());
     }
 
     #[test]
