@@ -34,6 +34,8 @@ pub enum Frame {
     FileAbort { id: u32 },
     /// A PNG.
     ClipImage(Vec<u8>),
+    /// The receiver doesn't want file `id` (the sender's id) any more: stop sending it.
+    FileCancel { id: u32 },
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -81,6 +83,7 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
         }
         Frame::FileEnd { id } => (b.push(7), b.extend_from_slice(&id.to_be_bytes())).1,
         Frame::FileAbort { id } => (b.push(8), b.extend_from_slice(&id.to_be_bytes())).1,
+        Frame::FileCancel { id } => (b.push(10), b.extend_from_slice(&id.to_be_bytes())).1,
         Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
     w.write_all(&(b.len() as u32).to_be_bytes())?;
@@ -125,6 +128,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
         }
         7 => Frame::FileEnd { id: u32_at(&b, 1)? },
         8 => Frame::FileAbort { id: u32_at(&b, 1)? },
+        10 => Frame::FileCancel { id: u32_at(&b, 1)? },
         CLIP_IMAGE => {
             b.remove(0);
             Frame::ClipImage(b)
@@ -245,6 +249,7 @@ mod tests {
         round(Frame::FileEnd { id: 7 });
         round(Frame::FileAbort { id: 7 });
         round(Frame::ClipImage(vec![0x89, b'P', b'N', b'G']));
+        round(Frame::FileCancel { id: 7 });
     }
 
     #[test]

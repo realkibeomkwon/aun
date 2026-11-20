@@ -19,15 +19,18 @@ const MESSAGE_FOR: Duration = Duration::from_secs(5);
 use aun_core::{Config, Id, Node, Note, PeerView};
 use settings::Settings;
 use rune::tok::{self, Theme, radius, space, type_};
-use rune::{App, AppHandle, AppSpec, Cx, El, FileDialogOptions, TextEdit, Tx, col, el, row, text, text_input};
+use rune::{App, AppHandle, AppSpec, Cx, El, FileDialogOptions, ScrollSpec, TextEdit, Tx, col, el, row, text, text_input};
 
 struct Transfer {
     key: u64,
     label: String,
+    path: PathBuf,
+    incoming: bool,
     done: u64,
     total: u64,
     finished: bool,
     failed: bool,
+    cancelled: bool,
 }
 
 struct Ui {
@@ -125,23 +128,35 @@ impl Ui {
                 self.say(m, tx);
                 self.refresh();
             }
-            Note::Transfer { key, peer, file, done, total, incoming, finished, failed } => {
+            Note::Transfer { key, peer, file, path, done, total, incoming, finished, failed, cancelled } => {
                 let label = if incoming { format!("{peer} → {file}") } else { format!("{file} → {peer}") };
                 match self.transfers.iter_mut().find(|t| t.key == key) {
-                    Some(t) => (t.done, t.finished, t.failed) = (done, finished, failed),
-                    None => self.transfers.insert(0, Transfer { key, label, done, total, finished, failed }),
+                    Some(t) => (t.done, t.finished, t.failed, t.cancelled) = (done, finished, failed, cancelled),
+                    None => self.transfers.insert(0, Transfer { key, label, path, incoming, done, total, finished, failed, cancelled }),
                 }
-                self.transfers.truncate(6);
+                // Keep every unfinished one (a dropped pile waits in line) and the latest few done.
+                let mut kept_done = 0;
+                self.transfers.retain(|t| !t.finished || { kept_done += 1; kept_done <= 6 });
             }
         }
     }
 
     fn send(&mut self, id: Id, files: &[PathBuf]) {
         if let Some(n) = &self.node {
-            for f in files.iter().filter(|f| f.is_file()) {
-                n.send_file(id, f.clone());
-            }
+            n.send_files(id, files.iter().filter(|f| f.is_file()).cloned().collect());
         }
+    }
+
+    fn set_downloads(&mut self, dir: PathBuf, tx: &mut Tx) {
+        if let Some(n) = &self.node {
+            n.set_downloads(dir.clone());
+        }
+        self.settings.downloads = Some(dir);
+        self.save(tx);
+    }
+
+    fn downloads(&self) -> PathBuf {
+        self.settings.downloads.clone().unwrap_or_else(downloads_dir)
     }
 }
 
@@ -255,6 +270,17 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         }));
     }
 
+    let folder = row().key("downloads").w_full().gap(space::S2).center_y()
+        .child(text(format!("받은 파일: {}", short_path(&s.downloads()))).font(type_::LABEL).color(t.text_secondary).grow(1.0))
+        .child(button("downloads-pick".into(), "폴더 변경", t, false, |s, tx| {
+            let directory = Some(s.downloads());
+            tx.open_folder(FileDialogOptions { title: "받은 파일을 둘 폴더".into(), directory, ..Default::default() }, |s: &mut Ui, res, tx| {
+                if let Ok(Some(dir)) = res {
+                    s.set_downloads(dir, tx);
+                }
+            });
+        }));
+
     let code = match &s.code {
         Some(c) => row().key("code").w_full().gap(space::S3).center_y().padding(space::S3).radius(radius::MD).fill(t.card).border(1.0, t.card_border)
             .child(col().grow(1.0).gap(2.0)
@@ -281,19 +307,41 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         list = list.child(peer_row(p, s, t));
     }
 
-    let mut root = col().key("root").w_full().h_full().padding(space::S6).gap(space::S3).fill(t.bg)
-        .child(header).child(prefs).child(code).child(list);
+    // Scrolls once a pile of transfers outgrows the window.
+    let mut root = col().key("root").w_full().h_full().scroll(ScrollSpec { stick_bottom: false }).padding(space::S6).gap(space::S3).fill(t.bg)
+        .child(header).child(prefs).child(folder).child(code).child(list);
     if let Some(b) = pair_box(s, t) {
         root = root.child(b);
     }
     if !s.transfers.is_empty() {
         let mut tl = col().key("transfers").w_full().gap(space::S1);
-        for x in &s.transfers {
+        for x in s.transfers.iter().take(12) {
             let pct = (x.done * 100).checked_div(x.total).unwrap_or(100);
-            let state = if x.failed { "실패".to_owned() } else if x.finished { "완료".into() } else { format!("{pct}%") };
-            tl = tl.child(row().key(format!("t-{}", x.key)).w_full().gap(space::S2)
+            let state = match () {
+                _ if x.cancelled => "취소됨".to_owned(),
+                _ if x.failed => "실패".into(),
+                _ if x.finished => "완료".into(),
+                _ => format!("{pct}%"),
+            };
+            let mut r = row().key(format!("t-{}", x.key)).w_full().gap(space::S2).center_y()
                 .child(text(x.label.clone()).font(type_::LABEL).color(t.text).grow(1.0))
-                .child(text(format!("{state} · {}", size(x.total))).font(type_::LABEL).color(t.text_secondary)));
+                .child(text(format!("{state} · {}", size(x.total))).font(type_::LABEL).color(t.text_secondary));
+            let key = x.key;
+            if !x.finished {
+                r = r.child(button(format!("t-cancel-{key}"), "취소", t, false, move |s, _| {
+                    if let Some(n) = &s.node {
+                        n.cancel(key);
+                    }
+                }));
+            } else if x.incoming && !x.failed {
+                let path = x.path.clone();
+                r = r.child(button(format!("t-show-{key}"), REVEAL, t, false, move |s, tx| {
+                    if let Err(e) = reveal(&path) {
+                        s.say(format!("폴더를 열지 못했어요: {e}"), tx);
+                    }
+                }));
+            }
+            tl = tl.child(r);
         }
         root = root.child(tl);
     }
@@ -301,6 +349,29 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         root = root.child(text(m.clone()).key("message").font(type_::LABEL).color(t.text_secondary));
     }
     root
+}
+
+const REVEAL: &str = if cfg!(windows) { "탐색기에서 보기" } else { "Finder에서 보기" };
+
+/// Shows `path` selected in Finder or Explorer.
+fn reveal(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // explorer wants `/select,"C:\a b\c.txt"` as one raw argument.
+        std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(drop)
+    }
+    #[cfg(not(windows))]
+    std::process::Command::new("open").arg("-R").arg(path).spawn().map(drop)
+}
+
+/// `~/Downloads` rather than the whole home path.
+fn short_path(p: &std::path::Path) -> String {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    match home.as_deref().and_then(|h| p.strip_prefix(h).ok()) {
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => p.display().to_string(),
+    }
 }
 
 fn size(b: u64) -> String {
@@ -319,8 +390,9 @@ fn demo(s: &mut Ui) {
     s.pairing = Some([3; 32]);
     s.code_input = TextEdit::new("123 4");
     s.transfers = vec![
-        Transfer { key: 1, label: "보고서.pdf → Windows 노트북".into(), done: 3 << 20, total: 8 << 20, finished: false, failed: false },
-        Transfer { key: 2, label: "Windows 노트북 → 사진.zip".into(), done: 120 << 20, total: 120 << 20, finished: true, failed: false },
+        Transfer { key: 1, label: "보고서.pdf → Windows 노트북".into(), path: "보고서.pdf".into(), incoming: false, done: 3 << 20, total: 8 << 20, finished: false, failed: false, cancelled: false },
+        Transfer { key: 2, label: "Windows 노트북 → 사진.zip".into(), path: "사진.zip".into(), incoming: true, done: 120 << 20, total: 120 << 20, finished: true, failed: false, cancelled: false },
+        Transfer { key: 3, label: "Windows 노트북 → 영상.mov".into(), path: "영상.mov".into(), incoming: true, done: 40 << 20, total: 900 << 20, finished: true, failed: true, cancelled: true },
     ];
 }
 
@@ -403,7 +475,7 @@ fn main() {
             let _ = autostart::set(true);
         }
         let h = app.handle();
-        let cfg = Config { dir: dir.clone(), downloads: downloads_dir(), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: settings.clipboard };
+        let cfg = Config { dir: dir.clone(), downloads: settings.downloads.clone().unwrap_or_else(downloads_dir), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: settings.clipboard };
         let node = match Node::start(cfg, move |note| h.update(move |s: &mut Ui, tx| s.apply(note, tx))) {
             Ok(n) => Some(n),
             Err(e) => {
@@ -476,6 +548,22 @@ mod tests {
         assert!(!rt.state.settings.clipboard);
         assert!(!Ui::new(None, Some(dir.clone())).settings.clipboard, "the next start reads it back");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transfers_past_the_window_bottom_scroll_into_view() {
+        let mut ui = Ui::new(None, None);
+        demo(&mut ui);
+        let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let (_, y) = rt.find("t-3").expect("the last transfer row");
+        assert!(y > 560.0, "below the window to begin with: {y}");
+        for i in 0..30 {
+            rt.wheel_xy(240.0, 300.0, 0.0, -40.0);
+            rt.frame(i as f64 / 60.0 + 0.1);
+        }
+        let (_, y) = rt.find("t-3").unwrap();
+        assert!(y < 560.0, "scrolled into view: {y}");
     }
 
     #[test]

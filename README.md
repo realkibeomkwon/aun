@@ -39,7 +39,10 @@ Settings live in `settings.txt` in the state folder.
   shared key; each side sends HMAC-SHA256(key, role ‖ Noise handshake hash), so a man in the middle
   fails and can't guess the code offline. The peer's static key is then pinned in `peers.txt`;
   unpaired keys are refused.
-- **Files**: 256 KiB chunks, received as `name.part` and renamed when complete. Names from the
+- **Files**: 256 KiB chunks, received as `name.part` and renamed when complete. Files for one
+  peer go one at a time from a queue (a dropped pile shows every file at once as waiting). Either
+  side can cancel: the sender sends `file abort`, the receiver deletes its `.part` and sends
+  `file cancel`. The download folder can be changed (kept in `settings.txt`). Names from the
   network are reduced to one safe component (no paths, no Windows reserved names) and made unique.
 - **Clipboard**: text up to 1 MiB, or an image as PNG (fdeflate "fast", encoded off the
   clipboard thread; decoded images are capped at 128 MiB of pixels). The OS change counter is

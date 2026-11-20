@@ -166,3 +166,93 @@ fn sends_right_after_pairing_survive_discovery() {
         assert!(bad.is_empty() && done == 5, "round {round}: {done}/5 done, {bad:?}");
     }
 }
+
+/// Dropping a pile of files on a device sends them all; none fails and the link stays up.
+#[test]
+fn many_files_dropped_at_once_all_arrive() {
+    let (host, _hn) = node("many-host", "Host");
+    let (guest, gn) = node("many-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let src = dir("many-src");
+    let _ = std::fs::remove_dir_all(&src);
+    std::fs::create_dir_all(&src).unwrap();
+    let files: Vec<_> = (0..80)
+        .map(|i| {
+            let f = src.join(format!("f{i}.bin"));
+            std::fs::write(&f, vec![i as u8; 1 << 20]).unwrap();
+            f
+        })
+        .collect();
+    guest.send_files(host.id(), files);
+    let (mut done, mut bad) = (0, Vec::new());
+    let end = Instant::now() + Duration::from_secs(30);
+    while done < 80 && Instant::now() < end {
+        match gn.recv_timeout(Duration::from_millis(200)) {
+            Ok(Note::Transfer { finished: true, failed: false, .. }) => done += 1,
+            Ok(n @ Note::Transfer { failed: true, .. }) | Ok(n @ Note::Info(_)) => bad.push(n),
+            _ => {}
+        }
+    }
+    bad.retain(|n| !matches!(n, Note::Info(m) if m.contains("페어링했어요")));
+    assert!(bad.is_empty() && done == 80, "{done}/80 done, {bad:?}");
+    assert!(connected(&guest, &host), "the link is still up");
+    let dl = dir("many-host").join("dl");
+    // "Sent" is when the last frame is queued; the receiver renames a moment later.
+    until("80 files in the folder", || std::fs::read_dir(&dl).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "bin")).count() == 80);
+    assert!(!dir_has_part(&dl));
+}
+
+/// Either side can call a transfer off: no `.part` stays behind, the link stays up and the next
+/// file still arrives.
+#[test]
+fn a_cancelled_transfer_leaves_no_part_file() {
+    let (host, hn) = node("cancel-host", "Host");
+    let (guest, gn) = node("cancel-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let src = dir("cancel-src");
+    let _ = std::fs::remove_dir_all(&src);
+    std::fs::create_dir_all(&src).unwrap();
+    // Sparse: big enough to still be on the wire when the cancel lands, free to make.
+    let big = src.join("big.bin");
+    std::fs::File::create(&big).unwrap().set_len(4 << 30).unwrap();
+    let small = src.join("small.txt");
+    std::fs::write(&small, b"after").unwrap();
+    let dl = dir("cancel-host").join("dl");
+
+    // Wait for a note matching `want` on `rx`; returns its key.
+    let wait = |rx: &mpsc::Receiver<Note>, what: &str, want: &dyn Fn(&Note) -> bool| -> u64 {
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            if let Ok(n) = rx.recv_timeout(Duration::from_millis(100))
+                && want(&n)
+                && let Note::Transfer { key, .. } = n
+            {
+                return key;
+            }
+        }
+    };
+    let moving = |incoming| move |n: &Note| matches!(n, Note::Transfer { incoming: i, done, finished: false, .. } if *i == incoming && *done > 0);
+    let stopped = |incoming| move |n: &Note| matches!(n, Note::Transfer { incoming: i, finished: true, failed: true, .. } if *i == incoming);
+
+    for by_receiver in [true, false] {
+        guest.send_file(host.id(), big.clone());
+        if by_receiver {
+            host.cancel(wait(&hn, "bytes arriving", &moving(true)));
+            wait(&hn, "the receiver to stop", &|n| matches!(n, Note::Transfer { incoming: true, cancelled: true, .. }));
+            wait(&gn, "the sender to stop", &|n| matches!(n, Note::Transfer { incoming: false, cancelled: true, .. }));
+        } else {
+            guest.cancel(wait(&gn, "bytes leaving", &moving(false)));
+            wait(&gn, "the sender to stop", &|n| matches!(n, Note::Transfer { incoming: false, cancelled: true, .. }));
+            wait(&hn, "the receiver to drop it", &stopped(true));
+        }
+        until("the .part to go", || !dir_has_part(&dl));
+        assert!(!dl.join("big.bin").exists(), "by receiver: {by_receiver}");
+        assert!(connected(&guest, &host) && connected(&host, &guest), "the link survives");
+        guest.send_file(host.id(), small.clone());
+        until("the next file", || std::fs::read(dl.join("small.txt")).is_ok_and(|b| b == b"after"));
+        std::fs::remove_file(dl.join("small.txt")).unwrap();
+    }
+}

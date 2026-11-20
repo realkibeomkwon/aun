@@ -2,18 +2,20 @@
 //! Unknown keys are ignored, so a later version can add some without breaking this one.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub clipboard: bool,
     /// macOS: show the Dock icon. Off, Aun lives in the menu bar only.
     pub dock: bool,
+    /// Where received files go; None is the Downloads folder.
+    pub downloads: Option<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { clipboard: true, dock: true }
+        Settings { clipboard: true, dock: true, downloads: None }
     }
 }
 
@@ -24,6 +26,7 @@ impl Settings {
             match line.split_once('=') {
                 Some(("clipboard", v)) => s.clipboard = v == "1",
                 Some(("dock", v)) => s.dock = v == "1",
+                Some(("downloads", v)) if !v.is_empty() => s.downloads = Some(v.into()),
                 _ => {}
             }
         }
@@ -32,7 +35,11 @@ impl Settings {
 
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let text = format!("clipboard={}\ndock={}\n", self.clipboard as u8, self.dock as u8);
+        let mut text = format!("clipboard={}\ndock={}\n", self.clipboard as u8, self.dock as u8);
+        // One line per key: a folder whose name has a line break isn't kept.
+        if let Some(d) = self.downloads.as_ref().and_then(|d| d.to_str()).filter(|d| !d.contains(['\n', '\r'])) {
+            text += &format!("downloads={d}\n");
+        }
         aun_core::store::write_atomic(&dir.join("settings.txt"), text.as_bytes())
     }
 }
@@ -46,11 +53,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aun-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(Settings::load(&dir), Settings::default(), "no file: defaults");
-        let off = Settings { clipboard: false, dock: false };
+        let off = Settings { clipboard: false, dock: false, downloads: Some("/Users/me/받은 파일=새".into()) };
         off.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), off);
         std::fs::write(dir.join("settings.txt"), "junk\nclipboard=0\nfuture=7\n").unwrap();
-        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true });
+        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true, downloads: None });
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
