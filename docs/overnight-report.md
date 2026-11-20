@@ -9,7 +9,7 @@ CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovern
 | B. 트레이·자동 실행 | 완료 | `0774514` | 설정 저장/로드, LaunchAgent(`plutil -lint`), 헤드리스 PNG, macOS 메뉴 막대 아이콘 표시 | 메뉴 항목 클릭(접근성 권한 없음), Windows 트레이·Run 값 실기기 |
 | C. 비밀번호 클립보드 제외 | 완료 | `5c4a2c9` | 이름 있는 페이스트보드로 Concealed/Transient 판정, Windows 플래그 판정 | 실제 비밀번호 관리자에서 복사 |
 | D. 클립보드 이미지 | 완료 | `10ed197` | 프레임 왕복, 종류별 크기 상한, PNG 왕복, 압축 폭탄 거부, 실제 스크린숏 인코딩 시간 | 두 기기 사이 실제 이미지 복사 |
-| E. 파일 받기 개선 | 대기 | | | |
+| E. 파일 받기 개선 | 완료 | `77e084f` | 취소 양방향 통합 테스트(`.part` 없음, 링크 유지), 80개 동시 전송, 스크롤, 헤드리스 PNG | "Finder/탐색기에서 보기" 실제 클릭, 폴더 선택 대화상자 |
 | F. 연결 견고성 | 대기 | | | |
 | G. 성능·메모리 측정 | 대기 | | | |
 | H. KVM 설계 | 대기 | | | |
@@ -81,3 +81,19 @@ CI: <https://github.com/realkibeomkwon/aun/actions?query=branch%3Aclaude%2Fovern
 
 - 확인하지 못한 것: 두 기기 사이 실제 이미지 복사(클립보드 스레드는 실제 시스템 클립보드를 쓰므로 테스트에서 돌리지 않았다). `arboard::get_image` 자체의 시간(macOS는 TIFF→RGBA 변환).
 - 사용자가 해 볼 것: Mac에서 ⌘⇧⌃4로 영역 캡처 → Windows에서 그림판에 붙여넣기. 반대로 Windows에서 Win+Shift+S → Mac 미리보기 › 클립보드에서 새로 만들기. `aun.log`에 `clipboard image WxH to N KB PNG in M ms`가 남는다.
+
+## E. 파일 받기 개선
+
+- 바뀐 것
+  - **버그 수정(재현 후)**: 파일 여러 개를 한 번에 끌어다 놓으면 파일마다 보내는 스레드가 따로 떠서 동시에 열린 파일이 받는 쪽 상한(64개)을 넘었고, 받는 쪽이 `PermissionDenied: too many files`로 링크를 끊었다. 80개 1 MiB 파일로 재현했을 때 1개만 도착했다(`many_files_dropped_at_once_all_arrive`, 수정 전 실패 로그는 커밋 메시지에). 이제 상대 기기마다 대기열(`Outbox`) 하나와 보내는 스레드 하나가 파일을 하나씩 보낸다. 끌어다 놓은 파일은 모두 바로 "0%" 줄로 보인다. 한 TCP 링크 위에서 동시에 보내도 속도 이득이 없으므로 순차 전송이 손해가 아니다.
+  - 취소: 진행 중인 줄에 "취소" 버튼. 보내는 쪽이 취소하면 `FileAbort`를 보내고, 받는 쪽이 취소하면 `.part`를 바로 지우고 새 프레임 `FileCancel { id }`(종류 10)로 알린다. 보내는 쪽은 그 링크의 상대가 보낸 것이고 지금 보내는 파일 id와 맞을 때만 멈춘다. 받는 스레드가 막히지 않도록 `FileCancel`은 `try_send`로 보내고, 큐가 차 있으면 다음 프레임 때 다시 보낸다. 대기열에 있던 파일을 취소하면 시작하지 않는다.
+  - "Finder에서 보기"/"탐색기에서 보기": 받은 파일이 완료된 줄에 버튼. macOS `open -R <경로>`, Windows `explorer /select,"<경로>"`(`raw_arg`로 따옴표를 그대로 넘긴다). `Note::Transfer`에 `path`와 `cancelled`가 추가됐다.
+  - 저장 폴더: "받은 파일: ~/Downloads" 줄의 "폴더 변경" → `tx.open_folder`. `settings.txt`의 `downloads=`에 저장하고, 실행 중에는 `Node::set_downloads`로 바로 바뀐다(이미 받는 중인 파일은 원래 폴더에서 끝난다).
+  - 줄 목록: 끝나지 않은 전송은 모두, 끝난 전송은 최근 6개를 남기고 최대 12줄을 그린다. 창 내용이 창 높이를 넘으면 스크롤된다(이번 작업으로 데모 화면이 560pt를 넘었다).
+- 확인한 것
+  - `a_cancelled_transfer_leaves_no_part_file`: 4 GiB 희소 파일을 보내다 받는 쪽 취소, 다시 보내는 쪽 취소. 두 경우 모두 `.part`와 완성 파일이 남지 않고, 양쪽에 `cancelled` 알림이 오고, 링크가 유지되고, 바로 다음 작은 파일이 도착한다.
+  - `many_files_dropped_at_once_all_arrive`: 80개가 모두 실패 없이 도착하고 링크 유지. 수정 전에는 1/80.
+  - `transfers_past_the_window_bottom_scroll_into_view`: 스크롤 없이 실패(마지막 줄 y=565)하고, 스크롤로 통과하는 것을 확인했다.
+  - 헤드리스 PNG에 취소 버튼, Finder에서 보기 버튼, 폴더 줄이 보이고 접근성 경고 없음.
+- 확인하지 못한 것: "Finder/탐색기에서 보기" 클릭(사용자 화면에 Finder 창이 뜨므로 실행하지 않았다), 폴더 선택 대화상자, Windows `explorer /select,` 동작(CI 컴파일만), 보내는 쪽이 취소했을 때 받는 쪽 줄은 "취소됨"이 아니라 "실패"로 보인다(`FileAbort`가 읽기 오류와 같은 프레임이라 구분하지 않았다).
+- 사용자가 해 볼 것: 큰 파일을 보내는 중에 받는 쪽에서 "취소" → 받은 폴더에 `.part`가 없는지. 파일 20~30개를 한꺼번에 끌어다 놓기. 받은 줄의 "Finder에서 보기". "폴더 변경"으로 바탕화면을 고르고 다시 받기, 앱을 껐다 켜도 유지되는지.
