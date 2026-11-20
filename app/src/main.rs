@@ -147,8 +147,9 @@ fn pair_box(s: &Ui, t: Theme) -> Option<El> {
             _ => s.message = Some("6자리 숫자를 입력하세요".into()),
         }
     };
-    let field = el().key("code-field").w(120.0).h(32.0).px(space::S2).radius(radius::MD).fill(t.bg).border(1.0, t.card_border).center_y()
-        .child(text_input(&s.code_input, type_::BODY).key("code-input").label("페어링 코드").color(t.text).placeholder("000000", t.text_secondary)
+    // The input itself fills the box: a click anywhere in it focuses the field.
+    let field = el().key("code-field").w(120.0).h(32.0).radius(radius::MD).fill(t.bg).border(1.0, t.card_border).center_y()
+        .child(text_input(&s.code_input, type_::BODY).key("code-input").w_full().px(space::S2).py(6.0).label("페어링 코드").color(t.text).placeholder("000000", t.text_secondary)
             .on_edit(|s: &mut Ui| &mut s.code_input).on_submit(submit));
     Some(col().key("pair-box").w_full().gap(space::S2).padding(space::S3).radius(radius::MD).fill(t.card).border(1.0, t.card_border)
         .child(text(format!("{name}에 표시된 6자리 코드를 입력하세요")).font(type_::LABEL).color(t.text))
@@ -304,4 +305,30 @@ fn main() {
         }
     };
     app.init(move || Ui::new(node)).run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune::{Env, Key, KeyEvent, Runtime};
+
+    #[test]
+    fn a_clicked_code_field_takes_typed_digits() {
+        let mut ui = Ui::new(None);
+        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: Some(([10, 0, 0, 3], 47810).into()), paired: false, nearby: true, connected: false }];
+        ui.pairing = Some([3; 32]);
+        let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        // Anywhere in the box, not only on the placeholder's glyphs.
+        let (cx, cy) = rt.find("code-field").expect("code field");
+        for (i, x) in [cx - 54.0, cx, cx + 54.0].into_iter().enumerate() {
+            rt.pointer_down(x, cy);
+            rt.pointer_up(x, cy);
+            rt.frame(1.0 / 60.0);
+            assert!(rt.has_focus(), "a click at {x} (box centre {cx}) focuses the field");
+            rt.key(KeyEvent { key: Key::Text(i.to_string()), mods: Default::default() });
+            rt.frame(1.0 / 60.0);
+        }
+        assert_eq!(rt.state.code_input.text, "012");
+    }
 }
