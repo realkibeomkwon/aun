@@ -7,6 +7,10 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+/// How long a status message stays up.
+const MESSAGE_FOR: Duration = Duration::from_secs(5);
 
 use aun_core::{Config, Id, Node, Note, PeerView};
 use rune::tok::{self, Theme, radius, space, type_};
@@ -30,7 +34,8 @@ struct Ui {
     pairing: Option<Id>,
     code_input: TextEdit,
     transfers: Vec<Transfer>,
-    message: Option<String>,
+    /// A status line and when it goes away.
+    message: Option<(String, Instant)>,
     clip: bool,
     over: Option<Id>,
 }
@@ -51,11 +56,25 @@ impl Ui {
         }
     }
 
-    fn apply(&mut self, note: Note) {
+    fn say(&mut self, m: impl Into<String>, tx: &mut Tx) {
+        self.message = Some((m.into(), Instant::now() + MESSAGE_FOR));
+        tx.wake_after(MESSAGE_FOR); // runs `poll` then, which drops it
+    }
+
+    /// Drops a status message past its time; true when the view must re-run.
+    fn expire(&mut self) -> bool {
+        let old = self.message.as_ref().is_some_and(|(_, until)| *until <= Instant::now());
+        if old {
+            self.message = None;
+        }
+        old
+    }
+
+    fn apply(&mut self, note: Note, tx: &mut Tx) {
         match note {
             Note::Changed => self.refresh(),
             Note::Info(m) => {
-                self.message = Some(m);
+                self.say(m, tx);
                 self.refresh();
             }
             Note::Transfer { key, peer, file, done, total, incoming, finished, failed } => {
@@ -134,16 +153,16 @@ fn peer_row(p: &PeerView, s: &Ui, t: Theme) -> El {
 fn pair_box(s: &Ui, t: Theme) -> Option<El> {
     let id = s.pairing?;
     let name = s.peers.iter().find(|p| p.id == id).map_or("기기", |p| p.name.as_str());
-    let submit = |s: &mut Ui, _: &mut Tx| {
+    let submit = |s: &mut Ui, tx: &mut Tx| {
         let Some(id) = s.pairing.take() else { return };
         let code: String = s.code_input.text.chars().filter(char::is_ascii_digit).collect();
         let addr = s.peers.iter().find(|p| p.id == id).and_then(|p| p.addr);
         match (&s.node, addr, code.len()) {
             (Some(n), Some(addr), 6) => {
                 n.pair(addr, code);
-                s.message = Some("페어링 중…".into());
+                s.say("페어링 중…", tx);
             }
-            _ => s.message = Some("6자리 숫자를 입력하세요".into()),
+            _ => s.say("6자리 숫자를 입력하세요", tx),
         }
     };
     // The input itself fills the box: a click anywhere in it focuses the field.
@@ -224,7 +243,7 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         }
         root = root.child(tl);
     }
-    if let Some(m) = &s.message {
+    if let Some((m, _)) = &s.message {
         root = root.child(text(m.clone()).key("message").font(type_::LABEL).color(t.text_secondary));
     }
     root
@@ -294,6 +313,7 @@ fn main() {
     let app = App::new(AppSpec::<Ui> {
         scenes: &[("demo", demo)],
         min_size: Some((420.0, 360.0)),
+        poll: Some(|s, _, _| s.expire()),
         ..AppSpec::new("Aun", (480.0, 560.0), || Ui::new(None), view)
     })
     .keep_running()
@@ -304,7 +324,7 @@ fn main() {
     } else {
         let h = app.handle();
         let cfg = Config { dir: config_dir(), downloads: downloads_dir(), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: true };
-        match Node::start(cfg, move |note| h.update(move |s: &mut Ui, _| s.apply(note))) {
+        match Node::start(cfg, move |note| h.update(move |s: &mut Ui, tx| s.apply(note, tx))) {
             Ok(n) => Some(n),
             Err(e) => {
                 eprintln!("aun: {e}");
@@ -351,5 +371,20 @@ mod tests {
         rt.key(KeyEvent { key: Key::Backspace, mods: Default::default() });
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.code_input.text, "012", "no trailing space once the second group is gone");
+    }
+
+    #[test]
+    fn a_status_message_goes_away_on_its_own() {
+        let mut ui = Ui::new(None);
+        ui.message = Some(("연결된 기기가 아니에요".into(), Instant::now() + MESSAGE_FOR));
+        let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        assert!(rt.find("message").is_some(), "a fresh message shows");
+        assert!(!rt.state.expire(), "and stays until its time");
+        rt.state.message.as_mut().unwrap().1 = Instant::now() - Duration::from_millis(1);
+        assert!(rt.state.expire(), "past its time, poll drops it and asks for a new view");
+        rt.invalidate(); // what poll's `true` does in the app
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("message").is_none(), "an old one is gone");
     }
 }
