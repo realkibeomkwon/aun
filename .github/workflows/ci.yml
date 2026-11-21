@@ -19,7 +19,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo build --release -p aun
+      - name: build (macOS app)
+        if: runner.os == 'macOS'
+        run: scripts/bundle-mac.sh
+      - name: build (Windows exe)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release -p aun
+          $v = (Get-Item target/release/aun.exe).VersionInfo
+          "$($v.ProductName) $($v.FileVersion)"
+          if ($v.ProductName -ne 'Aun') { throw 'no version resource' }
+          if (Select-String -Path target/release/aun.exe -Pattern 'VCRUNTIME140' -SimpleMatch -Quiet) { throw 'links the VC++ runtime dynamically' }
       - name: throughput (release, loopback)
         run: cargo test --release -p aun-core --test link -- --ignored --nocapture throughput
       - name: cipher speed (release, in memory)
@@ -28,6 +39,6 @@ jobs:
         with:
           name: aun-${{ matrix.os }}
           path: |
-            target/release/aun
+            target/release/Aun-mac.zip
             target/release/aun.exe
-          if-no-files-found: ignore
+          if-no-files-found: error

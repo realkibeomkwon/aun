@@ -4,3 +4,7 @@
 # set in the environment skips this file's rustflags, so add the flags there too.
 [target.aarch64-apple-darwin]
 rustflags = ["--cfg", "chacha20_force_neon", "--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+# Windows: link the C runtime statically so aun.exe runs on a PC without the VC++ redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

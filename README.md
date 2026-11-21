@@ -12,6 +12,12 @@ cargo run --release -p aun
 ```
 
 Build on each machine (`cargo build --release -p aun`, Windows needs the MSVC build tools).
+
+Packages: `scripts/bundle-mac.sh` makes `target/release/Aun.app` and `Aun-mac.zip` (ad-hoc signed,
+so the first open needs right-click > Open or System Settings > Privacy & Security). On Windows,
+`target/release/aun.exe` is the whole app (icon, version info, static C runtime; SmartScreen warns
+once since it isn't signed). CI uploads both as artifacts. `swift scripts/icon.swift` redraws
+`assets/` from the tray icon's design.
 Allow Aun through the firewall on first launch: TCP **47810** (links) and UDP **47811** (discovery).
 
 Closing the window keeps sync running and gives the GPU back. The menu bar item (macOS) or tray

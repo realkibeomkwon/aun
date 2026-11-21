@@ -133,7 +133,15 @@ Windows(2026-11-21): Windows 11 Pro PC, release 빌드. 변경 전 `42967de`와 
 - ~~점검에서 남은 한계: 깨어남 알림을 놓쳤을 때의 안전장치~~: 입력 기반 안전장치를 넣었다(`docs/device-check.md` 알려진 한계).
 - 점검에서 남은 한계: 메뉴 막대 비밀번호 관리자 판별. 이 Mac에 설치된 비밀번호 관리자는 Apple 암호 앱뿐이고(창, 메뉴 막대 모두 통과), Chrome 비밀번호 관리자는 비밀 표시를 넣는다. 재현할 대상이 없어 코드는 바꾸지 않았다. 다른 관리자(1Password, Bitwarden 등)를 쓰게 되면 그 앱으로 재현한 뒤 고친다.
 
-### 4. 배포 형태 (사용자와 상의 후)
+### 4. 배포 형태
+
+사용자 결정(2026-11-21): Mac은 ad-hoc 서명한 `.app`을 zip으로, Windows는 단일 exe. 아이콘은 트레이 아이콘 도안(`scripts/icon.swift` → `assets/`).
+
+- Mac: `scripts/bundle-mac.sh`. `LSUIElement`는 넣지 않았다(앱이 "Dock 아이콘" 설정으로 직접 정한다). 번들 앱은 macOS 15부터 LAN 접근에 `NSLocalNetworkUsageDescription`가 필요해 넣었다. arm64만 만든다. 공증은 Developer ID가 없어 하지 않는다.
+- Windows: `app/build.rs`(winresource)로 아이콘과 버전 정보를, `.cargo/config.toml`로 정적 C 런타임을 넣었다. CI가 버전 정보와 `VCRUNTIME140` 미포함을 확인한다.
+- 남은 확인(실기기): Mac에서 zip을 풀어 첫 실행(Gatekeeper, 로컬 네트워크 허용 창), Dock·Finder 아이콘, 탐색·연결, 로그인 시 실행. Windows에서 탐색기 아이콘과 속성 > 자세히, VC++ 재배포 패키지 없이 실행.
+
+이전 계획:
 
 - Mac: `.app` 번들(아이콘, `Info.plist`, `LSUIElement` 검토), 서명과 공증 여부. 서명이 없으면 Gatekeeper 경고가 뜬다.
 - Windows: 아이콘과 버전 정보가 들어간 exe, 설치 방식(설치 파일 또는 단일 exe).
