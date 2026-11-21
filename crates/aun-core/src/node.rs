@@ -490,7 +490,7 @@ impl Node {
         let (mut done, mut told) = (0u64, Instant::now());
         loop {
             if cancelled() {
-                let _ = tx.send(Frame::FileAbort { id });
+                let _ = tx.send(Frame::FileAbort { id, cancelled: true });
                 note(done, true, true, true);
                 return Err(stopped());
             }
@@ -499,7 +499,7 @@ impl Node {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = tx.send(Frame::FileAbort { id });
+                    let _ = tx.send(Frame::FileAbort { id, cancelled: false });
                     note(done, true, true, false);
                     return Err(e);
                 }
@@ -672,7 +672,7 @@ impl Node {
                 Frame::FileStart { id, size, name } => files.start(id, size, &name)?,
                 Frame::FileData { id, data } => files.data(id, &data)?,
                 Frame::FileEnd { id } => files.end(id),
-                Frame::FileAbort { id } => files.abort(id, false),
+                Frame::FileAbort { id, cancelled } => files.abort(id, cancelled),
                 Frame::FileCancel { id } => {
                     let mut st = self.st();
                     let key = st.outboxes.get(&files.remote).and_then(|o| o.current).filter(|c| c.0 == id).map(|c| c.1);

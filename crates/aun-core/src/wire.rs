@@ -34,7 +34,8 @@ pub enum Frame {
     FileStart { id: u32, size: u64, name: String },
     FileData { id: u32, data: Vec<u8> },
     FileEnd { id: u32 },
-    FileAbort { id: u32 },
+    /// The sender stopped: `cancelled` when the user called it off, not when reading failed.
+    FileAbort { id: u32, cancelled: bool },
     /// A PNG.
     ClipImage(Vec<u8>),
     /// The receiver doesn't want file `id` (the sender's id) any more: stop sending it.
@@ -85,7 +86,7 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
             put_str(&mut b, name);
         }
         Frame::FileEnd { id } => (b.push(7), b.extend_from_slice(&id.to_be_bytes())).1,
-        Frame::FileAbort { id } => (b.push(8), b.extend_from_slice(&id.to_be_bytes())).1,
+        Frame::FileAbort { id, cancelled } => (b.push(8), b.extend_from_slice(&id.to_be_bytes()), b.push(*cancelled as u8)).2,
         Frame::FileCancel { id } => (b.push(10), b.extend_from_slice(&id.to_be_bytes())).1,
         Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
@@ -130,7 +131,8 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
             Frame::FileData { id, data: b }
         }
         7 => Frame::FileEnd { id: u32_at(&b, 1)? },
-        8 => Frame::FileAbort { id: u32_at(&b, 1)? },
+        // A build before the cancel byte sends none: read as a failure, as it was shown then.
+        8 => Frame::FileAbort { id: u32_at(&b, 1)?, cancelled: b.get(5) == Some(&1) },
         10 => Frame::FileCancel { id: u32_at(&b, 1)? },
         CLIP_IMAGE => {
             b.remove(0);
@@ -250,9 +252,17 @@ mod tests {
         round(Frame::FileStart { id: 7, size: 1 << 40, name: "a b.txt".into() });
         round(Frame::FileData { id: 7, data: vec![5; 1000] });
         round(Frame::FileEnd { id: 7 });
-        round(Frame::FileAbort { id: 7 });
+        round(Frame::FileAbort { id: 7, cancelled: false });
+        round(Frame::FileAbort { id: 7, cancelled: true });
         round(Frame::ClipImage(vec![0x89, b'P', b'N', b'G']));
         round(Frame::FileCancel { id: 7 });
+    }
+
+    /// A build from before the cancel byte still talks to this one: its abort reads as a failure.
+    #[test]
+    fn an_abort_from_an_older_build_reads_as_a_failure() {
+        let old = [&5u32.to_be_bytes()[..], &[8], &7u32.to_be_bytes()].concat();
+        assert_eq!(read_frame(&mut &old[..]).unwrap(), Frame::FileAbort { id: 7, cancelled: false });
     }
 
     #[test]

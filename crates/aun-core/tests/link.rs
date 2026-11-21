@@ -255,7 +255,8 @@ fn a_cancelled_transfer_leaves_no_part_file() {
             k_out = wait(&gn, "bytes leaving", &moving_out);
             guest.cancel(k_out);
             wait(&gn, "the sender to stop", &|n| matches!(n, Note::Transfer { key, cancelled: true, .. } if *key == k_out));
-            k_in = wait(&hn, "the receiver to drop it", &|n| big_after(true, after_in)(n) && matches!(n, Note::Transfer { finished: true, failed: true, .. }));
+            // The receiver hears it was a cancel, not a failure: both sides show "취소됨".
+            k_in = wait(&hn, "the receiver to drop it as cancelled", &|n| big_after(true, after_in)(n) && matches!(n, Note::Transfer { finished: true, failed: true, cancelled: true, .. }));
         }
         (after_in, after_out) = (k_in, k_out);
         until("the .part to go", || !dir_has_part(&dl));
