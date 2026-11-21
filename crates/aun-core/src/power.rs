@@ -46,3 +46,30 @@ pub fn watch(node: Node) {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 pub fn watch(_: Node) {}
+
+/// Time since the last keyboard or mouse input. A DarkWake has none, so this getting shorter
+/// while the node thinks it is asleep means someone is at the machine: a missed wake notice.
+#[cfg(target_os = "macos")]
+pub fn idle() -> Option<std::time::Duration> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+    }
+    // SAFETY: plain query. Combined session state (0), any input event type (!0).
+    let s = unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) };
+    std::time::Duration::try_from_secs_f64(s).ok()
+}
+
+#[cfg(windows)]
+pub fn idle() -> Option<std::time::Duration> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    // SAFETY: `info` is sized for the call; both read the same tick clock.
+    unsafe { (GetLastInputInfo(&mut info) != 0).then(|| std::time::Duration::from_millis(GetTickCount().wrapping_sub(info.dwTime) as u64)) }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn idle() -> Option<std::time::Duration> {
+    None
+}

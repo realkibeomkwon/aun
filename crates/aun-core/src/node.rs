@@ -33,6 +33,8 @@ const CODE_TRIES: u32 = 3;
 const STACK: usize = 256 << 10;
 /// How often paired devices at a typed address are redialled, and a wake from sleep looked for.
 const KEEP: Duration = Duration::from_secs(5);
+/// Marked asleep this long (awake time) with input seen: the wake notice was missed.
+const MISSED_WAKE: Duration = Duration::from_secs(60);
 
 pub struct Config {
     pub dir: PathBuf,
@@ -144,6 +146,8 @@ struct Shared {
     secrets_on: AtomicBool,
     /// Between the OS saying it will sleep and saying it woke: no links, in or out.
     asleep: AtomicBool,
+    /// While asleep: the input idle time at the last look (`power::idle`), and since when.
+    idle: Mutex<(Option<Duration>, Instant)>,
     clip_tx: Mutex<Option<Sender<Option<clip::Content>>>>,
     st: Mutex<St>,
     notify: Box<dyn Fn(Note) + Send + Sync>,
@@ -177,6 +181,7 @@ impl Node {
             clip_on: AtomicBool::new(cfg.clipboard),
             secrets_on: AtomicBool::new(cfg.secrets),
             asleep: AtomicBool::new(false),
+            idle: Mutex::new((None, Instant::now())),
             clip_tx: Mutex::new(None),
             st: Mutex::new(st),
             notify: Box::new(notify),
@@ -265,7 +270,27 @@ impl Node {
         }
         crate::log(format_args!("{}", if on { "going to sleep: closing links" } else { "woke: links allowed again" }));
         if on {
+            *self.0.idle.lock().unwrap() = (crate::power::idle(), Instant::now());
             self.close_links();
+        }
+    }
+
+    /// The safety net for a wake notice that never came: input since the last look means
+    /// someone is using the machine, which a DarkWake never has. Not in the first minute (awake
+    /// time; `Instant` stops while the Mac sleeps): a hand on the mouse as the machine goes down
+    /// isn't a wake. `idle`: `power::idle()`.
+    fn input_while_asleep(&self, idle: Option<Duration>) {
+        let (was, since) = {
+            let mut g = self.0.idle.lock().unwrap();
+            (std::mem::replace(&mut g.0, idle), g.1)
+        };
+        if let (Some(was), Some(now)) = (was, idle)
+            && now < was
+            && since.elapsed() >= MISSED_WAKE
+            && self.asleep()
+        {
+            crate::log(format_args!("input {:.0} s ago while marked asleep: the wake notice was missed", now.as_secs_f64()));
+            self.set_sleeping(false);
         }
     }
     fn asleep(&self) -> bool {
@@ -379,6 +404,9 @@ impl Node {
                 self.close_links();
             }
             then = (SystemTime::now(), Instant::now());
+            if self.asleep() {
+                self.input_while_asleep(crate::power::idle());
+            }
             let due: Vec<_> = {
                 let mut st = self.st();
                 let due: Vec<_> = st.peers.iter().filter(|(_, p)| p.paired && p.link.is_none()).filter_map(|(id, p)| Some((*id, p.typed?))).collect();
@@ -1064,6 +1092,30 @@ mod tests {
         let open = t.elapsed().as_secs_f64();
         let mb = (n * wire::FILE_CHUNK) as f64 / 1e6;
         println!("{noise}: seal {:.0} MB/s, open {:.0} MB/s", mb / seal, mb / open);
+    }
+
+    /// A missed wake notice leaves the node refusing links; input at the machine ends that, while
+    /// a DarkWake (idle time only growing, or not readable) doesn't.
+    #[test]
+    fn input_after_a_missed_wake_notice_lets_links_back() {
+        let d = std::env::temp_dir().join(format!("aun-unit-idle-{}", std::process::id()));
+        let cfg = Config { dir: d.join("cfg"), downloads: d.join("dl"), name: "n".into(), port: 0, discovery: false, clipboard: false, secrets: false };
+        let n = Node::start(cfg, |_| {}).unwrap();
+        let s = Duration::from_secs;
+        n.set_sleeping(true);
+        // `None` first: going to sleep took this machine's real idle time as the baseline.
+        for idle in [None, Some(s(40)), Some(s(2))] {
+            n.input_while_asleep(idle);
+            assert!(n.asleep(), "input in the first minute doesn't count: {idle:?}");
+        }
+        n.0.idle.lock().unwrap().1 -= MISSED_WAKE;
+        for idle in [Some(s(45)), Some(s(45)), None, Some(s(3)), Some(s(50))] {
+            n.input_while_asleep(idle);
+            assert!(n.asleep(), "no input seen yet: {idle:?}");
+        }
+        n.input_while_asleep(Some(s(2)));
+        assert!(!n.asleep(), "input since the last look: awake");
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
