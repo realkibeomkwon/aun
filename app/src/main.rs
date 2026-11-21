@@ -153,6 +153,7 @@ impl Ui {
             Note::AlreadySending { key, file } => {
                 self.say(format!("이미 보내는 중이에요: {file}"), tx);
                 self.flash = Some((key, Instant::now() + FLASH_FOR));
+                tx.scroll_into_view_in("transfers", format!("t-{key}"));
                 tx.wake_after(FLASH_FOR);
             }
             Note::Transfer { key, peer_id, peer, file, path, done, total, incoming, finished, failed, cancelled } => {
@@ -905,6 +906,23 @@ mod tests {
         rt.state.flash.as_mut().unwrap().1 = Instant::now() - Duration::from_millis(1);
         assert!(rt.state.expire(), "the mark goes on its own");
         assert!(rt.state.flash.is_none());
+    }
+
+    /// The row a repeated send points at may sit below the visible list: it is scrolled to.
+    #[test]
+    fn the_marked_transfer_is_scrolled_into_view() {
+        let mut ui = Ui::new(None, None);
+        demo(&mut ui);
+        let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let bottom = 560.0 - space::S6;
+        assert!(rt.find("t-3").unwrap().1 > bottom, "below the visible list to begin with");
+        rt.update(|s, tx| s.apply(Note::AlreadySending { key: 3, file: "사진.heic".into() }, tx));
+        for i in 1..60 {
+            rt.frame(i as f64 / 60.0);
+        }
+        let (_, y) = rt.find("t-3").unwrap();
+        assert!(y < bottom, "scrolled into view: {y}");
     }
 
     #[test]
