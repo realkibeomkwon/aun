@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 /// How long a status message stays up.
 const MESSAGE_FOR: Duration = Duration::from_secs(5);
+const FLASH_FOR: Duration = Duration::from_millis(1500);
 
 use aun_core::{Config, Id, Node, Note, PeerView};
 use settings::Settings;
@@ -50,6 +51,8 @@ struct Ui {
     transfers: Vec<Transfer>,
     /// A status line and when it goes away.
     message: Option<(String, Instant)>,
+    /// A transfer row marked for a moment (the one a repeated send would have duplicated).
+    flash: Option<(u64, Instant)>,
     over: Option<Id>,
     /// Where `settings` is saved; None in headless runs.
     dir: Option<PathBuf>,
@@ -65,7 +68,7 @@ impl Ui {
         let settings = dir.as_deref().map(Settings::load).unwrap_or_default();
         let autostart = dir.is_some() && autostart::enabled();
         let mut ui = Ui {
-            node, me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, over: None,
+            node, me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, flash: None, over: None,
             dir, settings, autostart, handle: None, tray: None,
         };
         ui.refresh();
@@ -128,11 +131,16 @@ impl Ui {
 
     /// Drops a status message past its time; true when the view must re-run.
     fn expire(&mut self) -> bool {
-        let old = self.message.as_ref().is_some_and(|(_, until)| *until <= Instant::now());
+        let now = Instant::now();
+        let old = self.message.as_ref().is_some_and(|(_, until)| *until <= now);
         if old {
             self.message = None;
         }
-        old
+        let done = self.flash.is_some_and(|(_, until)| until <= now);
+        if done {
+            self.flash = None;
+        }
+        old || done
     }
 
     fn apply(&mut self, note: Note, tx: &mut Tx) {
@@ -141,6 +149,11 @@ impl Ui {
             Note::Info(m) => {
                 self.say(m, tx);
                 self.refresh();
+            }
+            Note::AlreadySending { key, file } => {
+                self.say(format!("이미 보내는 중이에요: {file}"), tx);
+                self.flash = Some((key, Instant::now() + FLASH_FOR));
+                tx.wake_after(FLASH_FOR);
             }
             Note::Transfer { key, peer_id, peer, file, path, done, total, incoming, finished, failed, cancelled } => {
                 match self.transfers.iter_mut().find(|t| t.key == key) {
@@ -391,10 +404,18 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     if let Some(b) = pair_box(s, t) {
         controls = controls.child(b);
     }
-    if let Some((m, _)) = &s.message {
-        controls = controls.child(text(m.clone()).key("message").font(type_::LABEL).color(t.text_secondary).wrap_anywhere());
-    }
     let mut root = col().key("root").w_full().h_full().padding(space::S6).gap(space::S3).fill(t.bg).child(controls);
+    // Notices sit just above the history, where the files they are about are.
+    if let Some((m, _)) = &s.message {
+        let close = row().key("message-close").role("button").label("닫기").focusable(true).size(24.0, 24.0).center().radius(radius::MD)
+            .hover(t.hover).on_press_tx(|s: &mut Ui, _| s.message = None)
+            .child(rune::icon(&CLOSE, 12.0).color(t.text_secondary));
+        root = root.child(row().key("message-banner").w_full().px(space::S3).py(space::S2).gap(space::S2).center_y()
+            .radius(radius::MD).fill(t.card).border(1.0, tok::accent(0, true))
+            .child(rune::icon(&INFO, 16.0).color(tok::accent(0, true)))
+            .child(text(m.clone()).key("message").font(type_::LABEL).color(t.text).grow(1.0).shrink().wrap_anywhere())
+            .child(close));
+    }
     if !s.transfers.is_empty() {
         root = root.child(transfers(s, t));
     }
@@ -423,6 +444,17 @@ static STOPPED: rune::Icon = rune::Icon {
     name: "aun-stopped",
     view: 24.0,
     body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M7.5 12H16.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>"#,
+};
+
+static INFO: rune::Icon = rune::Icon {
+    name: "aun-info",
+    view: 24.0,
+    body: r#"<circle cx="12" cy="12" r="10.5" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 11V17" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"/><circle cx="12" cy="7.5" r="1.4" fill="currentColor"/>"#,
+};
+static CLOSE: rune::Icon = rune::Icon {
+    name: "aun-close",
+    view: 24.0,
+    body: r#"<path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"/>"#,
 };
 
 /// The ring alone: the faint track a transfer's progress arc runs on.
@@ -491,8 +523,11 @@ fn transfers(s: &Ui, t: Theme) -> El {
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
             .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if failed { red() } else { t.text_secondary }));
+        // The row a repeated send pointed at is outlined in the accent for a moment.
+        let marked = s.flash.is_some_and(|(k, _)| k == x.key);
         let mut r = row().key(format!("t-{}", x.key)).w_full().px(space::S3).py(space::S2).gap(space::S3).center_y()
-            .radius(radius::MD).fill(t.card).border(1.0, t.card_border).child(badge).child(info);
+            .radius(radius::MD).fill(if marked { t.hover } else { t.card })
+            .border(if marked { 2.0 } else { 1.0 }, if marked { tok::accent(0, true) } else { t.card_border }).child(badge).child(info);
         let key = x.key;
         if !x.finished {
             r = r.child(button(format!("t-cancel-{key}"), "취소", t, false, move |s, _| {
@@ -848,6 +883,28 @@ mod tests {
         let short = rt.presented("message").unwrap().0;
         // presented: [x, y, width, height]. Cut to one line, the long one is no taller.
         assert!(long[3] > short[3] * 1.5, "the long message wraps onto more lines: {long:?} vs {short:?}");
+    }
+
+    /// Sending a file that is already going: a banner says so, the row it would repeat is
+    /// marked for a moment, and the banner closes on its ✕.
+    #[test]
+    fn a_repeated_send_points_at_the_transfer_already_going() {
+        let mut ui = Ui::new(None, None);
+        demo(&mut ui);
+        let mut rt = Runtime::new(ui, view, (480.0, 760.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        rt.update(|s, tx| s.apply(Note::AlreadySending { key: 1, file: "보고서.pdf".into() }, tx));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.message.as_ref().is_some_and(|(m, _)| m.contains("이미 보내는 중이에요: 보고서.pdf")));
+        assert_eq!(rt.state.flash.map(|f| f.0), Some(1), "the transfer already going is marked");
+        let (x, y) = rt.find("message-close").expect("the banner's close button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(2.0 / 60.0);
+        assert!(rt.state.message.is_none() && rt.find("message").is_none(), "closed");
+        rt.state.flash.as_mut().unwrap().1 = Instant::now() - Duration::from_millis(1);
+        assert!(rt.state.expire(), "the mark goes on its own");
+        assert!(rt.state.flash.is_none());
     }
 
     #[test]

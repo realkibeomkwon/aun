@@ -355,16 +355,18 @@ fn a_file_already_on_its_way_is_not_queued_again() {
     guest.send_files(host.id(), vec![big.clone(), big.clone()]);
     std::thread::sleep(Duration::from_millis(300));
     guest.send_file(host.id(), big.clone());
-    let (mut keys, mut told) = (std::collections::HashSet::new(), 0);
+    let (mut keys, mut told) = (std::collections::HashSet::new(), Vec::new());
     let end = Instant::now() + Duration::from_secs(2);
     while Instant::now() < end {
         match gn.recv_timeout(Duration::from_millis(50)) {
             Ok(Note::Transfer { key, incoming: false, .. }) => drop(keys.insert(key)),
-            Ok(Note::Info(m)) if m.contains("이미 보내는 중") => told += 1,
+            Ok(Note::AlreadySending { key, file }) => told.push((key, file)),
             _ => {}
         }
     }
     assert_eq!(keys.len(), 1, "one transfer for one file: {keys:?}");
-    assert_eq!(told, 2, "each refused copy is explained");
+    // Each refused copy is reported with the transfer it would have repeated, for the UI to point at.
+    let key = *keys.iter().next().unwrap();
+    assert_eq!(told, vec![(key, "big.bin".to_owned()); 2]);
     guest.cancel(*keys.iter().next().unwrap());
 }

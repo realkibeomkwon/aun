@@ -54,6 +54,9 @@ pub enum Note {
     /// A file going out or coming in. `path` is the source, or where an incoming file lands.
     /// `cancelled` (with `failed`) when either side called it off. `peer_id` is who it is with,
     /// to send it again.
+    /// A file asked to go again while it is still going there: not queued. `key` is the
+    /// transfer already under way (or waiting) for it.
+    AlreadySending { key: u64, file: String },
     Transfer { key: u64, peer_id: Id, peer: String, file: String, path: PathBuf, done: u64, total: u64, incoming: bool, finished: bool, failed: bool, cancelled: bool },
 }
 
@@ -421,9 +424,10 @@ impl Node {
         let mut again = Vec::new();
         for path in paths {
             let o = st.outboxes.get(&id);
-            let busy = o.is_some_and(|o| o.sending.as_ref() == Some(&path) || o.queue.iter().any(|(_, p)| *p == path));
-            if busy || queued.iter().any(|(_, p)| *p == path) {
-                again.push(path);
+            let on_wire = o.and_then(|o| o.current.filter(|_| o.sending.as_ref() == Some(&path))).map(|c| c.1);
+            let waiting = o.into_iter().flat_map(|o| &o.queue).chain(&queued).find(|(_, p)| *p == path).map(|(k, _)| *k);
+            if let Some(key) = on_wire.or(waiting) {
+                again.push((key, path));
                 continue;
             }
             st.next += 1;
@@ -432,8 +436,8 @@ impl Node {
         let start = !st.outboxes.contains_key(&id);
         st.outboxes.entry(id).or_default().queue.extend(queued.iter().cloned());
         drop(st);
-        for path in again {
-            (self.0.notify)(Note::Info(format!("이미 보내는 중이에요: {}", file_name(&path))));
+        for (key, path) in again {
+            (self.0.notify)(Note::AlreadySending { key, file: file_name(&path) });
         }
         for (key, path) in queued {
             let total = std::fs::metadata(&path).map_or(0, |m| m.len());
