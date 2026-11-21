@@ -607,10 +607,12 @@ impl Node {
             let p = st.peers.entry(remote).or_default();
             p.name = name.clone();
             p.paired |= just_paired;
-            // Paired by a typed address (discovery hasn't seen it): keep the address to redial.
-            if just_paired && initiator && !p.nearby {
-                p.typed = sock.peer_addr().ok();
-                p.addr = p.typed;
+            // Paired at an address discovery didn't report (typed, often a VPN while also on the
+            // same Wi-Fi): keep it to redial once the LAN is gone.
+            let dialled = sock.peer_addr().ok();
+            if just_paired && initiator && !(p.nearby && p.addr == dialled) {
+                p.typed = dialled;
+                p.addr = dialled;
             }
             // Both sides dialled: both keep the link whose dialler has the smaller id. The same
             // dialler again means it lost the old link (restart, sleep): the new one wins.

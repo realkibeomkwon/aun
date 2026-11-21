@@ -281,6 +281,20 @@ fn a_device_paired_by_address_reconnects_without_discovery() {
     until("a reconnect nobody asked for", || connected(&guest2, &host));
 }
 
+/// The laptop leaves the LAN: an address typed while discovery also saw the device elsewhere
+/// (Tailscale while on the same Wi-Fi) must still be kept, or nothing redials it.
+#[test]
+fn a_typed_address_is_kept_even_when_discovery_saw_the_device() {
+    let (host, _hn) = node("typed-lan-host", "Host");
+    let (guest, _gn) = node("typed-lan-guest", "Guest");
+    // Discovery reports the host at its LAN address; the user types another one.
+    guest.saw(host.id(), "Host".into(), SocketAddr::from(([192, 168, 0, 4], host.port())));
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let saved = std::fs::read_to_string(dir("typed-lan-guest").join("cfg").join("peers.txt")).unwrap();
+    assert!(saved.contains(&addr(&host).to_string()), "the typed address is saved: {saved}");
+}
+
 /// Going to sleep closes links at once, so the peer stops showing "connected" without waiting
 /// out 35 s of silence, and no link comes back (a DarkWake redial) until the machine wakes.
 #[test]
