@@ -413,6 +413,16 @@ static ARROW_UP: rune::Icon = rune::Icon {
     body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M12 18V6.5M7.25 11.25L12 6.5L16.75 11.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 
+static FAILED: rune::Icon = rune::Icon {
+    name: "aun-failed",
+    view: 24.0,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M8 8L16 16M16 8L8 16" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>"#,
+};
+/// Rune's accents have no red; this one reads on light and dark cards alike.
+fn red() -> rune::Color {
+    rune::oklch(0.63, 0.21, 27.0)
+}
+
 /// The history: one card per file, newest first, in a box that takes the rest of the window.
 fn transfers(s: &Ui, t: Theme) -> El {
     let mut tl = col().w_full().gap(space::S2);
@@ -426,12 +436,18 @@ fn transfers(s: &Ui, t: Theme) -> El {
         };
         // The arrow and its colour say the direction (received green ↓, sent blue ↑); the line
         // below names the peer. Screen readers get the direction from the badge's label.
-        let (arrow, way, tint) = if x.incoming { (&ARROW_DOWN, "받음", tok::accent(4, true)) } else { (&ARROW_UP, "보냄", tok::accent(0, true)) };
+        // A failure (not a cancel, which the user chose) shows a red ✕ instead of the direction.
+        let failed = x.failed && !x.cancelled;
+        let (arrow, way, tint) = match () {
+            _ if failed => (&FAILED, "실패", red()),
+            _ if x.incoming => (&ARROW_DOWN, "받음", tok::accent(4, true)),
+            _ => (&ARROW_UP, "보냄", tok::accent(0, true)),
+        };
         // The ring's diameter runs from the top of the file name to the bottom of the details line.
         let badge = rune::icon(arrow, 32.0).color(tint).label(way);
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
-            .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if x.failed { tok::accent(2, true) } else { t.text_secondary }));
+            .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if failed { red() } else { t.text_secondary }));
         let mut r = row().key(format!("t-{}", x.key)).w_full().px(space::S3).py(space::S2).gap(space::S3).center_y()
             .radius(radius::MD).fill(t.card).border(1.0, t.card_border).child(badge).child(info);
         let key = x.key;
@@ -516,7 +532,7 @@ fn demo(s: &mut Ui) {
     s.transfers = vec![
         Transfer { key: 1, peer: "Windows 노트북".into(), file: "보고서.pdf".into(), path: "보고서.pdf".into(), incoming: false, done: 3 << 20, total: 8 << 20, finished: false, failed: false, cancelled: false },
         Transfer { key: 2, peer: "Windows 노트북".into(), file: "사진.zip".into(), path: "사진.zip".into(), incoming: true, done: 120 << 20, total: 120 << 20, finished: true, failed: false, cancelled: false },
-        Transfer { key: 3, peer: "Windows 노트북".into(), file: "영상.mov".into(), path: "영상.mov".into(), incoming: true, done: 40 << 20, total: 900 << 20, finished: true, failed: true, cancelled: true },
+        Transfer { key: 3, peer: "Windows 노트북".into(), file: "영상.mov".into(), path: "영상.mov".into(), incoming: true, done: 40 << 20, total: 900 << 20, finished: true, failed: true, cancelled: false },
     ];
 }
 
