@@ -501,9 +501,13 @@ fn transfers(s: &Ui, t: Theme) -> El {
                 }
             }));
         } else if !x.incoming && x.failed && s.peers.iter().any(|p| p.id == x.peer_id && p.connected) {
-            // A cancelled or failed send can go again, from the start, as a new transfer.
+            // A cancelled or failed send can go again, from the start, as a new transfer whose
+            // row takes this one's place: one row per file, showing its latest attempt.
             let (id, path) = (x.peer_id, x.path.clone());
-            r = r.child(button(format!("t-retry-{key}"), "다시 보내기", t, false, move |s, _| s.send(id, std::slice::from_ref(&path))));
+            r = r.child(button(format!("t-retry-{key}"), "다시 보내기", t, false, move |s, _| {
+                s.transfers.retain(|t| t.key != key);
+                s.send(id, std::slice::from_ref(&path));
+            }));
         } else if x.incoming && !x.failed {
             let path = x.path.clone();
             r = r.child(button(format!("t-show-{key}"), REVEAL, t, false, move |s, tx| {
@@ -833,6 +837,12 @@ mod tests {
         assert!(rt.find("t-retry-4").is_some(), "the cancelled send to a connected device");
         assert!(rt.find("t-retry-3").is_none(), "a failed receive");
         assert!(rt.find("t-retry-2").is_none(), "a finished receive");
+        // Sending it again replaces the stopped row: one row per file, its latest attempt.
+        let (x, y) = rt.find("t-retry-4").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("t-4").is_none(), "the cancelled row goes once it is sent again");
         rt.state.peers.iter_mut().for_each(|p| p.connected = false);
         rt.invalidate();
         rt.frame(1.0 / 60.0);
