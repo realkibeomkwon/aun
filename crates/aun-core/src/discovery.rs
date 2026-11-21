@@ -139,7 +139,6 @@ pub fn run(me: Id, tcp_port: u16, name: String, mut seen: impl FnMut(Id, String,
         Err(e) => return crate::log(format_args!("discovery off, UDP {PORT}: {e}")),
     };
     let _ = sock.set_broadcast(true);
-    let _ = sock.set_read_timeout(Some(Duration::from_secs(1)));
     let hello = encode(&me, tcp_port, &name);
     let all = SocketAddr::from((Ipv4Addr::BROADCAST, PORT));
     let mut last: std::collections::HashMap<Id, Instant> = Default::default();
@@ -161,6 +160,9 @@ pub fn run(me: Id, tcp_port: u16, name: String, mut seen: impl FnMut(Id, String,
                 alive
             });
         }
+        // Sleep until the next announce is due, not a fixed second: a quiet network wakes this
+        // thread once per round. A zero timeout means "block forever", hence the floor.
+        let _ = sock.set_read_timeout(Some(next.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))));
         let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
         let Some((id, port, name)) = decode(&buf[..n]) else { continue };
         if id == me {
