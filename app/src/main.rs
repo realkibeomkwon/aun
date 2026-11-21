@@ -418,6 +418,32 @@ static FAILED: rune::Icon = rune::Icon {
     view: 24.0,
     body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M8 8L16 16M16 8L8 16" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>"#,
 };
+/// The ring alone: the faint track a transfer's progress arc runs on.
+static RING: rune::Icon = rune::Icon {
+    name: "aun-ring",
+    view: 24.0,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/>"#,
+};
+
+/// The ring's arc for `done` (0 to 1), clockwise from 12 o'clock, in 2% steps: icons are
+/// static, so each step is built once and kept (51 at most, a few KB).
+fn progress_arc(done: f64) -> &'static rune::Icon {
+    use std::f64::consts::{FRAC_PI_2, TAU};
+    static CACHE: std::sync::Mutex<[Option<&'static rune::Icon>; 51]> = std::sync::Mutex::new([None; 51]);
+    let step = (done.clamp(0.0, 1.0) * 50.0).round() as usize;
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache[step].get_or_insert_with(|| {
+        let a = step as f64 / 50.0 * TAU - FRAC_PI_2;
+        let (x, y, large) = (12.0 + 11.0 * a.cos(), 12.0 + 11.0 * a.sin(), u8::from(step > 25));
+        let body: &'static str = match step {
+            0 => "",
+            50 => RING.body,
+            _ => format!(r#"<path d="M12 1A11 11 0 {large} 1 {x:.3} {y:.3}" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" fill="none"/>"#).leak(),
+        };
+        Box::leak(Box::new(rune::Icon { name: "aun-progress", view: 24.0, body }))
+    })
+}
+
 /// Rune's accents have no red; this one reads on light and dark cards alike.
 fn red() -> rune::Color {
     rune::oklch(0.63, 0.21, 27.0)
@@ -444,7 +470,15 @@ fn transfers(s: &Ui, t: Theme) -> El {
             _ => (&ARROW_UP, "보냄", tok::accent(0, true)),
         };
         // Two thirds of the two text lines' height, centred beside them.
-        let badge = rune::icon(arrow, 32.0 * 2.0 / 3.0).color(tint).label(way);
+        let d = 32.0 * 2.0 / 3.0;
+        // Under way: no arrow, the ring itself fills clockwise as the bytes go.
+        let badge = if x.finished {
+            rune::icon(arrow, d).color(tint).label(way)
+        } else {
+            el().size(d, d).label(format!("{way} {pct}%"))
+                .child(rune::icon(&RING, d).absolute(0.0, 0.0).color(tint).opacity(0.25))
+                .child(rune::icon(progress_arc(pct as f64 / 100.0), d).absolute(0.0, 0.0).color(tint))
+        };
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
             .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if failed { red() } else { t.text_secondary }));
@@ -772,6 +806,17 @@ mod tests {
         assert_eq!(parse_addr("10.0.0.2:5000"), Some(([10, 0, 0, 2], 5000).into()));
         assert_eq!(parse_addr("my-pc"), None);
         assert_eq!(parse_addr("192.168.0"), None);
+    }
+
+    #[test]
+    fn progress_rings_fill_with_the_transfer() {
+        assert_eq!(progress_arc(0.0).body, "", "nothing sent: no arc");
+        assert!(progress_arc(1.0).body.starts_with("<circle"), "all sent: the whole ring");
+        let half = progress_arc(0.5).body;
+        assert!(half.contains("A11 11 0 0 1 12.000 23.000"), "half ends at 6 o'clock: {half}");
+        assert!(progress_arc(0.75).body.contains("A11 11 0 1 1"), "past half takes the large arc");
+        assert!(std::ptr::eq(progress_arc(0.371), progress_arc(0.379)), "2% steps share one icon");
+        assert!(std::ptr::eq(progress_arc(-1.0), progress_arc(0.0)) && std::ptr::eq(progress_arc(7.0), progress_arc(1.0)), "clamped");
     }
 
     #[test]
