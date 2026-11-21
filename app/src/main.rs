@@ -405,12 +405,12 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
 static ARROW_DOWN: rune::Icon = rune::Icon {
     name: "aun-arrow-down",
     view: 24.0,
-    body: r#"<path d="M12 2.5V21M5 14L12 21L19 14" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+    body: r#"<path d="M12 1.5V22.5M5 15.5L12 22.5L19 15.5" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 static ARROW_UP: rune::Icon = rune::Icon {
     name: "aun-arrow-up",
     view: 24.0,
-    body: r#"<path d="M12 21.5V3M5 10L12 3L19 10" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+    body: r#"<path d="M12 22.5V1.5M5 8.5L12 1.5L19 8.5" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 
 /// The history: one card per file, newest first, in a box that takes the rest of the window.
@@ -427,8 +427,8 @@ fn transfers(s: &Ui, t: Theme) -> El {
         // The arrow and its colour say the direction (received green ↓, sent blue ↑); the line
         // below names the peer. Screen readers get the direction from the badge's label.
         let (arrow, way, tint) = if x.incoming { (&ARROW_DOWN, "받음", tok::accent(4, true)) } else { (&ARROW_UP, "보냄", tok::accent(0, true)) };
-        // As tall as the two lines beside it (file name + details).
-        let badge = rune::icon(arrow, 40.0).color(tint).label(way);
+        // From the top of the file name to the bottom of the details line.
+        let badge = rune::icon(arrow, 32.0).color(tint).label(way);
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
             .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if x.failed { tok::accent(2, true) } else { t.text_secondary }));
