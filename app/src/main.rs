@@ -411,12 +411,14 @@ fn transfers(s: &Ui, t: Theme) -> El {
             _ if x.finished => "완료".into(),
             _ => format!("{pct}%"),
         };
-        let (arrow, way) = if x.incoming { ("↓", format!("{}에서 받음", x.peer)) } else { ("↑", format!("{}에게 보냄", x.peer)) };
-        let badge = el().size(28.0, 28.0).radius(14.0).center().fill(if x.incoming { tok::accent(0, true) } else { t.control_off })
-            .child(text(arrow).font(type_::BODY).color(if x.incoming { rune::oklch(0.99, 0.0, 0.0) } else { t.text }));
+        // The arrow and its colour say the direction (received green ↓, sent blue ↑); the line
+        // below names the peer. Screen readers get the direction from the badge's label.
+        let (arrow, way, tint) = if x.incoming { ("↓", "받음", tok::accent(4, true)) } else { ("↑", "보냄", tok::accent(0, true)) };
+        let badge = el().size(28.0, 28.0).radius(14.0).center().fill(tint).role("image").label(way)
+            .child(text(arrow).font(type_::BODY).color(rune::oklch(0.99, 0.0, 0.0)));
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
-            .child(text(format!("{way} · {} · {state}", size(x.total))).font(type_::LABEL).color(if x.failed { tok::accent(1, true) } else { t.text_secondary }));
+            .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if x.failed { tok::accent(2, true) } else { t.text_secondary }));
         let mut r = row().key(format!("t-{}", x.key)).w_full().px(space::S3).py(space::S2).gap(space::S3).center_y()
             .radius(radius::MD).fill(t.card).border(1.0, t.card_border).child(badge).child(info);
         let key = x.key;
