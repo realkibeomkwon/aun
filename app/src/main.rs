@@ -24,7 +24,8 @@ use rune::{App, AppHandle, AppSpec, Cx, El, FileDialogOptions, ScrollSpec, TextE
 
 struct Transfer {
     key: u64,
-    label: String,
+    peer: String,
+    file: String,
     path: PathBuf,
     incoming: bool,
     done: u64,
@@ -141,10 +142,9 @@ impl Ui {
                 self.refresh();
             }
             Note::Transfer { key, peer, file, path, done, total, incoming, finished, failed, cancelled } => {
-                let label = if incoming { format!("{peer} → {file}") } else { format!("{file} → {peer}") };
                 match self.transfers.iter_mut().find(|t| t.key == key) {
                     Some(t) => (t.done, t.finished, t.failed, t.cancelled) = (done, finished, failed, cancelled),
-                    None => self.transfers.insert(0, Transfer { key, label, path, incoming, done, total, finished, failed, cancelled }),
+                    None => self.transfers.insert(0, Transfer { key, peer, file, path, incoming, done, total, finished, failed, cancelled }),
                 }
                 // Keep every unfinished one (a dropped pile waits in line) and the latest 100 done:
                 // a big pile stays checkable, at about 100 bytes a row.
@@ -383,48 +383,62 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         list = list.child(peer_row(p, s, t));
     }
 
-    // Scrolls once a pile of transfers outgrows the window.
-    let mut root = col().key("root").w_full().h_full().scroll(ScrollSpec { stick_bottom: false }).padding(space::S6).gap(space::S3).fill(t.bg)
+    // The controls stay put while the transfer history below scrolls on its own. In a short
+    // window the controls give way first (and scroll), keeping a few history rows in view.
+    let mut controls = col().key("controls").w_full().shrink().min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).gap(space::S3)
         .child(header).child(prefs).child(folder).child(code).child(list).child(by_address(s, t));
     if let Some(b) = pair_box(s, t) {
-        root = root.child(b);
-    }
-    if !s.transfers.is_empty() {
-        let mut tl = col().key("transfers").w_full().gap(space::S1);
-        for x in &s.transfers {
-            let pct = (x.done * 100).checked_div(x.total).unwrap_or(100);
-            let state = match () {
-                _ if x.cancelled => "취소됨".to_owned(),
-                _ if x.failed => "실패".into(),
-                _ if x.finished => "완료".into(),
-                _ => format!("{pct}%"),
-            };
-            let mut r = row().key(format!("t-{}", x.key)).w_full().gap(space::S2).center_y()
-                .child(text(x.label.clone()).font(type_::LABEL).color(t.text).grow(1.0).shrink().wrap_anywhere())
-                .child(text(format!("{state} · {}", size(x.total))).font(type_::LABEL).color(t.text_secondary));
-            let key = x.key;
-            if !x.finished {
-                r = r.child(button(format!("t-cancel-{key}"), "취소", t, false, move |s, _| {
-                    if let Some(n) = &s.node {
-                        n.cancel(key);
-                    }
-                }));
-            } else if x.incoming && !x.failed {
-                let path = x.path.clone();
-                r = r.child(button(format!("t-show-{key}"), REVEAL, t, false, move |s, tx| {
-                    if let Err(e) = reveal(&path) {
-                        s.say(format!("폴더를 열지 못했어요: {e}"), tx);
-                    }
-                }));
-            }
-            tl = tl.child(r);
-        }
-        root = root.child(tl);
+        controls = controls.child(b);
     }
     if let Some((m, _)) = &s.message {
-        root = root.child(text(m.clone()).key("message").font(type_::LABEL).color(t.text_secondary));
+        controls = controls.child(text(m.clone()).key("message").font(type_::LABEL).color(t.text_secondary));
+    }
+    let mut root = col().key("root").w_full().h_full().padding(space::S6).gap(space::S3).fill(t.bg).child(controls);
+    if !s.transfers.is_empty() {
+        root = root.child(transfers(s, t));
     }
     root
+}
+
+/// The history: one card per file, newest first, in a box that takes the rest of the window.
+fn transfers(s: &Ui, t: Theme) -> El {
+    let mut tl = col().w_full().gap(space::S2);
+    for x in &s.transfers {
+        let pct = (x.done * 100).checked_div(x.total).unwrap_or(100);
+        let state = match () {
+            _ if x.cancelled => "취소됨".to_owned(),
+            _ if x.failed => "실패".into(),
+            _ if x.finished => "완료".into(),
+            _ => format!("{pct}%"),
+        };
+        let (arrow, way) = if x.incoming { ("↓", format!("{}에서 받음", x.peer)) } else { ("↑", format!("{}에게 보냄", x.peer)) };
+        let badge = el().size(28.0, 28.0).radius(14.0).center().fill(if x.incoming { tok::accent(0, true) } else { t.control_off })
+            .child(text(arrow).font(type_::BODY).color(if x.incoming { rune::oklch(0.99, 0.0, 0.0) } else { t.text }));
+        let info = col().grow(1.0).shrink().gap(2.0)
+            .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
+            .child(text(format!("{way} · {} · {state}", size(x.total))).font(type_::LABEL).color(if x.failed { tok::accent(1, true) } else { t.text_secondary }));
+        let mut r = row().key(format!("t-{}", x.key)).w_full().px(space::S3).py(space::S2).gap(space::S3).center_y()
+            .radius(radius::MD).fill(t.card).border(1.0, t.card_border).child(badge).child(info);
+        let key = x.key;
+        if !x.finished {
+            r = r.child(button(format!("t-cancel-{key}"), "취소", t, false, move |s, _| {
+                if let Some(n) = &s.node {
+                    n.cancel(key);
+                }
+            }));
+        } else if x.incoming && !x.failed {
+            let path = x.path.clone();
+            r = r.child(button(format!("t-show-{key}"), REVEAL, t, false, move |s, tx| {
+                if let Err(e) = reveal(&path) {
+                    s.say(format!("폴더를 열지 못했어요: {e}"), tx);
+                }
+            }));
+        }
+        tl = tl.child(r);
+    }
+    col().w_full().grow(1.0).min_h(150.0).gap(space::S2)
+        .child(text(format!("전송 기록 {}", s.transfers.len())).font(type_::LABEL).color(t.text_secondary))
+        .child(col().key("transfers").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).child(tl))
 }
 
 const REVEAL: &str = if cfg!(windows) { "탐색기에서 보기" } else { "Finder에서 보기" };
@@ -485,9 +499,9 @@ fn demo(s: &mut Ui) {
     s.pairing = Some(("Mac mini".into(), ([192, 168, 0, 3], 47810).into()));
     s.code_input = TextEdit::new("123 4");
     s.transfers = vec![
-        Transfer { key: 1, label: "보고서.pdf → Windows 노트북".into(), path: "보고서.pdf".into(), incoming: false, done: 3 << 20, total: 8 << 20, finished: false, failed: false, cancelled: false },
-        Transfer { key: 2, label: "Windows 노트북 → 사진.zip".into(), path: "사진.zip".into(), incoming: true, done: 120 << 20, total: 120 << 20, finished: true, failed: false, cancelled: false },
-        Transfer { key: 3, label: "Windows 노트북 → 영상.mov".into(), path: "영상.mov".into(), incoming: true, done: 40 << 20, total: 900 << 20, finished: true, failed: true, cancelled: true },
+        Transfer { key: 1, peer: "Windows 노트북".into(), file: "보고서.pdf".into(), path: "보고서.pdf".into(), incoming: false, done: 3 << 20, total: 8 << 20, finished: false, failed: false, cancelled: false },
+        Transfer { key: 2, peer: "Windows 노트북".into(), file: "사진.zip".into(), path: "사진.zip".into(), incoming: true, done: 120 << 20, total: 120 << 20, finished: true, failed: false, cancelled: false },
+        Transfer { key: 3, peer: "Windows 노트북".into(), file: "영상.mov".into(), path: "영상.mov".into(), incoming: true, done: 40 << 20, total: 900 << 20, finished: true, failed: true, cancelled: true },
     ];
 }
 
@@ -655,33 +669,39 @@ mod tests {
         demo(&mut ui);
         let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
         rt.frame(0.0);
+        // The window's content ends at its bottom padding; the list is clipped there.
+        let bottom = 560.0 - space::S6;
         let (_, y) = rt.find("t-3").expect("the last transfer row");
-        assert!(y > 560.0, "below the window to begin with: {y}");
+        assert!(y > bottom, "below the visible list to begin with: {y}");
+        let (lx, ly) = rt.find("transfers").expect("the transfer list");
         for i in 0..30 {
-            rt.wheel_xy(240.0, 300.0, 0.0, -40.0);
+            rt.wheel_xy(lx, ly, 0.0, -40.0);
             rt.frame(i as f64 / 60.0 + 0.1);
         }
         let (_, y) = rt.find("t-3").unwrap();
-        assert!(y < 560.0, "scrolled into view: {y}");
+        assert!(y < bottom, "scrolled into view: {y}");
     }
 
-    fn finished(key: u64, label: String) -> Transfer {
-        Transfer { key, path: format!("{label}.bin").into(), label, incoming: true, done: 1, total: 1, finished: true, failed: false, cancelled: false }
+    fn finished(key: u64, file: String) -> Transfer {
+        Transfer { key, peer: "Windows 노트북".into(), path: file.clone().into(), file, incoming: true, done: 1, total: 1, finished: true, failed: false, cancelled: false }
     }
 
     /// A dropped pile of files: every row stays reachable, the oldest at the bottom.
     #[test]
     fn every_transfer_of_a_pile_can_be_scrolled_to() {
         let mut ui = Ui::new(None, None);
-        ui.transfers = (1..=30).rev().map(|k| finished(k, format!("Windows 노트북 → 파일 {k}"))).collect();
+        ui.transfers = (1..=30).rev().map(|k| finished(k, format!("파일 {k}.jpeg"))).collect();
         let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
         rt.frame(0.0);
+        let header = rt.find("clip").expect("the clipboard switch");
+        let (lx, ly) = rt.find("transfers").expect("the transfer list");
         for i in 0..200 {
-            rt.wheel_xy(240.0, 300.0, 0.0, -40.0);
+            rt.wheel_xy(lx, ly, 0.0, -40.0);
             rt.frame(i as f64 / 60.0 + 0.1);
         }
         let (_, y) = rt.find("t-1").expect("the oldest of 30 rows");
         assert!(y < 560.0, "scrolled into view: {y}");
+        assert_eq!(rt.find("clip"), Some(header), "only the list scrolls; the controls above stay put");
     }
 
     /// A long file name wraps inside the window instead of pushing the row's button off it.
@@ -689,7 +709,7 @@ mod tests {
     fn a_long_file_name_keeps_its_row_inside_the_window() {
         let mut ui = Ui::new(None, None);
         let long = "아주_긴_파일_이름_".repeat(12) + "끝.mov";
-        ui.transfers = vec![finished(1, format!("Windows 노트북 → {long}"))];
+        ui.transfers = vec![finished(1, long)];
         let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
         rt.frame(0.0);
         let (x, _) = rt.find("t-show-1").expect("the reveal button");
