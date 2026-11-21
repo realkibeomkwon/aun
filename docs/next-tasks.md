@@ -7,7 +7,7 @@
 
 - 야간 배치(CI, 트레이·자동 실행, 비밀번호 클립보드 제외, 클립보드 이미지, 파일 받기 개선, 연결 견고성, 성능 측정, KVM 설계)는 `main`에 병합했다. CI는 macOS와 Windows에서 통과한다.
 - 실기기에서 확인한 것: 클립보드 이미지 동기화(Mac ↔ Windows). Mac 로그 `clipboard image 1536x2048 to 1710 KB PNG in 12 ms`.
-- Mac에서 실행 중인 Aun은 워크트리 `.claude/worktrees/overnight-a68e04`의 release 빌드다(`main`과 같은 코드). 워크트리를 지우기 전에 `main` 체크아웃에서 다시 빌드해 실행한다.
+- 1번 실기기 점검 결과와 지금 실행 중인 빌드는 `docs/device-check.md`에 있다.
 - 링크 로그: `~/Library/Application Support/Aun/aun.log`, `%APPDATA%\Aun\aun.log`.
 - 사용자의 우선순위: **성능, 속도, 낮은 메모리 사용량, 최적화**. 대상은 macOS와 Windows뿐이다.
 
