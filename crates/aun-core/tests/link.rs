@@ -403,8 +403,9 @@ fn a_stopped_send_resumes_where_it_stopped() {
     let _ = std::fs::remove_dir_all(&src);
     std::fs::create_dir_all(&src).unwrap();
     let big = src.join("big.bin");
-    // Debug builds move about 12 MB/s on loopback: small enough to finish, big enough to stop midway.
-    let size: u64 = 64 << 20;
+    // A debug build on the Windows runner moves about 2.6 MB/s on loopback (64 MiB went past the
+    // 30 s wait there): small enough to finish, big enough to stop midway.
+    let size: u64 = 16 << 20;
     // Sparse, with marks at both ends and the middle: bytes before and after the resume point.
     let mark = |at: u64, byte: u8| {
         let mut f = std::fs::OpenOptions::new().write(true).open(&big).unwrap();
