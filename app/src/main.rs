@@ -24,6 +24,7 @@ use rune::{App, AppHandle, AppSpec, Cx, El, FileDialogOptions, ScrollSpec, TextE
 
 struct Transfer {
     key: u64,
+    peer_id: Id,
     peer: String,
     file: String,
     path: PathBuf,
@@ -141,10 +142,10 @@ impl Ui {
                 self.say(m, tx);
                 self.refresh();
             }
-            Note::Transfer { key, peer, file, path, done, total, incoming, finished, failed, cancelled } => {
+            Note::Transfer { key, peer_id, peer, file, path, done, total, incoming, finished, failed, cancelled } => {
                 match self.transfers.iter_mut().find(|t| t.key == key) {
                     Some(t) => (t.done, t.finished, t.failed, t.cancelled) = (done, finished, failed, cancelled),
-                    None => self.transfers.insert(0, Transfer { key, peer, file, path, incoming, done, total, finished, failed, cancelled }),
+                    None => self.transfers.insert(0, Transfer { key, peer_id, peer, file, path, incoming, done, total, finished, failed, cancelled }),
                 }
                 // Keep every unfinished one (a dropped pile waits in line) and the latest 100 done:
                 // a big pile stays checkable, at about 100 bytes a row.
@@ -418,6 +419,12 @@ static FAILED: rune::Icon = rune::Icon {
     view: 24.0,
     body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M8 8L16 16M16 8L8 16" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>"#,
 };
+static STOPPED: rune::Icon = rune::Icon {
+    name: "aun-stopped",
+    view: 24.0,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M7.5 12H16.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>"#,
+};
+
 /// The ring alone: the faint track a transfer's progress arc runs on.
 static RING: rune::Icon = rune::Icon {
     name: "aun-ring",
@@ -466,6 +473,8 @@ fn transfers(s: &Ui, t: Theme) -> El {
         let failed = x.failed && !x.cancelled;
         let (arrow, way, tint) = match () {
             _ if failed => (&FAILED, "실패", red()),
+            // Called off by either side: grey, nothing went wrong.
+            _ if x.finished && x.cancelled => (&STOPPED, "취소됨", t.text_secondary),
             _ if x.incoming => (&ARROW_DOWN, "받음", tok::accent(4, true)),
             _ => (&ARROW_UP, "보냄", tok::accent(0, true)),
         };
@@ -491,6 +500,10 @@ fn transfers(s: &Ui, t: Theme) -> El {
                     n.cancel(key);
                 }
             }));
+        } else if !x.incoming && x.failed && s.peers.iter().any(|p| p.id == x.peer_id && p.connected) {
+            // A cancelled or failed send can go again, from the start, as a new transfer.
+            let (id, path) = (x.peer_id, x.path.clone());
+            r = r.child(button(format!("t-retry-{key}"), "다시 보내기", t, false, move |s, _| s.send(id, std::slice::from_ref(&path))));
         } else if x.incoming && !x.failed {
             let path = x.path.clone();
             r = r.child(button(format!("t-show-{key}"), REVEAL, t, false, move |s, tx| {
@@ -564,9 +577,10 @@ fn demo(s: &mut Ui) {
     s.pairing = Some(("Mac mini".into(), ([192, 168, 0, 3], 47810).into()));
     s.code_input = TextEdit::new("123 4");
     s.transfers = vec![
-        Transfer { key: 1, peer: "Windows 노트북".into(), file: "보고서.pdf".into(), path: "보고서.pdf".into(), incoming: false, done: 3 << 20, total: 8 << 20, finished: false, failed: false, cancelled: false },
-        Transfer { key: 2, peer: "Windows 노트북".into(), file: "사진.zip".into(), path: "사진.zip".into(), incoming: true, done: 120 << 20, total: 120 << 20, finished: true, failed: false, cancelled: false },
-        Transfer { key: 3, peer: "Windows 노트북".into(), file: "영상.mov".into(), path: "영상.mov".into(), incoming: true, done: 40 << 20, total: 900 << 20, finished: true, failed: true, cancelled: false },
+        Transfer { key: 4, peer_id: [1; 32], peer: "Windows 노트북".into(), file: "발표.key".into(), path: "발표.key".into(), incoming: false, done: 2 << 20, total: 30 << 20, finished: true, failed: true, cancelled: true },
+        Transfer { key: 1, peer_id: [1; 32], peer: "Windows 노트북".into(), file: "보고서.pdf".into(), path: "보고서.pdf".into(), incoming: false, done: 3 << 20, total: 8 << 20, finished: false, failed: false, cancelled: false },
+        Transfer { key: 2, peer_id: [1; 32], peer: "Windows 노트북".into(), file: "사진.zip".into(), path: "사진.zip".into(), incoming: true, done: 120 << 20, total: 120 << 20, finished: true, failed: false, cancelled: false },
+        Transfer { key: 3, peer_id: [1; 32], peer: "Windows 노트북".into(), file: "영상.mov".into(), path: "영상.mov".into(), incoming: true, done: 40 << 20, total: 900 << 20, finished: true, failed: true, cancelled: false },
     ];
 }
 
@@ -748,7 +762,7 @@ mod tests {
     }
 
     fn finished(key: u64, file: String) -> Transfer {
-        Transfer { key, peer: "Windows 노트북".into(), path: file.clone().into(), file, incoming: true, done: 1, total: 1, finished: true, failed: false, cancelled: false }
+        Transfer { key, peer_id: [1; 32], peer: "Windows 노트북".into(), path: file.clone().into(), file, incoming: true, done: 1, total: 1, finished: true, failed: false, cancelled: false }
     }
 
     /// A dropped pile of files: every row stays reachable, the oldest at the bottom.
@@ -806,6 +820,23 @@ mod tests {
         assert_eq!(parse_addr("10.0.0.2:5000"), Some(([10, 0, 0, 2], 5000).into()));
         assert_eq!(parse_addr("my-pc"), None);
         assert_eq!(parse_addr("192.168.0"), None);
+    }
+
+    /// A send the user cancelled (or that failed) can go again while the device is connected;
+    /// a received file can't be asked for from this side.
+    #[test]
+    fn a_stopped_send_offers_to_send_it_again() {
+        let mut ui = Ui::new(None, None);
+        demo(&mut ui);
+        let mut rt = Runtime::new(ui, view, (480.0, 760.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        assert!(rt.find("t-retry-4").is_some(), "the cancelled send to a connected device");
+        assert!(rt.find("t-retry-3").is_none(), "a failed receive");
+        assert!(rt.find("t-retry-2").is_none(), "a finished receive");
+        rt.state.peers.iter_mut().for_each(|p| p.connected = false);
+        rt.invalidate();
+        rt.frame(1.0 / 60.0);
+        assert!(rt.find("t-retry-4").is_none(), "nowhere to send it while offline");
     }
 
     #[test]

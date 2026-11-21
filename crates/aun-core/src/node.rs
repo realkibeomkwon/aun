@@ -52,8 +52,9 @@ pub enum Note {
     Changed,
     Info(String),
     /// A file going out or coming in. `path` is the source, or where an incoming file lands.
-    /// `cancelled` (with `failed`) when either side called it off.
-    Transfer { key: u64, peer: String, file: String, path: PathBuf, done: u64, total: u64, incoming: bool, finished: bool, failed: bool, cancelled: bool },
+    /// `cancelled` (with `failed`) when either side called it off. `peer_id` is who it is with,
+    /// to send it again.
+    Transfer { key: u64, peer_id: Id, peer: String, file: String, path: PathBuf, done: u64, total: u64, incoming: bool, finished: bool, failed: bool, cancelled: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -424,7 +425,7 @@ impl Node {
         drop(st);
         for (key, path) in queued {
             let total = std::fs::metadata(&path).map_or(0, |m| m.len());
-            (self.0.notify)(Note::Transfer { key, peer: peer.clone(), file: file_name(&path), path, done: 0, total, incoming: false, finished: false, failed: false, cancelled: false });
+            (self.0.notify)(Note::Transfer { key, peer_id: id, peer: peer.clone(), file: file_name(&path), path, done: 0, total, incoming: false, finished: false, failed: false, cancelled: false });
         }
         if start {
             let n = self.clone();
@@ -447,7 +448,7 @@ impl Node {
                 (key, path, tx)
             };
             let res = match tx {
-                Some(tx) => self.stream_file(tx, key, peer, &path),
+                Some(tx) => self.stream_file(tx, key, id, peer, &path),
                 None => Err(io::Error::new(io::ErrorKind::BrokenPipe, "연결이 끊겼어요")),
             };
             let cancelled = {
@@ -471,14 +472,14 @@ impl Node {
     }
 
     /// Sends one file; every outcome ends in a finished note.
-    fn stream_file(&self, tx: SyncSender<Frame>, key: u64, peer: &str, path: &Path) -> io::Result<()> {
+    fn stream_file(&self, tx: SyncSender<Frame>, key: u64, peer_id: Id, peer: &str, path: &Path) -> io::Result<()> {
         let cancelled = || self.st().cancelled.contains(&key);
         let total = std::fs::metadata(path).map_or(0, |m| m.len());
         let name = file_name(path);
         let id = key as u32;
         let gone = || io::Error::new(io::ErrorKind::BrokenPipe, "연결이 끊겼어요");
         let note = |done, finished, failed, cancelled| {
-            (self.0.notify)(Note::Transfer { key, peer: peer.into(), file: name.clone(), path: path.into(), done, total, incoming: false, finished, failed, cancelled })
+            (self.0.notify)(Note::Transfer { key, peer_id, peer: peer.into(), file: name.clone(), path: path.into(), done, total, incoming: false, finished, failed, cancelled })
         };
         let stopped = || io::Error::other("cancelled");
         if cancelled() {
@@ -782,7 +783,7 @@ impl<'a> Incoming<'a> {
     fn note(&self, f: &InFile, finished: bool, failed: bool, cancelled: bool) {
         let file = f.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let (key, done, total, path) = (f.key, f.done, f.size, f.path.clone());
-        (self.node.0.notify)(Note::Transfer { key, peer: self.peer.clone(), file, path, done, total, incoming: true, finished, failed, cancelled });
+        (self.node.0.notify)(Note::Transfer { key, peer_id: self.remote, peer: self.peer.clone(), file, path, done, total, incoming: true, finished, failed, cancelled });
     }
 
     /// Never blocks: this thread reads, and a blocked reader can stall both writers.
