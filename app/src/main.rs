@@ -400,17 +400,17 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     root
 }
 
-/// Direction arrows for the transfer history: a long shaft and an open head, drawn in the
+/// Direction arrows for the transfer history: an arrow inside a ring, both stroked in the
 /// element's colour.
 static ARROW_DOWN: rune::Icon = rune::Icon {
     name: "aun-arrow-down",
     view: 24.0,
-    body: r#"<path d="M12 1.5V22.5M5 15.5L12 22.5L19 15.5" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M12 6V17.5M7.25 12.75L12 17.5L16.75 12.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 static ARROW_UP: rune::Icon = rune::Icon {
     name: "aun-arrow-up",
     view: 24.0,
-    body: r#"<path d="M12 22.5V1.5M5 8.5L12 1.5L19 8.5" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M12 18V6.5M7.25 11.25L12 6.5L16.75 11.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 
 /// The history: one card per file, newest first, in a box that takes the rest of the window.
@@ -427,7 +427,7 @@ fn transfers(s: &Ui, t: Theme) -> El {
         // The arrow and its colour say the direction (received green ↓, sent blue ↑); the line
         // below names the peer. Screen readers get the direction from the badge's label.
         let (arrow, way, tint) = if x.incoming { (&ARROW_DOWN, "받음", tok::accent(4, true)) } else { (&ARROW_UP, "보냄", tok::accent(0, true)) };
-        // From the top of the file name to the bottom of the details line.
+        // The ring's diameter runs from the top of the file name to the bottom of the details line.
         let badge = rune::icon(arrow, 32.0).color(tint).label(way);
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
