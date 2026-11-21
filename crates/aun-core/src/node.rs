@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +75,8 @@ struct Link {
     initiator: Id,
     tx: SyncSender<Frame>,
     sock: TcpStream,
+    /// The peer's build can say where a stopped file goes on from.
+    resume: bool,
 }
 
 #[derive(Default)]
@@ -102,6 +104,16 @@ struct Outbox {
     current: Option<(u32, u64)>,
     /// Its path, so the same file isn't queued again while it goes.
     sending: Option<PathBuf>,
+    /// Where the reader hands over the peer's `FileFrom` for the file on the wire.
+    from: Option<SyncSender<u64>>,
+}
+
+/// What a receiver kept of a file whose sender stopped or whose link dropped.
+struct Partial {
+    size: u64,
+    mtime: u64,
+    /// Where the finished file goes; its `.part` holds what arrived.
+    path: PathBuf,
 }
 
 #[derive(Default)]
@@ -113,6 +125,12 @@ struct St {
     outboxes: HashMap<Id, Outbox>,
     /// Transfers (by key) to stop at the next chunk.
     cancelled: HashSet<u64>,
+    /// Files that stopped on their way to a peer: sent again, they ask where to go on from.
+    unfinished: HashSet<(Id, PathBuf)>,
+    /// Kept `.part`s by sender and file name.
+    /// shortcut: in memory, so a restart forgets them (the `.part` stays, unused); persist if
+    /// stopped sends across restarts turn out to matter.
+    partials: HashMap<(Id, String), Partial>,
 }
 
 struct Shared {
@@ -467,15 +485,16 @@ impl Node {
                     st.outboxes.remove(&id);
                     return;
                 };
-                let tx = st.peers.get(&id).and_then(|p| p.link.as_ref()).map(|l| l.tx.clone());
+                let link = st.peers.get(&id).and_then(|p| p.link.as_ref()).map(|l| (l.tx.clone(), l.resume));
+                let ask = link.as_ref().is_some_and(|l| l.1) && st.unfinished.contains(&(id, path.clone()));
                 if let Some(o) = st.outboxes.get_mut(&id) {
                     o.current = Some((key as u32, key));
                     o.sending = Some(path.clone());
                 }
-                (key, path, tx)
+                (key, path, link.map(|l| (l.0, ask)))
             };
             let res = match tx {
-                Some(tx) => self.stream_file(tx, key, id, peer, &path),
+                Some((tx, ask)) => self.stream_file(tx, ask, key, id, peer, &path),
                 None => Err(io::Error::new(io::ErrorKind::BrokenPipe, "연결이 끊겼어요")),
             };
             let cancelled = {
@@ -483,6 +502,10 @@ impl Node {
                 if let Some(o) = st.outboxes.get_mut(&id) {
                     o.current = None;
                     o.sending = None;
+                    o.from = None;
+                }
+                if res.is_ok() {
+                    st.unfinished.remove(&(id, path.clone()));
                 }
                 st.cancelled.remove(&key)
             };
@@ -494,15 +517,20 @@ impl Node {
         }
     }
 
-    /// Stops a transfer, either way. An incoming one loses its `.part`; the other side is told.
+    /// Stops a transfer, either way; the other side is told. Stopped here, an incoming one loses
+    /// its `.part`; stopped at the sender, the receiver keeps it for the send to go on later.
     pub fn cancel(&self, key: u64) {
         self.st().cancelled.insert(key);
     }
 
-    /// Sends one file; every outcome ends in a finished note.
-    fn stream_file(&self, tx: SyncSender<Frame>, key: u64, peer_id: Id, peer: &str, path: &Path) -> io::Result<()> {
+    /// Sends one file; every outcome ends in a finished note. `ask`: it stopped before, so ask the
+    /// receiver how much it kept and send only the rest.
+    fn stream_file(&self, tx: SyncSender<Frame>, ask: bool, key: u64, peer_id: Id, peer: &str, path: &Path) -> io::Result<()> {
         let cancelled = || self.st().cancelled.contains(&key);
-        let total = std::fs::metadata(path).map_or(0, |m| m.len());
+        let meta = std::fs::metadata(path).ok();
+        let total = meta.as_ref().map_or(0, |m| m.len());
+        let mtime = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok()).map(|d| d.as_nanos() as u64);
+        let ask = ask && mtime.is_some();
         let name = file_name(path);
         let id = key as u32;
         let gone = || io::Error::new(io::ErrorKind::BrokenPipe, "연결이 끊겼어요");
@@ -514,9 +542,40 @@ impl Node {
             note(0, true, true, true);
             return Err(stopped());
         }
-        let opened = File::open(path).and_then(|f| tx.send(Frame::FileStart { id, size: total, name: name.clone() }).map(|_| f).map_err(|_| gone()));
+        let (from_tx, from) = mpsc::sync_channel(1);
+        if ask && let Some(o) = self.st().outboxes.get_mut(&peer_id) {
+            o.from = Some(from_tx);
+        }
+        let opened = File::open(path).and_then(|f| tx.send(Frame::FileStart { id, size: total, name: name.clone(), mtime, resume: ask }).map(|_| f).map_err(|_| gone()));
         let mut f = opened.inspect_err(|_| note(0, true, true, false))?;
-        let (mut done, mut told) = (0u64, Instant::now());
+        // From here the receiver may hold part of it: a later try asks.
+        self.st().unfinished.insert((peer_id, path.into()));
+        let offset = if ask {
+            let asked = Instant::now();
+            loop {
+                match from.recv_timeout(Duration::from_millis(200)) {
+                    // More than the file holds is nonsense: from the start, then.
+                    Ok(o) => break if o <= total { o } else { 0 },
+                    Err(_) if cancelled() => {
+                        let _ = tx.send(Frame::FileAbort { id, cancelled: true });
+                        note(0, true, true, true);
+                        return Err(stopped());
+                    }
+                    Err(_) if asked.elapsed() > DEAD || self.st().peers.get(&peer_id).is_none_or(|p| p.link.is_none()) => {
+                        note(0, true, true, false);
+                        return Err(gone());
+                    }
+                    Err(_) => {}
+                }
+            }
+        } else {
+            0
+        };
+        if offset > 0 {
+            crate::log(format_args!("sending {name} from {offset} of {total} bytes"));
+            f.seek(SeekFrom::Start(offset)).inspect_err(|_| note(0, true, true, false))?;
+        }
+        let (mut done, mut told) = (offset, Instant::now());
         loop {
             if cancelled() {
                 let _ = tx.send(Frame::FileAbort { id, cancelled: true });
@@ -576,9 +635,9 @@ impl Node {
         rsock.set_read_timeout(Some(DEAD))?;
         let mut r = OpenReader::new(t, BufReader::with_capacity(128 << 10, rsock));
 
-        wire::write_frame(&mut w, &Frame::Hello { pair: pair.is_some(), name: self.0.name.clone() })?;
+        wire::write_frame(&mut w, &Frame::Hello { pair: pair.is_some(), name: self.0.name.clone(), resume: true })?;
         w.flush()?;
-        let Frame::Hello { pair: they_pair, name } = wire::read_frame(&mut r)? else { return Err(denied("hello")) };
+        let Frame::Hello { pair: they_pair, name, resume } = wire::read_frame(&mut r)? else { return Err(denied("hello")) };
         let name = store::clean_name(&name);
 
         // Marked paired only when the link registers below: in between, discovery would see a
@@ -632,7 +691,7 @@ impl Node {
             st.next += 1;
             let conn = st.next;
             let initiator_id = if initiator { self.0.id } else { remote };
-            let link = Link { conn, initiator: initiator_id, tx: tx.clone(), sock: sock.try_clone()? };
+            let link = Link { conn, initiator: initiator_id, tx: tx.clone(), sock: sock.try_clone()?, resume };
             let p = st.peers.entry(remote).or_default();
             p.name = name.clone();
             p.paired |= just_paired;
@@ -674,7 +733,7 @@ impl Node {
 
         let mut rx_files = Incoming::new(self, name.clone(), remote, tx);
         let res = self.read_loop(&mut r, &mut rx_files);
-        rx_files.abort_all();
+        rx_files.keep_all();
         let _ = sock.shutdown(std::net::Shutdown::Both);
         {
             let mut st = self.st();
@@ -699,10 +758,20 @@ impl Node {
                 Frame::Clip(text) if text.len() <= clip::MAX_TEXT => self.to_clipboard(clip::Content::Text(text)),
                 Frame::Clip(_) => {}
                 Frame::ClipImage(png) => self.to_clipboard(clip::Content::Png(png)),
-                Frame::FileStart { id, size, name } => files.start(id, size, &name)?,
+                Frame::FileStart { id, size, name, mtime, resume } => files.start(id, size, name, mtime, resume)?,
                 Frame::FileData { id, data } => files.data(id, &data)?,
                 Frame::FileEnd { id } => files.end(id),
-                Frame::FileAbort { id, cancelled } => files.abort(id, cancelled),
+                // A cancel at the sender keeps what arrived; a failure there (its read) doesn't.
+                Frame::FileAbort { id, cancelled } => files.abort(id, cancelled, cancelled),
+                Frame::FileFrom { id, offset } => {
+                    let st = self.st();
+                    if let Some(o) = st.outboxes.get(&files.remote)
+                        && o.current.is_some_and(|c| c.0 == id)
+                        && let Some(from) = &o.from
+                    {
+                        let _ = from.try_send(offset);
+                    }
+                }
                 Frame::FileCancel { id } => {
                     let mut st = self.st();
                     let key = st.outboxes.get(&files.remote).and_then(|o| o.current).filter(|c| c.0 == id).map(|c| c.1);
@@ -786,6 +855,9 @@ fn writer(mut w: SealWriter<TcpStream>, rx: Receiver<Frame>, sock: TcpStream) {
 
 struct InFile {
     path: PathBuf,
+    /// As the sender named it, and its time: together they tell a later try of this file.
+    name: String,
+    mtime: Option<u64>,
     out: BufWriter<File>,
     size: u64,
     done: u64,
@@ -825,21 +897,49 @@ impl<'a> Incoming<'a> {
         }
     }
 
-    fn start(&mut self, id: u32, size: u64, name: &str) -> io::Result<()> {
+    fn start(&mut self, id: u32, size: u64, name: String, mtime: Option<u64>, resume: bool) -> io::Result<()> {
         if self.files.len() >= 64 {
             return Err(denied("too many files"));
         }
-        self.abort(id, false);
+        self.abort(id, false, false);
         let downloads = self.node.downloads();
         std::fs::create_dir_all(&downloads)?;
-        let path = store::incoming_path(&downloads, name);
-        let out = BufWriter::with_capacity(512 << 10, File::create(store::part_of(&path))?);
+        // A part kept from an earlier try under this name: go on with it if it is the same file
+        // (size and time) in the same folder and the sender asks, and nothing has taken its name
+        // since (finishing renames over it); otherwise it is stale.
+        let kept = self.node.st().partials.remove(&(self.remote, name.clone()));
+        let mut resumed = None;
+        if let Some(k) = kept {
+            let part = store::part_of(&k.path);
+            let len = std::fs::metadata(&part).map_or(u64::MAX, |m| m.len());
+            if resume && mtime == Some(k.mtime) && size == k.size && len <= size && k.path.parent() == Some(&downloads) && !k.path.exists() {
+                let mut file = std::fs::OpenOptions::new().write(true).open(&part)?;
+                file.seek(SeekFrom::Start(len))?;
+                resumed = Some((k.path, file, len));
+            } else {
+                let _ = std::fs::remove_file(part);
+            }
+        }
+        let (path, file, done) = match resumed {
+            Some(r) => r,
+            None => {
+                let path = store::incoming_path(&downloads, &name);
+                let file = File::create(store::part_of(&path))?;
+                (path, file, 0)
+            }
+        };
+        if resume {
+            // Off this thread: a reader blocked on a full queue can stall both writers.
+            let tx = self.tx.clone();
+            spawn("aun-from", move || drop(tx.send(Frame::FileFrom { id, offset: done })));
+        }
+        let out = BufWriter::with_capacity(512 << 10, file);
         let key = {
             let mut st = self.node.st();
             st.next += 1;
             st.next
         };
-        let f = InFile { path, out, size, done: 0, key, told: Instant::now() };
+        let f = InFile { path, name, mtime, out, size, done, key, told: Instant::now() };
         self.note(&f, false, false, false);
         self.files.insert(id, f);
         Ok(())
@@ -848,16 +948,16 @@ impl<'a> Incoming<'a> {
     fn data(&mut self, id: u32, data: &[u8]) -> io::Result<()> {
         let Some(f) = self.files.get_mut(&id) else { return Ok(()) };
         if self.node.st().cancelled.remove(&f.key) {
-            self.abort(id, true);
+            self.abort(id, true, false);
             self.untold.push(id);
             return Ok(());
         }
         if f.done + data.len() as u64 > f.size {
-            self.abort(id, false);
+            self.abort(id, false, false);
             return Err(denied("file larger than announced"));
         }
         if let Err(e) = f.out.write_all(data) {
-            self.abort(id, false);
+            self.abort(id, false, false);
             (self.node.0.notify)(Note::Info(format!("파일을 저장하지 못했어요: {e}")));
             return Ok(());
         }
@@ -882,19 +982,30 @@ impl<'a> Incoming<'a> {
         self.note(&f, true, !ok, false);
     }
 
-    fn abort(&mut self, id: u32, cancelled: bool) {
-        if let Some(f) = self.files.remove(&id) {
-            self.note(&f, true, true, cancelled);
-            let part = store::part_of(&f.path);
-            drop(f); // closed before it is deleted
-            let _ = std::fs::remove_file(part);
+    /// `keep`: leave the `.part` for the sender to go on with, if it said which file it is.
+    fn abort(&mut self, id: u32, cancelled: bool, keep: bool) {
+        let Some(f) = self.files.remove(&id) else { return };
+        self.note(&f, true, true, cancelled);
+        let part = store::part_of(&f.path);
+        let kept = f.mtime.filter(|_| keep).map(|mtime| Partial { size: f.size, mtime, path: f.path.clone() });
+        let name = f.name.clone();
+        drop(f); // flushed and closed before it is kept or deleted
+        match kept {
+            Some(k) => {
+                let old = self.node.st().partials.insert((self.remote, name), k);
+                if let Some(old) = old {
+                    let _ = std::fs::remove_file(store::part_of(&old.path));
+                }
+            }
+            None => drop(std::fs::remove_file(part)),
         }
     }
 
-    fn abort_all(&mut self) {
+    /// The link is down: every file under way keeps what arrived.
+    fn keep_all(&mut self) {
         let ids: Vec<_> = self.files.keys().copied().collect();
         for id in ids {
-            self.abort(id, false);
+            self.abort(id, false, true);
         }
     }
 }

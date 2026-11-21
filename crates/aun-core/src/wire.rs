@@ -26,12 +26,16 @@ pub const FILE_CHUNK: usize = 256 << 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
-    Hello { pair: bool, name: String },
+    /// `resume`: this build answers `FileStart { resume: true }` with `FileFrom`. Older builds
+    /// send no such byte and never get asked.
+    Hello { pair: bool, name: String, resume: bool },
     Spake(Vec<u8>),
     Confirm(Vec<u8>),
     Ping,
     Clip(String),
-    FileStart { id: u32, size: u64, name: String },
+    /// `mtime` (ns since the epoch, absent from older builds) tells a resumable copy of the same
+    /// file apart from a changed one. `resume` asks where to go on from: send nothing until `FileFrom`.
+    FileStart { id: u32, size: u64, name: String, mtime: Option<u64>, resume: bool },
     FileData { id: u32, data: Vec<u8> },
     FileEnd { id: u32 },
     /// The sender stopped: `cancelled` when the user called it off, not when reading failed.
@@ -40,6 +44,8 @@ pub enum Frame {
     ClipImage(Vec<u8>),
     /// The receiver doesn't want file `id` (the sender's id) any more: stop sending it.
     FileCancel { id: u32 },
+    /// The answer to `FileStart { resume: true }`: send file `id` (the sender's id) from `offset`.
+    FileFrom { id: u32, offset: u64 },
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -70,24 +76,31 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
     }
     let mut b = Vec::with_capacity(64);
     match f {
-        Frame::Hello { pair, name } => {
+        Frame::Hello { pair, name, resume } => {
             b.push(0);
             b.push(*pair as u8);
             put_str(&mut b, name);
+            b.push(*resume as u8);
         }
         Frame::Spake(m) => (b.push(1), b.extend_from_slice(m)).1,
         Frame::Confirm(m) => (b.push(2), b.extend_from_slice(m)).1,
         Frame::Ping => b.push(3),
         Frame::Clip(t) => (b.push(4), b.extend_from_slice(t.as_bytes())).1,
-        Frame::FileStart { id, size, name } => {
+        Frame::FileStart { id, size, name, mtime, resume } => {
             b.push(5);
             b.extend_from_slice(&id.to_be_bytes());
             b.extend_from_slice(&size.to_be_bytes());
             put_str(&mut b, name);
+            // Past the name, where older builds stop reading.
+            if let Some(m) = mtime {
+                b.extend_from_slice(&m.to_be_bytes());
+                b.push(*resume as u8);
+            }
         }
         Frame::FileEnd { id } => (b.push(7), b.extend_from_slice(&id.to_be_bytes())).1,
         Frame::FileAbort { id, cancelled } => (b.push(8), b.extend_from_slice(&id.to_be_bytes()), b.push(*cancelled as u8)).2,
         Frame::FileCancel { id } => (b.push(10), b.extend_from_slice(&id.to_be_bytes())).1,
+        Frame::FileFrom { id, offset } => (b.push(11), b.extend_from_slice(&id.to_be_bytes()), b.extend_from_slice(&offset.to_be_bytes())).2,
         Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
     w.write_all(&(b.len() as u32).to_be_bytes())?;
@@ -116,14 +129,20 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
         String::from_utf8(s.to_vec()).map_err(|_| bad("utf8"))
     };
     Ok(match b[0] {
-        0 => Frame::Hello { pair: b.get(1) == Some(&1), name: str_at(&b, 2)? },
+        0 => {
+            let name = str_at(&b, 2)?;
+            Frame::Hello { pair: b.get(1) == Some(&1), resume: b.get(4 + name.len()) == Some(&1), name }
+        }
         1 => Frame::Spake(b.split_off(1)),
         2 => Frame::Confirm(b.split_off(1)),
         3 => Frame::Ping,
         4 => Frame::Clip(String::from_utf8(b.split_off(1)).map_err(|_| bad("utf8"))?),
         5 => {
             let size = b.get(5..13).map(|s| u64::from_be_bytes(s.try_into().unwrap())).ok_or_else(|| bad("short"))?;
-            Frame::FileStart { id: u32_at(&b, 1)?, size, name: str_at(&b, 13)? }
+            let name = str_at(&b, 13)?;
+            let rest = &b[15 + name.len()..];
+            let mtime = rest.get(..8).map(|s| u64::from_be_bytes(s.try_into().unwrap()));
+            Frame::FileStart { id: u32_at(&b, 1)?, size, mtime, resume: mtime.is_some() && rest.get(8) == Some(&1), name }
         }
         6 => {
             let id = u32_at(&b, 1)?;
@@ -134,6 +153,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
         // A build before the cancel byte sends none: read as a failure, as it was shown then.
         8 => Frame::FileAbort { id: u32_at(&b, 1)?, cancelled: b.get(5) == Some(&1) },
         10 => Frame::FileCancel { id: u32_at(&b, 1)? },
+        11 => Frame::FileFrom { id: u32_at(&b, 1)?, offset: b.get(5..13).map(|s| u64::from_be_bytes(s.try_into().unwrap())).ok_or_else(|| bad("short"))? },
         CLIP_IMAGE => {
             b.remove(0);
             Frame::ClipImage(b)
@@ -244,12 +264,16 @@ mod tests {
 
     #[test]
     fn every_frame_round_trips() {
-        round(Frame::Hello { pair: true, name: "맥북".into() });
+        round(Frame::Hello { pair: true, name: "맥북".into(), resume: true });
+        round(Frame::Hello { pair: false, name: "맥북".into(), resume: false });
         round(Frame::Spake(vec![1, 2, 3]));
         round(Frame::Confirm(vec![9; 32]));
         round(Frame::Ping);
         round(Frame::Clip("안녕 clipboard".into()));
-        round(Frame::FileStart { id: 7, size: 1 << 40, name: "a b.txt".into() });
+        round(Frame::FileStart { id: 7, size: 1 << 40, name: "a b.txt".into(), mtime: Some(1 << 60), resume: true });
+        round(Frame::FileStart { id: 7, size: 1 << 40, name: "a b.txt".into(), mtime: Some(0), resume: false });
+        round(Frame::FileStart { id: 7, size: 1 << 40, name: "a b.txt".into(), mtime: None, resume: false });
+        round(Frame::FileFrom { id: 7, offset: 1 << 33 });
         round(Frame::FileData { id: 7, data: vec![5; 1000] });
         round(Frame::FileEnd { id: 7 });
         round(Frame::FileAbort { id: 7, cancelled: false });
@@ -263,6 +287,15 @@ mod tests {
     fn an_abort_from_an_older_build_reads_as_a_failure() {
         let old = [&5u32.to_be_bytes()[..], &[8], &7u32.to_be_bytes()].concat();
         assert_eq!(read_frame(&mut &old[..]).unwrap(), Frame::FileAbort { id: 7, cancelled: false });
+    }
+
+    /// An older build ends both frames at the name: it can't be asked to resume.
+    #[test]
+    fn hello_and_file_start_from_an_older_build_offer_no_resume() {
+        let hello = [&5u32.to_be_bytes()[..], &[0, 1], &1u16.to_be_bytes(), b"m"].concat();
+        assert_eq!(read_frame(&mut &hello[..]).unwrap(), Frame::Hello { pair: true, name: "m".into(), resume: false });
+        let start = [&16u32.to_be_bytes()[..], &[5], &7u32.to_be_bytes(), &9u64.to_be_bytes(), &1u16.to_be_bytes(), b"f"].concat();
+        assert_eq!(read_frame(&mut &start[..]).unwrap(), Frame::FileStart { id: 7, size: 9, name: "f".into(), mtime: None, resume: false });
     }
 
     #[test]
@@ -306,7 +339,7 @@ mod tests {
 
     #[test]
     fn hostile_frames_are_rejected_not_panicked() {
-        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff]] {
+        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff], &[0, 0, 0, 5, 11, 0, 0, 0, 7]] {
             assert!(read_frame(&mut &b[..]).is_err(), "{b:?}");
         }
     }

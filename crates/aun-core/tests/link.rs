@@ -205,10 +205,10 @@ fn many_files_dropped_at_once_all_arrive() {
     assert!(!dir_has_part(&dl));
 }
 
-/// Either side can call a transfer off: no `.part` stays behind, the link stays up and the next
-/// file still arrives.
+/// Either side can call a transfer off: the link stays up and the next file still arrives. A
+/// receiver that cancels keeps no `.part`; one cancelled by the sender keeps it, to go on later.
 #[test]
-fn a_cancelled_transfer_leaves_no_part_file() {
+fn a_cancelled_transfer_keeps_the_link() {
     let (host, hn) = node("cancel-host", "Host");
     let (guest, gn) = node("cancel-guest", "Guest");
     guest.pair(addr(&host), host.show_code());
@@ -260,7 +260,12 @@ fn a_cancelled_transfer_leaves_no_part_file() {
             k_in = wait(&hn, "the receiver to drop it as cancelled", &|n| big_after(true, after_in)(n) && matches!(n, Note::Transfer { finished: true, failed: true, cancelled: true, .. }));
         }
         (after_in, after_out) = (k_in, k_out);
-        until("the .part to go", || !dir_has_part(&dl));
+        if by_receiver {
+            until("the .part to go", || !dir_has_part(&dl));
+        } else {
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(dir_has_part(&dl), "kept for the sender to go on with");
+        }
         assert!(!dl.join("big.bin").exists(), "by receiver: {by_receiver}");
         assert!(connected(&guest, &host) && connected(&host, &guest), "the link survives");
         guest.send_file(host.id(), small.clone());
@@ -369,4 +374,119 @@ fn a_file_already_on_its_way_is_not_queued_again() {
     let key = *keys.iter().next().unwrap();
     assert_eq!(told, vec![(key, "big.bin".to_owned()); 2]);
     guest.cancel(*keys.iter().next().unwrap());
+}
+
+/// The next transfer note on `rx` that `want` accepts.
+fn next_transfer(rx: &mpsc::Receiver<Note>, what: &str, want: impl Fn(&Note) -> bool) -> Note {
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < end, "timed out waiting for {what}");
+        if let Ok(n) = rx.recv_timeout(Duration::from_millis(100))
+            && matches!(n, Note::Transfer { .. })
+            && want(&n)
+        {
+            return n;
+        }
+    }
+}
+
+/// A send the sender stopped goes again from where the receiver got to, not from the start; a
+/// source changed in between starts over.
+#[test]
+fn a_stopped_send_resumes_where_it_stopped() {
+    use std::io::{Seek, SeekFrom, Write};
+    let (host, hn) = node("resume-host", "Host");
+    let (guest, gn) = node("resume-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let src = dir("resume-src");
+    let _ = std::fs::remove_dir_all(&src);
+    std::fs::create_dir_all(&src).unwrap();
+    let big = src.join("big.bin");
+    // Debug builds move about 12 MB/s on loopback: small enough to finish, big enough to stop midway.
+    let size: u64 = 64 << 20;
+    // Sparse, with marks at both ends and the middle: bytes before and after the resume point.
+    let mark = |at: u64, byte: u8| {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&big).unwrap();
+        f.seek(SeekFrom::Start(at)).unwrap();
+        f.write_all(&[byte; 4096]).unwrap();
+    };
+    std::fs::File::create(&big).unwrap().set_len(size).unwrap();
+    for at in [0, size / 2, size - 4096] {
+        mark(at, 0xA5);
+    }
+    let dl = dir("resume-host").join("dl");
+    let got = dl.join("big.bin");
+    let check_at = |at: &std::path::Path, first: u8| {
+        let b = std::fs::read(at).unwrap();
+        assert_eq!(b.len() as u64, size);
+        assert!(b[..4096].iter().all(|&x| x == first), "start");
+        assert!(b[size as usize / 2..][..4096].iter().all(|&x| x == 0xA5), "middle");
+        assert!(b[size as usize - 4096..].iter().all(|&x| x == 0xA5), "end");
+        assert!(b[4096..8192].iter().all(|&x| x == 0), "a hole stays zero");
+    };
+    let check = |first: u8| check_at(&got, first);
+    let (mut after_in, mut after_out) = (0u64, 0u64);
+    let ours = |incoming: bool, after: u64| move |n: &Note| matches!(n, Note::Transfer { incoming: i, key, file, .. } if *i == incoming && *key > after && file.starts_with("big"));
+    // Sends big.bin and, once bytes are moving, stops it: a cancel at the sender, or the link
+    // dropping (the sender going to sleep).
+    let stop_midway = |after_in: &mut u64, after_out: &mut u64, drop_link: bool| {
+        guest.send_file(host.id(), big.clone());
+        let Note::Transfer { key: k_out, .. } = next_transfer(&gn, "bytes leaving", |n| ours(false, *after_out)(n) && matches!(n, Note::Transfer { done, finished: false, .. } if *done > 0)) else { unreachable!() };
+        if drop_link {
+            guest.set_sleeping(true);
+        } else {
+            guest.cancel(k_out);
+        }
+        let Note::Transfer { key: k_in, done, .. } = next_transfer(&hn, "the receiver to stop", |n| ours(true, *after_in)(n) && matches!(n, Note::Transfer { finished: true, failed: true, .. })) else { unreachable!() };
+        next_transfer(&gn, "the sender to stop", |n| matches!(n, Note::Transfer { key, finished: true, .. } if *key == k_out));
+        assert!(done < size, "stopped before the end");
+        (*after_in, *after_out) = (k_in, k_out);
+        if drop_link {
+            guest.set_sleeping(false);
+            until("a reconnect after waking", || connected(&guest, &host) && connected(&host, &guest));
+        }
+        // The receiver notes the stop before it would delete the part: give it the time to.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(dir_has_part(&dl), "a send stopped by the sender keeps what arrived (link dropped: {drop_link})");
+    };
+    // Sends it again; returns where the receiver started.
+    let again = |after_in: &mut u64, after_out: &mut u64| -> u64 {
+        guest.send_file(host.id(), big.clone());
+        let Note::Transfer { key, done: from, .. } = next_transfer(&hn, "the next try", ours(true, *after_in)) else { unreachable!() };
+        next_transfer(&hn, "the next try to finish", |n| matches!(n, Note::Transfer { key: k, finished: true, failed: false, .. } if *k == key));
+        let Note::Transfer { key: k_out, .. } = next_transfer(&gn, "the sender to finish", |n| ours(false, *after_out)(n) && matches!(n, Note::Transfer { finished: true, failed: false, .. })) else { unreachable!() };
+        (*after_in, *after_out) = (key, k_out);
+        from
+    };
+
+    for drop_link in [false, true] {
+        stop_midway(&mut after_in, &mut after_out, drop_link);
+        assert!(again(&mut after_in, &mut after_out) > 0, "picks up where it stopped, not at 0 (link dropped: {drop_link})");
+        check(0xA5);
+        assert!(!dir_has_part(&dl));
+        std::fs::remove_file(&got).unwrap();
+    }
+
+    // A file of that name turned up while the part waited: it stays, the send lands beside it.
+    stop_midway(&mut after_in, &mut after_out, false);
+    std::fs::write(&got, b"mine").unwrap();
+    again(&mut after_in, &mut after_out);
+    assert!(std::fs::read(&got).unwrap() == b"mine", "not overwritten");
+    check_at(&dl.join("big (1).bin"), 0xA5);
+    assert!(!dir_has_part(&dl));
+    std::fs::remove_file(&got).unwrap();
+    std::fs::remove_file(dl.join("big (1).bin")).unwrap();
+
+    // Same size, new content and time: what arrived before is not this file any more.
+    stop_midway(&mut after_in, &mut after_out, false);
+    mark(0, 0x5A);
+    let f = std::fs::OpenOptions::new().write(true).open(&big).unwrap();
+    f.set_modified(std::time::SystemTime::now() + Duration::from_secs(5)).unwrap();
+    drop(f);
+    assert_eq!(again(&mut after_in, &mut after_out), 0, "a changed source starts over");
+    check(0x5A);
+    assert!(!dir_has_part(&dl), "the stale part is gone");
+    std::fs::remove_dir_all(&src).unwrap();
+    std::fs::remove_dir_all(dir("resume-host")).unwrap();
 }
