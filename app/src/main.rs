@@ -400,6 +400,19 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     root
 }
 
+/// Direction arrows for the transfer history: a long shaft and an open head, drawn in the
+/// element's colour.
+static ARROW_DOWN: rune::Icon = rune::Icon {
+    name: "aun-arrow-down",
+    view: 24.0,
+    body: r#"<path d="M12 2.5V21M5 14L12 21L19 14" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+static ARROW_UP: rune::Icon = rune::Icon {
+    name: "aun-arrow-up",
+    view: 24.0,
+    body: r#"<path d="M12 21.5V3M5 10L12 3L19 10" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
 /// The history: one card per file, newest first, in a box that takes the rest of the window.
 fn transfers(s: &Ui, t: Theme) -> El {
     let mut tl = col().w_full().gap(space::S2);
@@ -413,10 +426,9 @@ fn transfers(s: &Ui, t: Theme) -> El {
         };
         // The arrow and its colour say the direction (received green ↓, sent blue ↑); the line
         // below names the peer. Screen readers get the direction from the badge's label.
-        let (arrow, way, tint) = if x.incoming { ("↓", "받음", tok::accent(4, true)) } else { ("↑", "보냄", tok::accent(0, true)) };
+        let (arrow, way, tint) = if x.incoming { (&ARROW_DOWN, "받음", tok::accent(4, true)) } else { (&ARROW_UP, "보냄", tok::accent(0, true)) };
         // As tall as the two lines beside it (file name + details).
-        let badge = el().size(40.0, 40.0).radius(20.0).center().fill(tint).role("image").label(way)
-            .child(text(arrow).font(type_::TITLE).color(rune::oklch(0.99, 0.0, 0.0)));
+        let badge = rune::icon(arrow, 40.0).color(tint).label(way);
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
             .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if x.failed { tok::accent(2, true) } else { t.text_secondary }));
