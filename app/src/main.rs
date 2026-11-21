@@ -395,11 +395,30 @@ const REVEAL: &str = if cfg!(windows) { "탐색기에서 보기" } else { "Finde
 
 /// Shows `path` selected in Finder or Explorer.
 fn reveal(path: &std::path::Path) -> std::io::Result<()> {
+    // The Shell call reuses an Explorer window already showing the folder (`explorer /select`
+    // opens a new one each time) and brings it to the front.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        // explorer wants `/select,"C:\a b\c.txt"` as one raw argument.
-        std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).spawn().map(drop)
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        use windows_sys::Win32::UI::Shell::{ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let fail = |hr: i32| std::io::Error::other(format!("HRESULT {:#010x}", hr as u32));
+        // SAFETY: `wide` is NUL-terminated and outlives the calls; the PIDL the Shell allocates is
+        // freed once, after its last use.
+        unsafe {
+            // The Shell needs COM on this thread; already initialised, in either model, is fine.
+            CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+            let mut pidl = std::ptr::null_mut();
+            let hr = SHParseDisplayName(wide.as_ptr(), std::ptr::null_mut(), &mut pidl, 0, std::ptr::null_mut());
+            if hr < 0 {
+                return Err(fail(hr));
+            }
+            // No child items: `pidl` names the file itself, selected in its folder.
+            let hr = SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0);
+            ILFree(pidl);
+            if hr < 0 { Err(fail(hr)) } else { Ok(()) }
+        }
     }
     #[cfg(not(windows))]
     std::process::Command::new("open").arg("-R").arg(path).spawn().map(drop)
