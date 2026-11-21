@@ -136,6 +136,8 @@ pub enum Content {
     Text(String),
     /// An image as PNG: lossless and far smaller than the RGBA a clipboard holds.
     Png(Vec<u8>),
+    /// Files copied in Finder or Explorer: never sent as is, offered to send as files instead.
+    Files(Vec<std::path::PathBuf>),
 }
 
 /// A decoded image may take at most this much memory (about 5800 × 5800): a small PNG can claim
@@ -216,6 +218,7 @@ pub fn run(incoming: Receiver<Option<Content>>, active: impl Fn() -> bool, share
                     last = digest(&rgba[..]);
                     c.set_image(arboard::ImageData { width, height, bytes: rgba.into() })
                 }
+                Content::Files(_) => continue,
             };
             if set.is_err() {
                 cb = None;
@@ -230,6 +233,17 @@ pub fn run(incoming: Receiver<Option<Content>>, active: impl Fn() -> bool, share
         if !share_secrets() && secret() {
             seq = now;
             continue;
+        }
+        // File references come with the names as text (macOS): the files, not their names.
+        match c.get().file_list() {
+            Ok(files) if !files.is_empty() => {
+                seq = now;
+                latest.fetch_add(1, Ordering::Relaxed);
+                changed(Content::Files(files));
+                continue;
+            }
+            Err(arboard::Error::ClipboardOccupied) => continue,
+            _ => {}
         }
         let text = match c.get_text() {
             Ok(t) => Some(t),

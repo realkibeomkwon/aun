@@ -53,6 +53,9 @@ struct Ui {
     message: Option<(String, Instant)>,
     /// A transfer row marked for a moment (the one a repeated send would have duplicated).
     flash: Option<(u64, Instant)>,
+    /// Files copied in Finder or Explorer, offered to send, and how many folders were left out.
+    copied: Vec<PathBuf>,
+    copied_dirs: usize,
     over: Option<Id>,
     /// Where `settings` is saved; None in headless runs.
     dir: Option<PathBuf>,
@@ -68,7 +71,7 @@ impl Ui {
         let settings = dir.as_deref().map(Settings::load).unwrap_or_default();
         let autostart = dir.is_some() && autostart::enabled();
         let mut ui = Ui {
-            node, me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, flash: None, over: None,
+            node, me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, flash: None, copied: vec![], copied_dirs: 0, over: None,
             dir, settings, autostart, handle: None, tray: None,
         };
         ui.refresh();
@@ -150,6 +153,12 @@ impl Ui {
                 self.say(m, tx);
                 self.refresh();
             }
+            Note::Copied(paths) => {
+                let n = paths.len();
+                self.copied = paths.into_iter().filter(|p| p.is_file()).collect();
+                self.copied_dirs = n - self.copied.len();
+                self.show_copied();
+            }
             Note::AlreadySending { key, file } => {
                 self.say(format!("이미 보내는 중이에요: {file}"), tx);
                 self.flash = Some((key, Instant::now() + FLASH_FOR));
@@ -165,6 +174,31 @@ impl Ui {
                 // a big pile stays checkable, at about 100 bytes a row.
                 let mut kept_done = 0;
                 self.transfers.retain(|t| !t.finished || { kept_done += 1; kept_done <= 100 });
+            }
+        }
+    }
+
+    fn show_copied(&self) {
+        if let Some(t) = &self.tray {
+            t.set_copied(!self.copied.is_empty());
+        }
+    }
+
+    /// Sends the copied files to `id`, or (from the tray, `None`) to the one connected device;
+    /// with none or several, the window opens to choose.
+    fn send_copied(&mut self, id: Option<Id>) {
+        let mut on = self.peers.iter().filter(|p| p.connected).map(|p| p.id);
+        let id = id.or_else(|| on.next().filter(|_| on.next().is_none()));
+        match id {
+            Some(id) => {
+                let files = std::mem::take(&mut self.copied);
+                self.send(id, &files);
+                self.show_copied();
+            }
+            None => {
+                if let Some(h) = &self.handle {
+                    h.open();
+                }
             }
         }
     }
@@ -417,10 +451,31 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
             .child(text(m.clone()).key("message").font(type_::LABEL).color(t.text).grow(1.0).shrink().wrap_anywhere())
             .child(close));
     }
+    if !s.copied.is_empty() {
+        let close = row().key("copied-close").role("button").label("닫기").focusable(true).size(24.0, 24.0).center().radius(radius::MD)
+            .hover(t.hover).on_press_tx(|s: &mut Ui, _| {
+                s.copied.clear();
+                s.show_copied();
+            })
+            .child(rune::icon(&CLOSE, 12.0).color(t.text_secondary));
+        let mut b = row().key("copied").w_full().px(space::S3).py(space::S2).gap(space::S2).center_y()
+            .radius(radius::MD).fill(t.card).border(1.0, tok::accent(0, true))
+            .child(text(copied_text(s)).key("copied-text").font(type_::LABEL).color(t.text).grow(1.0).shrink().wrap_anywhere());
+        for p in s.peers.iter().filter(|p| p.connected) {
+            let id = p.id;
+            b = b.child(button(format!("copied-send-{}", aun_core::hex(&id[..6])), &format!("{}로 보내기", p.name), t, true, move |s, _| s.send_copied(Some(id))));
+        }
+        root = root.child(b.child(close));
+    }
     if !s.transfers.is_empty() {
         root = root.child(transfers(s, t));
     }
     root
+}
+
+fn copied_text(s: &Ui) -> String {
+    let dirs = if s.copied_dirs > 0 { format!(" (폴더 {}개는 보낼 수 없어요)", s.copied_dirs) } else { String::new() };
+    format!("복사한 파일 {}개{dirs}", s.copied.len())
 }
 
 /// Direction arrows for the transfer history: an arrow inside a ring, both stroked in the
@@ -906,6 +961,50 @@ mod tests {
         rt.state.flash.as_mut().unwrap().1 = Instant::now() - Duration::from_millis(1);
         assert!(rt.state.expire(), "the mark goes on its own");
         assert!(rt.state.flash.is_none());
+    }
+
+    /// Files copied in Finder or Explorer are offered for each connected device; folders are left
+    /// out and said so, sending or closing takes the offer down, and a copy of folders only offers nothing.
+    #[test]
+    fn copied_files_are_offered_to_connected_devices() {
+        let d = std::env::temp_dir().join(format!("aun-ui-copied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("폴더")).unwrap();
+        std::fs::write(d.join("a.txt"), b"a").unwrap();
+        std::fs::write(d.join("b.txt"), b"b").unwrap();
+        let mut ui = Ui::new(None, None);
+        demo(&mut ui);
+        let mut rt = Runtime::new(ui, view, (480.0, 760.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        assert!(rt.find("copied").is_none());
+        let copy = |rt: &mut Runtime<Ui>, paths: Vec<PathBuf>| {
+            rt.update(|s, tx| s.apply(Note::Copied(paths), tx));
+            rt.frame(1.0 / 60.0);
+        };
+        copy(&mut rt, vec![d.join("a.txt"), d.join("폴더"), d.join("b.txt")]);
+        assert_eq!(rt.state.copied, vec![d.join("a.txt"), d.join("b.txt")]);
+        assert!(rt.find("copied-text").is_some(), "the offer");
+        let words = copied_text(&rt.state);
+        assert!(words.contains("파일 2개") && words.contains("폴더 1개"), "{words}");
+        // Only the connected device (Windows 노트북) gets a button.
+        let k = aun_core::hex(&[1u8; 32][..6]);
+        assert!(rt.find(&format!("copied-send-{}", aun_core::hex(&[2u8; 32][..6]))).is_none(), "an offline device");
+        let (x, y) = rt.find(&format!("copied-send-{k}")).expect("send to the connected device");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(2.0 / 60.0);
+        assert!(rt.state.copied.is_empty() && rt.find("copied").is_none(), "sent: the offer goes");
+
+        copy(&mut rt, vec![d.join("a.txt")]);
+        let (x, y) = rt.find("copied-close").expect("close");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(3.0 / 60.0);
+        assert!(rt.find("copied").is_none(), "closed");
+
+        copy(&mut rt, vec![d.join("폴더")]);
+        assert!(rt.find("copied").is_none(), "folders alone: nothing to offer");
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     /// The row a repeated send points at may sit below the visible list: it is scrolled to.

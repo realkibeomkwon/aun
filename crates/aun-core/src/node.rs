@@ -59,6 +59,8 @@ pub enum Note {
     /// A file asked to go again while it is still going there: not queued. `key` is the
     /// transfer already under way (or waiting) for it.
     AlreadySending { key: u64, file: String },
+    /// Files (or folders) were copied here: the app may offer to send them.
+    Copied(Vec<PathBuf>),
     Transfer { key: u64, peer_id: Id, peer: String, file: String, path: PathBuf, done: u64, total: u64, incoming: bool, finished: bool, failed: bool, cancelled: bool },
 }
 
@@ -447,6 +449,7 @@ impl Node {
             return;
         }
         let frame = match content {
+            clip::Content::Files(paths) => return (self.0.notify)(Note::Copied(paths)),
             clip::Content::Text(t) => Frame::Clip(t),
             clip::Content::Png(png) if png.len() < wire::MAX_IMAGE => Frame::ClipImage(png),
             clip::Content::Png(png) => return crate::log(format_args!("clipboard image not sent: {} KB PNG is past the limit", png.len() >> 10)),

@@ -6,11 +6,12 @@ use rune::AppHandle;
 
 use crate::Ui;
 
-const ITEMS: [&str; 3] = ["open", "clip", "quit"];
+const ITEMS: [&str; 4] = ["open", "copied", "clip", "quit"];
 
 fn label(id: &str, clip: bool) -> &'static str {
     match id {
         "open" => "Aun 열기",
+        "copied" => "복사한 파일 보내기",
         "clip" if clip => "클립보드 공유 끄기",
         "clip" => "클립보드 공유 켜기",
         _ => "종료",
@@ -22,36 +23,48 @@ fn pick(h: &AppHandle<Ui>, id: &str) {
     match id {
         "open" => h.open(),
         "clip" => h.update(|s, tx| s.set_clip(!s.settings.clipboard, tx)),
+        "copied" => h.update(|s, _| s.send_copied(None)),
         "quit" => h.quit(),
         _ => {}
     }
 }
 
+/// Windows rebuilds its menu from these; the item for copied files shows only while some wait.
 #[cfg(windows)]
-pub struct Tray(rune::Tray);
+pub struct Tray(rune::Tray, std::cell::Cell<(bool, bool)>);
 
 #[cfg(windows)]
 impl Tray {
     pub fn new(h: AppHandle<Ui>, clip: bool) -> Option<Tray> {
         use rune::{TrayEvent, TrayIcon, TraySpec};
-        let spec = TraySpec::new("dev.aun.desk", "Aun", TrayIcon::rgba(32, 32, icon(32))).tooltip("Aun").menu(menu(clip));
+        let spec = TraySpec::new("dev.aun.desk", "Aun", TrayIcon::rgba(32, 32, icon(32))).tooltip("Aun").menu(menu(clip, false));
         let tray = rune::Tray::new(spec, move |e| match e {
             TrayEvent::Activate { .. } => h.open(),
             TrayEvent::Menu(id) => pick(&h, &id),
             _ => {}
         });
-        tray.map_err(|e| aun_core::log(format_args!("tray: {e}"))).ok().map(Tray)
+        tray.map_err(|e| aun_core::log(format_args!("tray: {e}"))).ok().map(|t| Tray(t, std::cell::Cell::new((clip, false))))
     }
 
     pub fn set_clip(&self, clip: bool) {
-        self.0.set_menu(menu(clip));
+        self.set((clip, self.1.get().1));
+    }
+
+    pub fn set_copied(&self, copied: bool) {
+        self.set((self.1.get().0, copied));
+    }
+
+    fn set(&self, state: (bool, bool)) {
+        self.1.set(state);
+        self.0.set_menu(menu(state.0, state.1));
     }
 }
 
 #[cfg(windows)]
-fn menu(clip: bool) -> Vec<rune::TrayItem> {
-    let mut v: Vec<_> = ITEMS.iter().map(|id| rune::TrayItem::action(*id, label(id, clip))).collect();
-    v.insert(2, rune::TrayItem::Separator);
+fn menu(clip: bool, copied: bool) -> Vec<rune::TrayItem> {
+    let mut v: Vec<_> = ITEMS.iter().filter(|id| copied || **id != "copied").map(|id| rune::TrayItem::action(*id, label(id, clip))).collect();
+    let quit = v.len() - 1;
+    v.insert(quit, rune::TrayItem::Separator);
     v
 }
 
@@ -113,6 +126,7 @@ mod mac {
     pub struct Tray {
         item: Retained<NSStatusItem>,
         clip: Retained<NSMenuItem>,
+        copied: Retained<NSMenuItem>,
         _target: Retained<Target>,
     }
 
@@ -123,7 +137,7 @@ mod mac {
             // SAFETY: NSObject's init on a freshly allocated object.
             let target: Retained<Target> = unsafe { msg_send![super(this), init] };
             let menu = NSMenu::new(mtm);
-            let mut clip_item = None;
+            let (mut clip_item, mut copied_item) = (None, None);
             for (i, id) in ITEMS.iter().enumerate() {
                 if *id == "quit" {
                     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -136,8 +150,13 @@ mod mac {
                 };
                 item.setTag(i as isize);
                 menu.addItem(&item);
-                if *id == "clip" {
-                    clip_item = Some(item);
+                match *id {
+                    "clip" => clip_item = Some(item),
+                    "copied" => {
+                        item.setHidden(true);
+                        copied_item = Some(item);
+                    }
+                    _ => {}
                 }
             }
             // NSVariableStatusItemLength
@@ -153,7 +172,7 @@ mod mac {
                 }
             }
             item.setMenu(Some(&menu));
-            let t = Tray { item, clip: clip_item?, _target: target };
+            let t = Tray { item, clip: clip_item?, copied: copied_item?, _target: target };
             t.set_clip(clip);
             Some(t)
         }
@@ -161,6 +180,10 @@ mod mac {
         pub fn set_clip(&self, clip: bool) {
             self.clip.setTitle(&NSString::from_str(label("clip", clip)));
             self.clip.setState(if clip { NSControlStateValueOn } else { NSControlStateValueOff });
+        }
+
+        pub fn set_copied(&self, copied: bool) {
+            self.copied.setHidden(!copied);
         }
     }
 
@@ -180,6 +203,7 @@ impl Tray {
         None
     }
     pub fn set_clip(&self, _: bool) {}
+    pub fn set_copied(&self, _: bool) {}
 }
 
 #[cfg(test)]
