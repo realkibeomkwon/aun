@@ -126,7 +126,7 @@ struct Shared {
     secrets_on: AtomicBool,
     /// Between the OS saying it will sleep and saying it woke: no links, in or out.
     asleep: AtomicBool,
-    clip_tx: Mutex<Option<Sender<clip::Content>>>,
+    clip_tx: Mutex<Option<Sender<Option<clip::Content>>>>,
     st: Mutex<St>,
     notify: Box<dyn Fn(Note) + Send + Sync>,
 }
@@ -185,8 +185,9 @@ impl Node {
 
         let (tx, rx) = mpsc::channel();
         *node.0.clip_tx.lock().unwrap() = Some(tx);
-        let (n, s) = (node.clone(), node.clone());
-        spawn("aun-clip", move || clip::run(rx, move || s.secrets(), move |c| n.broadcast_clip(c)));
+        let (n, s, a) = (node.clone(), node.clone(), node.clone());
+        let active = move || a.clipboard() && a.st().peers.values().any(|p| p.link.is_some());
+        spawn("aun-clip", move || clip::run(rx, active, move || s.secrets(), move |c| n.broadcast_clip(c)));
         Ok(node)
     }
 
@@ -229,6 +230,15 @@ impl Node {
     }
     pub fn set_clipboard(&self, on: bool) {
         self.0.clip_on.store(on, Ordering::Relaxed);
+        if on {
+            self.wake_clip();
+        }
+    }
+    /// Sharing may have started: the clipboard thread, asleep while nothing would be sent, looks again.
+    fn wake_clip(&self) {
+        if let Some(tx) = self.0.clip_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(None);
+        }
     }
     /// The OS is about to sleep (true) or woke (false).
     pub fn set_sleeping(&self, on: bool) {
@@ -405,7 +415,7 @@ impl Node {
         if self.clipboard()
             && let Some(tx) = self.0.clip_tx.lock().unwrap().as_ref()
         {
-            let _ = tx.send(c);
+            let _ = tx.send(Some(c));
         }
     }
 
@@ -657,6 +667,7 @@ impl Node {
             return Ok(());
         }
         crate::log(format_args!("link {conn} to {name} at {peer_addr:?} up (we dialled: {initiator})"));
+        self.wake_clip();
         let up = Instant::now();
         let wsock = sock.try_clone()?;
         spawn("aun-write", move || writer(w, rx, wsock));

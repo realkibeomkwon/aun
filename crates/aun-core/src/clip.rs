@@ -1,5 +1,6 @@
 //! System clipboard watch. Polls the OS change counter (one cheap call, no content read) and reads
-//! the text only when it moved, and only when the copying app didn't mark it private.
+//! the text only when it moved, and only when the copying app didn't mark it private. Polls only
+//! while a copy would go somewhere (sharing on, a device connected); otherwise it sleeps until woken.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -170,10 +171,16 @@ pub fn decode_png(png: &[u8], max_bytes: usize) -> Option<(usize, usize, Vec<u8>
     Some((info.width as usize, info.height as usize, buf))
 }
 
-/// Runs forever. `incoming` carries what peers copied, for this clipboard; `changed` hears local
-/// copies (images from a thread of their own, so a big one doesn't hold up the clipboard).
-/// `share_secrets` says whether copies marked private go too.
-pub fn run(incoming: Receiver<Content>, share_secrets: impl Fn() -> bool, changed: impl Fn(Content) + Send + Sync + 'static) {
+/// The next message, or `Timeout` when it is time to poll. While `active` is false nothing would be
+/// sent, so it waits for a message instead of waking every tick.
+fn next(incoming: &Receiver<Option<Content>>, active: bool, tick: Duration) -> Result<Option<Content>, RecvTimeoutError> {
+    if active { incoming.recv_timeout(tick) } else { incoming.recv().map_err(|_| RecvTimeoutError::Disconnected) }
+}
+
+/// Runs forever. `incoming` carries what peers copied, for this clipboard, and `None` when `active`
+/// may have turned true; `changed` hears local copies (images from a thread of their own, so a big
+/// one doesn't hold up the clipboard). `share_secrets` says whether copies marked private go too.
+pub fn run(incoming: Receiver<Option<Content>>, active: impl Fn() -> bool, share_secrets: impl Fn() -> bool, changed: impl Fn(Content) + Send + Sync + 'static) {
     // shortcut: 300 ms polling of the change counter; switch to AddClipboardFormatListener /
     // NSPasteboard notifications if wakeups ever show up in an energy profile.
     let tick = Duration::from_millis(300);
@@ -184,8 +191,13 @@ pub fn run(incoming: Receiver<Content>, share_secrets: impl Fn() -> bool, change
     let mut seq = change_count();
     let mut last = 0u64;
     loop {
-        let remote = match incoming.recv_timeout(tick) {
-            Ok(t) => Some(t),
+        let remote = match next(&incoming, active(), tick) {
+            Ok(Some(t)) => Some(t),
+            // Woken: copies made while nothing would have been sent stay unsent.
+            Ok(None) => {
+                seq = change_count();
+                continue;
+            }
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
@@ -303,8 +315,23 @@ mod tests {
     #[ignore]
     fn poll_alone() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || run(rx, || false, |_| {}));
+        std::thread::spawn(move || run(rx, || true, || false, |_| {}));
         std::thread::sleep(Duration::from_secs(40));
+    }
+
+    #[test]
+    fn idle_it_waits_for_a_wake_instead_of_polling() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tick = Duration::from_millis(50);
+        assert!(matches!(next(&rx, true, tick), Err(RecvTimeoutError::Timeout)), "active: polls every tick");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = tx.send(None);
+        });
+        let t = Instant::now();
+        assert!(matches!(next(&rx, false, tick), Ok(None)), "idle: the wake, not a tick");
+        assert!(t.elapsed() >= Duration::from_millis(350), "slept through {} ticks", t.elapsed().as_millis() / 50);
+        assert!(matches!(next(&rx, false, tick), Err(RecvTimeoutError::Disconnected)), "and ends with the node");
     }
 
     #[test]
