@@ -443,8 +443,8 @@ fn transfers(s: &Ui, t: Theme) -> El {
             _ if x.incoming => (&ARROW_DOWN, "받음", tok::accent(4, true)),
             _ => (&ARROW_UP, "보냄", tok::accent(0, true)),
         };
-        // The ring's diameter runs from the top of the file name to the bottom of the details line.
-        let badge = rune::icon(arrow, 32.0).color(tint).label(way);
+        // Two thirds of the two text lines' height, centred beside them.
+        let badge = rune::icon(arrow, 32.0 * 2.0 / 3.0).color(tint).label(way);
         let info = col().grow(1.0).shrink().gap(2.0)
             .child(text(x.file.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
             .child(text(format!("{} · {} · {state}", x.peer, size(x.total))).font(type_::LABEL).color(if failed { red() } else { t.text_secondary }));
