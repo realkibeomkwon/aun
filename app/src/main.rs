@@ -271,19 +271,55 @@ fn parse_addr(s: &str) -> Option<SocketAddr> {
     s.parse().ok().or_else(|| Some(SocketAddr::new(s.parse::<std::net::IpAddr>().ok()?, aun_core::node::PORT)))
 }
 
+/// A host name such as a Tailscale device name (`kibeom-windows`), with an optional port.
+fn parse_name(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (s, aun_core::node::PORT),
+    };
+    let label_ok = |l: &str| !l.is_empty() && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    // An all-digit last label is a mistyped IP ("192.168.0"), which the resolver would still
+    // turn into some address.
+    let numeric = host.rsplit('.').next().is_some_and(|l| l.chars().all(|c| c.is_ascii_digit()));
+    (host.split('.').all(label_ok) && !numeric).then(|| (host.to_owned(), port))
+}
+
+/// The first IPv4 address of `host`: Aun listens on IPv4 only.
+fn resolve(host: &str, port: u16) -> std::io::Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs()?.find(SocketAddr::is_ipv4).ok_or_else(|| std::io::Error::other("IPv4 주소가 없어요"))
+}
+
 /// For networks where discovery doesn't reach (another subnet, a VPN, broadcasts blocked).
 fn by_address(s: &Ui, t: Theme) -> El {
-    let go = |s: &mut Ui, tx: &mut Tx| match parse_addr(&s.ip_input.text) {
-        Some(addr) => {
+    let go = |s: &mut Ui, tx: &mut Tx| {
+        if let Some(addr) = parse_addr(&s.ip_input.text) {
             s.pairing = Some((addr.ip().to_string(), addr));
             s.code_input = TextEdit::new("");
             s.ip_input = TextEdit::new("");
+        } else if let (Some((host, port)), Some(h)) = (parse_name(&s.ip_input.text), s.handle.clone()) {
+            s.ip_input = TextEdit::new("");
+            s.say(format!("{host} 찾는 중…"), tx);
+            // A lookup can take seconds (an unknown name waits out DNS): off the UI thread.
+            std::thread::spawn(move || {
+                let found = resolve(&host, port);
+                h.update(move |s: &mut Ui, tx| match found {
+                    Ok(addr) => {
+                        s.pairing = Some((host, addr));
+                        s.code_input = TextEdit::new("");
+                        s.message = None;
+                    }
+                    Err(e) => s.say(format!("{host}을(를) 찾지 못했어요: {e}"), tx),
+                });
+            });
+        } else {
+            s.say("IP 주소나 기기 이름을 확인하세요 (예: 192.168.0.5)", tx);
         }
-        None => s.say("IP 주소를 확인하세요 (예: 192.168.0.5)", tx),
     };
     let field = el().key("ip-field").grow(1.0).h(28.0).radius(radius::MD).fill(t.bg).border(1.0, t.card_border).center_y()
-        .child(text_input(&s.ip_input, type_::LABEL).key("ip-input").w_full().px(space::S2).py(4.0).label("상대 기기 IP 주소").color(t.text)
-            .placeholder("목록에 없나요? IP 주소로 페어링 (예: 192.168.0.5)", t.text_secondary)
+        .child(text_input(&s.ip_input, type_::LABEL).key("ip-input").w_full().px(space::S2).py(4.0).label("상대 기기 IP 주소 또는 이름").color(t.text)
+            .placeholder("목록에 없나요? IP 주소나 이름으로 페어링 (예: 192.168.0.5)", t.text_secondary)
             .on_edit(|s: &mut Ui| &mut s.ip_input).on_submit(go));
     row().key("by-address").w_full().gap(space::S2).center_y().child(field).child(button("ip-go".into(), "페어링", t, false, go))
 }
@@ -685,6 +721,18 @@ mod tests {
         assert_eq!(parse_addr("10.0.0.2:5000"), Some(([10, 0, 0, 2], 5000).into()));
         assert_eq!(parse_addr("my-pc"), None);
         assert_eq!(parse_addr("192.168.0"), None);
+    }
+
+    #[test]
+    fn device_names_are_accepted_alongside_addresses() {
+        assert_eq!(parse_name(" kibeom-windows "), Some(("kibeom-windows".into(), aun_core::node::PORT)));
+        assert_eq!(parse_name("kibeom-mac.tail7efa79.ts.net:5000"), Some(("kibeom-mac.tail7efa79.ts.net".into(), 5000)));
+        assert_eq!(parse_name("my pc"), None, "no spaces in a host name");
+        assert_eq!(parse_name(""), None);
+        assert_eq!(parse_name("-pc"), None);
+        assert_eq!(parse_name("192.168.0"), None, "a mistyped IP is not a name");
+        assert_eq!(resolve("localhost", 47810).unwrap(), SocketAddr::from(([127, 0, 0, 1], 47810)), "names resolve to IPv4");
+        assert!(resolve("no-such-host.invalid", 47810).is_err());
     }
 
     #[test]
