@@ -428,11 +428,13 @@ fn a_stopped_send_resumes_where_it_stopped() {
     let check = |first: u8| check_at(&got, first);
     let (mut after_in, mut after_out) = (0u64, 0u64);
     let ours = |incoming: bool, after: u64| move |n: &Note| matches!(n, Note::Transfer { incoming: i, key, file, .. } if *i == incoming && *key > after && file.starts_with("big"));
-    // Sends big.bin and, once bytes are moving, stops it: a cancel at the sender, or the link
-    // dropping (the sender going to sleep).
-    let stop_midway = |after_in: &mut u64, after_out: &mut u64, drop_link: bool| {
+    // Sends big.bin and, once the receiver has written some of it, stops it: a cancel at the
+    // sender, or the link dropping (the sender going to sleep). Returns what the receiver kept.
+    // (The sender's count is what it queued: bytes still in flight may never land.)
+    let stop_midway = |after_in: &mut u64, after_out: &mut u64, drop_link: bool| -> u64 {
         guest.send_file(host.id(), big.clone());
-        let Note::Transfer { key: k_out, .. } = next_transfer(&gn, "bytes leaving", |n| ours(false, *after_out)(n) && matches!(n, Note::Transfer { done, finished: false, .. } if *done > 0)) else { unreachable!() };
+        next_transfer(&hn, "bytes arriving", |n| ours(true, *after_in)(n) && matches!(n, Note::Transfer { done, finished: false, .. } if *done > 0));
+        let Note::Transfer { key: k_out, .. } = next_transfer(&gn, "the send under way", |n| ours(false, *after_out)(n)) else { unreachable!() };
         if drop_link {
             guest.set_sleeping(true);
         } else {
@@ -449,6 +451,7 @@ fn a_stopped_send_resumes_where_it_stopped() {
         // The receiver notes the stop before it would delete the part: give it the time to.
         std::thread::sleep(Duration::from_millis(300));
         assert!(dir_has_part(&dl), "a send stopped by the sender keeps what arrived (link dropped: {drop_link})");
+        done
     };
     // Sends it again; returns where the receiver started.
     let again = |after_in: &mut u64, after_out: &mut u64| -> u64 {
@@ -461,8 +464,9 @@ fn a_stopped_send_resumes_where_it_stopped() {
     };
 
     for drop_link in [false, true] {
-        stop_midway(&mut after_in, &mut after_out, drop_link);
-        assert!(again(&mut after_in, &mut after_out) > 0, "picks up where it stopped, not at 0 (link dropped: {drop_link})");
+        let kept = stop_midway(&mut after_in, &mut after_out, drop_link);
+        assert!(kept > 0);
+        assert_eq!(again(&mut after_in, &mut after_out), kept, "picks up where it stopped (link dropped: {drop_link})");
         check(0xA5);
         assert!(!dir_has_part(&dl));
         std::fs::remove_file(&got).unwrap();
