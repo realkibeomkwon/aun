@@ -97,6 +97,8 @@ struct Outbox {
     queue: VecDeque<(u64, PathBuf)>,
     /// The file on the wire: (frame id, key).
     current: Option<(u32, u64)>,
+    /// Its path, so the same file isn't queued again while it goes.
+    sending: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -415,14 +417,24 @@ impl Node {
             drop(st);
             return (self.0.notify)(Note::Info("연결된 기기가 아니에요".into()));
         };
-        let mut queued = Vec::new();
+        let mut queued: Vec<(u64, PathBuf)> = Vec::new();
+        let mut again = Vec::new();
         for path in paths {
+            let o = st.outboxes.get(&id);
+            let busy = o.is_some_and(|o| o.sending.as_ref() == Some(&path) || o.queue.iter().any(|(_, p)| *p == path));
+            if busy || queued.iter().any(|(_, p)| *p == path) {
+                again.push(path);
+                continue;
+            }
             st.next += 1;
             queued.push((st.next, path));
         }
         let start = !st.outboxes.contains_key(&id);
         st.outboxes.entry(id).or_default().queue.extend(queued.iter().cloned());
         drop(st);
+        for path in again {
+            (self.0.notify)(Note::Info(format!("{}은(는) 이미 보내는 중이에요", file_name(&path))));
+        }
         for (key, path) in queued {
             let total = std::fs::metadata(&path).map_or(0, |m| m.len());
             (self.0.notify)(Note::Transfer { key, peer_id: id, peer: peer.clone(), file: file_name(&path), path, done: 0, total, incoming: false, finished: false, failed: false, cancelled: false });
@@ -444,6 +456,7 @@ impl Node {
                 let tx = st.peers.get(&id).and_then(|p| p.link.as_ref()).map(|l| l.tx.clone());
                 if let Some(o) = st.outboxes.get_mut(&id) {
                     o.current = Some((key as u32, key));
+                    o.sending = Some(path.clone());
                 }
                 (key, path, tx)
             };
@@ -455,6 +468,7 @@ impl Node {
                 let mut st = self.st();
                 if let Some(o) = st.outboxes.get_mut(&id) {
                     o.current = None;
+                    o.sending = None;
                 }
                 st.cancelled.remove(&key)
             };

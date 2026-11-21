@@ -145,10 +145,11 @@ fn sends_right_after_pairing_survive_discovery() {
         let src = dir(&format!("race-src-{round}"));
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(&src).unwrap();
-        let file = src.join("f.bin");
-        std::fs::write(&file, vec![7u8; 2 << 20]).unwrap();
-        for _ in 0..5 {
-            guest.send_file(hid, file.clone());
+        // Five different files: the same one again while it is still going is refused by design.
+        for i in 0..5 {
+            let file = src.join(format!("f{i}.bin"));
+            std::fs::write(&file, vec![7u8; 2 << 20]).unwrap();
+            guest.send_file(hid, file);
             std::thread::sleep(Duration::from_millis(15));
         }
         let (mut done, mut bad) = (0, Vec::new());
@@ -335,4 +336,35 @@ fn idle_link() {
     guest.pair(addr(&host), host.show_code());
     until("pairing", || connected(&guest, &host));
     std::thread::sleep(Duration::from_secs(45));
+}
+
+/// The same file to the same device while it is still waiting or on the wire is a mistake
+/// (two copies, twice the time): the second is not queued, and the user is told.
+#[test]
+fn a_file_already_on_its_way_is_not_queued_again() {
+    let (host, _hn) = node("dup-host", "Host");
+    let (guest, gn) = node("dup-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let src = dir("dup-src");
+    let _ = std::fs::remove_dir_all(&src);
+    std::fs::create_dir_all(&src).unwrap();
+    let big = src.join("big.bin");
+    std::fs::File::create(&big).unwrap().set_len(4 << 30).unwrap();
+    // Once on the wire, once waiting (in the same drop), once more after it started.
+    guest.send_files(host.id(), vec![big.clone(), big.clone()]);
+    std::thread::sleep(Duration::from_millis(300));
+    guest.send_file(host.id(), big.clone());
+    let (mut keys, mut told) = (std::collections::HashSet::new(), 0);
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < end {
+        match gn.recv_timeout(Duration::from_millis(50)) {
+            Ok(Note::Transfer { key, incoming: false, .. }) => drop(keys.insert(key)),
+            Ok(Note::Info(m)) if m.contains("이미 보내는 중") => told += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(keys.len(), 1, "one transfer for one file: {keys:?}");
+    assert_eq!(told, 2, "each refused copy is explained");
+    guest.cancel(*keys.iter().next().unwrap());
 }
