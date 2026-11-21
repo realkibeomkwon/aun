@@ -281,6 +281,27 @@ fn a_device_paired_by_address_reconnects_without_discovery() {
     until("a reconnect nobody asked for", || connected(&guest2, &host));
 }
 
+/// Going to sleep closes links at once, so the peer stops showing "connected" without waiting
+/// out 35 s of silence, and no link comes back (a DarkWake redial) until the machine wakes.
+#[test]
+fn a_sleeping_node_drops_its_links_until_it_wakes() {
+    let (host, _hn) = node("sleep-host", "Host");
+    let (guest, _gn) = node("sleep-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    for (sleeper, other) in [(&host, &guest), (&guest, &host)] {
+        sleeper.set_sleeping(true);
+        let t = Instant::now();
+        until("the peer to see the link go", || !connected(other, sleeper));
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // The guest redials the typed address every 5 s: refused (or not made) while asleep.
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(!connected(other, sleeper) && !connected(sleeper, other), "a link came back during sleep");
+        sleeper.set_sleeping(false);
+        until("a reconnect after waking", || connected(&guest, &host) && connected(&host, &guest));
+    }
+}
+
 /// `-- --ignored --exact idle_nodes` / `idle_link`, watched with `top -stats csw`: what one idle
 /// link adds to two nodes.
 #[test]

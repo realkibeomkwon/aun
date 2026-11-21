@@ -118,6 +118,8 @@ struct Shared {
     downloads: Mutex<PathBuf>,
     clip_on: AtomicBool,
     secrets_on: AtomicBool,
+    /// Between the OS saying it will sleep and saying it woke: no links, in or out.
+    asleep: AtomicBool,
     clip_tx: Mutex<Option<Sender<clip::Content>>>,
     st: Mutex<St>,
     notify: Box<dyn Fn(Note) + Send + Sync>,
@@ -150,6 +152,7 @@ impl Node {
             downloads: Mutex::new(cfg.downloads),
             clip_on: AtomicBool::new(cfg.clipboard),
             secrets_on: AtomicBool::new(cfg.secrets),
+            asleep: AtomicBool::new(false),
             clip_tx: Mutex::new(None),
             st: Mutex::new(st),
             notify: Box::new(notify),
@@ -220,6 +223,19 @@ impl Node {
     }
     pub fn set_clipboard(&self, on: bool) {
         self.0.clip_on.store(on, Ordering::Relaxed);
+    }
+    /// The OS is about to sleep (true) or woke (false).
+    pub fn set_sleeping(&self, on: bool) {
+        if self.0.asleep.swap(on, Ordering::Relaxed) == on {
+            return;
+        }
+        crate::log(format_args!("{}", if on { "going to sleep: closing links" } else { "woke: links allowed again" }));
+        if on {
+            self.close_links();
+        }
+    }
+    fn asleep(&self) -> bool {
+        self.0.asleep.load(Ordering::Relaxed)
     }
     pub fn secrets(&self) -> bool {
         self.0.secrets_on.load(Ordering::Relaxed)
@@ -305,9 +321,11 @@ impl Node {
     fn dial(&self, id: Id, addr: SocketAddr) {
         let n = self.clone();
         spawn("aun-dial", move || {
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
-                Ok(sock) => n.clone().run_link(sock, true, None),
-                Err(e) => crate::log(format_args!("dial {addr}: {e}")),
+            if !n.asleep() {
+                match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+                    Ok(sock) => n.clone().run_link(sock, true, None),
+                    Err(e) => crate::log(format_args!("dial {addr}: {e}")),
+                }
             }
             n.st().dialing.remove(&id);
         });
@@ -504,6 +522,10 @@ impl Node {
 
     /// One link, from handshake to close. `pair` is the code when this side dials to pair.
     fn run_link(self, sock: TcpStream, initiator: bool, pair: Option<String>) {
+        // Dropped unanswered: a DarkWake would otherwise bring the link back while "asleep".
+        if self.asleep() {
+            return;
+        }
         let peer_addr = sock.peer_addr().ok();
         if let Err(e) = self.link(sock, initiator, pair.clone()) {
             crate::log(format_args!("link {peer_addr:?} (we dialled: {initiator}) refused before it was up: {e}"));

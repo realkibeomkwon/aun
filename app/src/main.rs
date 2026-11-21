@@ -524,7 +524,11 @@ fn main() {
         };
         // Runs on the main thread once the loop starts, window or not.
         let h = app.handle();
+        let power = node.clone();
         app.handle().update(move |s, _| {
+            if let Some(n) = power {
+                aun_core::power::watch(n);
+            }
             s.tray = tray::Tray::new(h.clone(), s.settings.clipboard);
             aun_core::log(format_args!("tray {}", if s.tray.is_some() { "up" } else { "unavailable" }));
             s.handle = Some(h);

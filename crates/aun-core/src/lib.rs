@@ -3,6 +3,7 @@
 pub mod clip;
 pub mod discovery;
 pub mod node;
+pub mod power;
 pub mod store;
 pub mod wire;
 
