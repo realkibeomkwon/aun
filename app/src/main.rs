@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 /// How long a status message stays up.
 const MESSAGE_FOR: Duration = Duration::from_secs(5);
 const FLASH_FOR: Duration = Duration::from_millis(1500);
+/// Pixels the remote pointer moves per point moved on the pad.
+const PAD_GAIN: f32 = 2.0;
 
+use aun_core::wire::Frame;
 use aun_core::{Config, Id, Node, Note, PeerView};
 use settings::Settings;
 use rune::tok::{self, Theme, radius, space, type_};
@@ -37,8 +40,27 @@ struct Transfer {
     cancelled: bool,
 }
 
+/// The trackpad driving a peer's pointer (docs/kvm-design.md, step 1).
+struct Pad {
+    id: Id,
+    name: String,
+    route: u32,
+    mn: u32,
+    /// Points moved since the pad opened, times the gain: sent as a running total.
+    total: (f32, f32),
+    /// The last pointer point over the pad while no button is down; None after it entered.
+    last: Option<(f32, f32)>,
+    /// The drag's travel already sent, while the button is down.
+    held: Option<(f32, f32)>,
+}
+
 struct Ui {
     node: Option<Node>,
+    pad: Option<Pad>,
+    /// The last pad's route: each opening starts the next.
+    route: u32,
+    #[cfg(test)]
+    sent: std::cell::RefCell<Vec<Frame>>,
     me: String,
     peers: Vec<PeerView>,
     code: Option<String>,
@@ -71,7 +93,7 @@ impl Ui {
         let settings = dir.as_deref().map(Settings::load).unwrap_or_default();
         let autostart = dir.is_some() && autostart::enabled();
         let mut ui = Ui {
-            node, me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, flash: None, copied: vec![], copied_dirs: 0, over: None,
+            node, pad: None, route: 0, #[cfg(test)] sent: Default::default(), me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, flash: None, copied: vec![], copied_dirs: 0, over: None,
             dir, settings, autostart, handle: None, tray: None,
         };
         ui.refresh();
@@ -96,6 +118,48 @@ impl Ui {
         }
         self.settings.secrets = on;
         self.save(tx);
+    }
+
+    fn set_kvm(&mut self, on: bool, tx: &mut Tx) {
+        if let Some(n) = &self.node {
+            n.set_kvm(on);
+        }
+        self.settings.kvm = on;
+        self.save(tx);
+        // macOS drops posted input without Accessibility; asking opens the system's request.
+        if on && self.node.is_some() && !aun_core::kvm::allowed(true) {
+            self.say("시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 Aun을 허용하세요", tx);
+        }
+    }
+
+    fn open_pad(&mut self, id: Id, name: String) {
+        self.close_pad();
+        self.route = self.route.wrapping_add(1);
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None });
+    }
+
+    /// Lets go of what the pad holds at the peer, then closes it.
+    fn close_pad(&mut self) {
+        if let Some(p) = self.pad.take() {
+            self.input(p.id, Frame::KvmLeave);
+        }
+    }
+
+    fn input(&self, id: Id, f: Frame) {
+        #[cfg(test)]
+        self.sent.borrow_mut().push(f.clone());
+        if let Some(n) = &self.node {
+            n.send_input(id, f);
+        }
+    }
+
+    fn pad_move(&mut self, dx: f32, dy: f32) {
+        let Some(p) = &mut self.pad else { return };
+        p.total = (p.total.0 + dx * PAD_GAIN, p.total.1 + dy * PAD_GAIN);
+        p.mn += 1;
+        let f = Frame::KvmMove { route: p.route, mn: p.mn, cx: p.total.0.round() as i32, cy: p.total.1.round() as i32 };
+        let id = p.id;
+        self.input(id, f);
     }
 
     fn set_dock(&mut self, on: bool, tx: &mut Tx) {
@@ -124,6 +188,10 @@ impl Ui {
         if let Some(n) = &self.node {
             self.peers = n.peers();
             self.code = n.code();
+        }
+        // Its link went: the peer let go of what it held when it dropped.
+        if self.pad.as_ref().is_some_and(|p| !self.peers.iter().any(|v| v.id == p.id && v.kvm)) {
+            self.pad = None;
         }
     }
 
@@ -260,6 +328,13 @@ fn peer_row(p: &PeerView, s: &Ui, t: Theme) -> El {
         .on_drop_files(move |s: &mut Ui, files, _| s.send(id, files))
         .on_drop_hover(move |s: &mut Ui, over, _| s.over = over.then_some(id));
     }
+    if p.kvm {
+        let open = s.pad.as_ref().is_some_and(|x| x.id == id);
+        let name = p.name.clone();
+        r = r.child(button(format!("pad-{k}"), "원격 조작", t, open, move |s, _| {
+            if open { s.close_pad() } else { s.open_pad(id, name.clone()) }
+        }));
+    }
     if p.paired {
         r = r.child(button(format!("forget-{k}"), "해제", t, false, move |s, _| {
             if let Some(n) = &s.node {
@@ -382,12 +457,15 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         .child(button("clip".into(), if s.settings.clipboard { "클립보드 공유 켜짐" } else { "클립보드 공유 꺼짐" }, t, s.settings.clipboard, |s, tx| {
             s.set_clip(!s.settings.clipboard, tx)
         }));
-    let mut prefs = row().key("prefs").w_full().gap(space::S2)
+    let mut prefs = row().key("prefs").w_full().gap(space::S2).flex_wrap()
         .child(button("autostart".into(), if s.autostart { "로그인 시 실행 켜짐" } else { "로그인 시 실행 꺼짐" }, t, s.autostart, |s, tx| {
             s.set_autostart(!s.autostart, tx)
         }))
         .child(button("secrets".into(), if s.settings.secrets { "비밀번호 공유 켜짐" } else { "비밀번호 공유 꺼짐" }, t, s.settings.secrets, |s, tx| {
             s.set_secrets(!s.settings.secrets, tx)
+        }))
+        .child(button("kvm".into(), if s.settings.kvm { "원격 조작 허용 켜짐" } else { "원격 조작 허용 꺼짐" }, t, s.settings.kvm, |s, tx| {
+            s.set_kvm(!s.settings.kvm, tx)
         }));
     if cfg!(target_os = "macos") {
         prefs = prefs.child(button("dock".into(), if s.settings.dock { "Dock 아이콘 표시" } else { "Dock 아이콘 숨김" }, t, s.settings.dock, |s, tx| {
@@ -440,6 +518,10 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         controls = controls.child(b);
     }
     let mut root = col().key("root").w_full().h_full().padding(space::S6).gap(space::S3).fill(t.bg).child(controls);
+    // Outside the scrolling controls, so it stays in view while it is in use.
+    if let Some(p) = pad(s, t) {
+        root = root.child(p);
+    }
     // Notices sit just above the history, where the files they are about are.
     if let Some((m, _)) = &s.message {
         let close = row().key("message-close").role("button").label("닫기").focusable(true).size(24.0, 24.0).center().radius(radius::MD)
@@ -471,6 +553,70 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         root = root.child(transfers(s, t));
     }
     root
+}
+
+/// Moving over it moves the peer's pointer; a click, a drag, a right click and a scroll here
+/// happen there.
+fn pad(s: &Ui, t: Theme) -> Option<El> {
+    let p = s.pad.as_ref()?;
+    let area = el().key("pad-area").w_full().h(180.0).radius(radius::MD).fill(t.bg).border(1.0, tok::accent(0, true)).center()
+        .label(format!("{} 트랙패드", p.name))
+        .child(text("여기서 움직이면 상대 커서가 움직여요 · 클릭, 끌기, 오른쪽 클릭, 스크롤").font(type_::LABEL).color(t.text_secondary))
+        // Out and back in elsewhere is no move: the next point over the pad starts afresh.
+        .on_hover_change(|s: &mut Ui, inside, _| {
+            if let Some(p) = &mut s.pad
+                && !inside
+            {
+                p.last = None;
+            }
+        })
+        .on_pointer_move_local(|s: &mut Ui, e, _| {
+            let Some(p) = &mut s.pad else { return };
+            if p.held.is_some() {
+                return; // the drag sends its own travel
+            }
+            let last = p.last.replace((e.x, e.y));
+            if let Some((x, y)) = last {
+                s.pad_move(e.x - x, e.y - y);
+            }
+        })
+        .on_drag(|s: &mut Ui, d, _| {
+            let Some(p) = &mut s.pad else { return };
+            let id = p.id;
+            match d.phase {
+                rune::Phase::Down => {
+                    p.held = Some((0.0, 0.0));
+                    s.input(id, Frame::KvmButton { button: 0, down: true, clicks: d.clicks.min(255) as u8 });
+                }
+                rune::Phase::Move => {
+                    let (x, y) = p.held.replace((d.dx, d.dy)).unwrap_or((d.dx, d.dy));
+                    s.pad_move(d.dx - x, d.dy - y);
+                }
+                // A cancelled gesture lets go too: the button is down at the peer.
+                rune::Phase::Up => {
+                    (p.held, p.last) = (None, None);
+                    s.input(id, Frame::KvmButton { button: 0, down: false, clicks: d.clicks.min(255) as u8 });
+                }
+            }
+        })
+        .on_secondary_press(|s: &mut Ui, _, _| {
+            if let Some(id) = s.pad.as_ref().map(|p| p.id) {
+                s.input(id, Frame::KvmButton { button: 1, down: true, clicks: 1 });
+                s.input(id, Frame::KvmButton { button: 1, down: false, clicks: 1 });
+            }
+        })
+        .on_wheel(|s: &mut Ui, w, _| {
+            if let Some(id) = s.pad.as_ref().map(|p| p.id) {
+                let px = |v: f32| v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                s.input(id, Frame::KvmWheel { dx: px(w.dx), dy: px(w.dy) });
+            }
+            true
+        });
+    Some(col().key("pad").w_full().gap(space::S2).padding(space::S3).radius(radius::MD).fill(t.card).border(1.0, t.card_border)
+        .child(row().w_full().center_y().gap(space::S2)
+            .child(text(format!("{} 원격 조작 중", p.name)).font(type_::LABEL).color(t.text).grow(1.0))
+            .child(button("pad-close".into(), "그만", t, false, |s, _| s.close_pad())))
+        .child(area))
 }
 
 fn copied_text(s: &Ui) -> String {
@@ -665,7 +811,7 @@ fn size(b: u64) -> String {
 }
 
 fn demo(s: &mut Ui) {
-    let peer = |n: u8, name: &str, paired, nearby, connected| PeerView { id: [n; 32], name: name.into(), addr: Some(([192, 168, 0, n], 47810).into()), paired, nearby, connected };
+    let peer = |n: u8, name: &str, paired, nearby, connected| PeerView { id: [n; 32], name: name.into(), addr: Some(([192, 168, 0, n], 47810).into()), paired, nearby, connected, kvm: connected };
     s.me = "MacBook Pro".into();
     s.peers = vec![peer(1, "Windows 노트북", true, true, true), peer(2, "작업실 PC", true, false, false), peer(3, "Mac mini", false, true, false)];
     s.code = Some("482913".into());
@@ -758,7 +904,7 @@ fn main() {
             let _ = autostart::set(true);
         }
         let h = app.handle();
-        let cfg = Config { dir: dir.clone(), downloads: settings.downloads.clone().unwrap_or_else(downloads_dir), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: settings.clipboard, secrets: settings.secrets };
+        let cfg = Config { dir: dir.clone(), downloads: settings.downloads.clone().unwrap_or_else(downloads_dir), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: settings.clipboard, secrets: settings.secrets, kvm: settings.kvm };
         let node = match Node::start(cfg, move |note| h.update(move |s: &mut Ui, tx| s.apply(note, tx))) {
             Ok(n) => Some(n),
             Err(e) => {
@@ -791,7 +937,7 @@ mod tests {
     #[test]
     fn a_clicked_code_field_takes_typed_digits() {
         let mut ui = Ui::new(None, None);
-        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: Some(([10, 0, 0, 3], 47810).into()), paired: false, nearby: true, connected: false }];
+        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: Some(([10, 0, 0, 3], 47810).into()), paired: false, nearby: true, connected: false, kvm: false }];
         ui.pairing = Some(("PC".into(), ([10, 0, 0, 3], 47810).into()));
         let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
         rt.frame(0.0);
@@ -819,6 +965,52 @@ mod tests {
         rt.key(KeyEvent { key: Key::Backspace, mods: Default::default() });
         rt.frame(1.0 / 60.0);
         assert_eq!(rt.state.code_input.text, "012", "no trailing space once the second group is gone");
+    }
+
+    /// Hovering moves the pointer there, a drag holds the button while it moves (each point once,
+    /// though the pad hears both the hover and the drag), and closing lets go.
+    #[test]
+    fn the_pad_moves_clicks_and_drags_the_peer_s_pointer() {
+        let mut ui = Ui::new(None, None);
+        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: None, paired: true, nearby: true, connected: true, kvm: true }];
+        let mut rt = Runtime::new(ui, view, (480.0, 700.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let (x, y) = rt.find("pad-030303030303").expect("the remote control button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let (cx, cy) = rt.find("pad-area").expect("the pad");
+        // Rune hands the first moves over a just-shown pad to no handler (seen, cause not looked
+        // into): settle on it first.
+        for i in 0..3 {
+            rt.pointer_move(cx - 10.0, cy);
+            rt.frame(0.05 + i as f64 * 0.02);
+        }
+        rt.state.sent.borrow_mut().clear();
+        for (i, px) in [cx, cx + 5.0, cx + 15.0].into_iter().enumerate() {
+            rt.pointer_move(px, cy);
+            rt.frame(0.12 + i as f64 * 0.02);
+        }
+        rt.pointer_down(cx + 15.0, cy);
+        rt.pointer_move(cx + 15.0, cy + 10.0);
+        rt.pointer_move(cx + 15.0, cy + 30.0);
+        rt.pointer_up(cx + 15.0, cy + 30.0);
+        rt.frame(0.2);
+        rt.pointer_move(cx + 16.0, cy + 30.0);
+        rt.pointer_move(cx + 18.0, cy + 30.0);
+        rt.frame(0.3);
+        let (x, y) = rt.find("pad-close").expect("the stop button");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.4);
+        let sent: Vec<_> = rt.state.sent.borrow().iter().map(|f| match f {
+            Frame::KvmMove { cx, cy, .. } => format!("to {cx},{cy}"),
+            Frame::KvmButton { down, .. } => (if *down { "down" } else { "up" }).into(),
+            f => format!("{f:?}"),
+        }).collect::<Vec<_>>();
+        // Points times the gain, as a running total.
+        assert_eq!(sent, ["to 20,0", "to 30,0", "to 50,0", "down", "to 50,20", "to 50,60", "up", "to 54,60", "KvmLeave"]);
+        assert!(rt.state.pad.is_none());
     }
 
     #[test]

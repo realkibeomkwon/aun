@@ -1,7 +1,9 @@
-//! Aun's engine: discovery, pairing, encrypted links, clipboard and file transfer. No UI.
+//! Aun's engine: discovery, pairing, encrypted links, clipboard, file transfer and injected
+//! mouse input. No UI.
 
 pub mod clip;
 pub mod discovery;
+pub mod kvm;
 pub mod node;
 pub mod power;
 pub mod store;

@@ -20,7 +20,7 @@ fn node(tag: &str, name: &str) -> (Node, mpsc::Receiver<Note>) {
 fn restart(tag: &str, name: &str) -> (Node, mpsc::Receiver<Note>) {
     let (tx, rx) = mpsc::channel();
     let d = dir(tag);
-    let cfg = Config { dir: d.join("cfg"), downloads: d.join("dl"), name: name.into(), port: 0, discovery: false, clipboard: false, secrets: false };
+    let cfg = Config { dir: d.join("cfg"), downloads: d.join("dl"), name: name.into(), port: 0, discovery: false, clipboard: false, secrets: false, kvm: false };
     (Node::start(cfg, move |n| { let _ = tx.send(n); }).unwrap(), rx)
 }
 
@@ -502,4 +502,54 @@ fn a_stopped_send_resumes_where_it_stopped() {
     assert!(!dir_has_part(&dl), "the stale part is gone");
     std::fs::remove_dir_all(&src).unwrap();
     std::fs::remove_dir_all(dir("resume-host")).unwrap();
+}
+
+#[derive(Clone, Default)]
+struct Rec(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl aun_core::kvm::Sink for Rec {
+    fn move_by(&mut self, dx: i32, dy: i32, held: u8) {
+        self.0.lock().unwrap().push(format!("move {dx} {dy} held {held}"));
+    }
+    fn button(&mut self, b: u8, down: bool, _: u8) {
+        self.0.lock().unwrap().push(format!("button {b} {}", if down { "down" } else { "up" }));
+    }
+    fn wheel(&mut self, dx: i32, dy: i32) {
+        self.0.lock().unwrap().push(format!("wheel {dx} {dy}"));
+    }
+}
+
+/// Input from a peer lands only while allowed, and a button it held is let go when the link
+/// drops: a mouse button stuck down at the other desk is the accident to prevent.
+#[test]
+fn injected_input_is_allowed_only_when_switched_on_and_let_go_when_the_link_drops() {
+    use aun_core::wire::Frame;
+    let (host, hn) = node("kvm-host", "Host");
+    let (guest, _gn) = node("kvm-guest", "Guest");
+    let rec = Rec::default();
+    let r = rec.clone();
+    host.set_sink(move || Box::new(r.clone()));
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    assert!(guest.peers()[0].kvm && host.peers()[0].kvm, "both builds speak the input frames");
+    let log = || rec.0.lock().unwrap().clone();
+
+    // Off (the default): dropped. A file sent after it arrives after it was read.
+    assert!(guest.send_input(host.id(), Frame::KvmButton { button: 0, down: true, clicks: 1 }));
+    let f = dir("kvm-guest").join("marker.txt");
+    std::fs::write(&f, b"x").unwrap();
+    guest.send_file(host.id(), f);
+    next_transfer(&hn, "the marker file", |n| matches!(n, Note::Transfer { finished: true, .. }));
+    host.set_kvm(true);
+    assert!(guest.send_input(host.id(), Frame::KvmWheel { dx: 0, dy: 3 }));
+    until("the wheel", || !log().is_empty());
+    assert_eq!(log(), ["wheel 0 3"]);
+
+    assert!(guest.send_input(host.id(), Frame::KvmButton { button: 0, down: true, clicks: 1 }));
+    assert!(guest.send_input(host.id(), Frame::KvmMove { route: 1, mn: 1, cx: 7, cy: -2 }));
+    until("the drag", || log().len() == 3);
+    guest.set_sleeping(true);
+    until("the release", || log().len() == 4);
+    assert_eq!(log(), ["wheel 0 3", "button 0 down", "move 7 -2 held 1", "button 0 up"]);
+    assert!(!guest.send_input(host.id(), Frame::KvmLeave), "no link, nothing sent");
 }

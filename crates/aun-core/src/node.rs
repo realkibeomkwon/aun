@@ -24,6 +24,7 @@ use spake2::{Ed25519Group, Identity as SpakeId, Password, Spake2};
 
 use crate::store::{self, Id};
 use crate::wire::{self, Frame, OpenReader, SealWriter};
+use crate::kvm::{self, Injector, Sink};
 use crate::{clip, discovery};
 
 pub const PORT: u16 = 47810;
@@ -46,6 +47,8 @@ pub struct Config {
     pub clipboard: bool,
     /// Send copies that password managers mark private, too.
     pub secrets: bool,
+    /// Let paired devices move this device's pointer.
+    pub kvm: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +75,8 @@ pub struct PeerView {
     pub paired: bool,
     pub nearby: bool,
     pub connected: bool,
+    /// Connected with a build that can drive this device's pointer and be driven.
+    pub kvm: bool,
 }
 
 struct Link {
@@ -81,6 +86,8 @@ struct Link {
     sock: TcpStream,
     /// The peer's build can say where a stopped file goes on from.
     resume: bool,
+    /// The peer speaks this build's `Kvm*` frames.
+    kvm: bool,
 }
 
 #[derive(Default)]
@@ -146,6 +153,9 @@ struct Shared {
     downloads: Mutex<PathBuf>,
     clip_on: AtomicBool,
     secrets_on: AtomicBool,
+    kvm_on: AtomicBool,
+    /// Where each link's injected input goes.
+    sink: Mutex<Arc<MakeSink>>,
     /// Between the OS saying it will sleep and saying it woke: no links, in or out.
     asleep: AtomicBool,
     /// While asleep: the input idle time at the last look (`power::idle`), and since when.
@@ -154,6 +164,8 @@ struct Shared {
     st: Mutex<St>,
     notify: Box<dyn Fn(Note) + Send + Sync>,
 }
+
+type MakeSink = dyn Fn() -> Box<dyn Sink + Send> + Send + Sync;
 
 #[derive(Clone)]
 pub struct Node(Arc<Shared>);
@@ -182,6 +194,8 @@ impl Node {
             downloads: Mutex::new(cfg.downloads),
             clip_on: AtomicBool::new(cfg.clipboard),
             secrets_on: AtomicBool::new(cfg.secrets),
+            kvm_on: AtomicBool::new(cfg.kvm),
+            sink: Mutex::new(Arc::new(|| Box::new(kvm::Os))),
             asleep: AtomicBool::new(false),
             idle: Mutex::new((None, Instant::now())),
             clip_tx: Mutex::new(None),
@@ -236,7 +250,7 @@ impl Node {
             .peers
             .iter()
             .filter(|(_, p)| p.paired || p.nearby)
-            .map(|(id, p)| PeerView { id: *id, name: p.name.clone(), addr: p.addr, paired: p.paired, nearby: p.nearby, connected: p.link.is_some() })
+            .map(|(id, p)| PeerView { id: *id, name: p.name.clone(), addr: p.addr, paired: p.paired, nearby: p.nearby, connected: p.link.is_some(), kvm: p.link.as_ref().is_some_and(|l| l.kvm) })
             .collect();
         v.sort_by(|a, b| (!a.paired, &a.name).cmp(&(!b.paired, &b.name)));
         v
@@ -303,6 +317,38 @@ impl Node {
     }
     pub fn set_secrets(&self, on: bool) {
         self.0.secrets_on.store(on, Ordering::Relaxed);
+    }
+    pub fn kvm(&self) -> bool {
+        self.0.kvm_on.load(Ordering::Relaxed)
+    }
+    /// Off, input from peers is dropped, and a link's held buttons are let go at its next frame.
+    pub fn set_kvm(&self, on: bool) {
+        self.0.kvm_on.store(on, Ordering::Relaxed);
+    }
+    /// Where links opened from now on inject input: the OS's queue unless a test records it.
+    pub fn set_sink(&self, make: impl Fn() -> Box<dyn Sink + Send> + Send + Sync + 'static) {
+        *self.0.sink.lock().unwrap() = Arc::new(make);
+    }
+
+    /// Drives `id`'s pointer, if it is connected and speaks `Kvm*` frames; false if not sent.
+    /// A move or a scroll is dropped when the link's queue is full (a file going out): the next
+    /// move carries the total. A button or a leave waits for room, up to a moment.
+    /// shortcut: input waits behind file chunks already queued; a queue of its own is step 2.
+    pub fn send_input(&self, id: Id, f: Frame) -> bool {
+        let Some(tx) = self.st().peers.get(&id).and_then(|p| p.link.as_ref()).filter(|l| l.kvm).map(|l| l.tx.clone()) else { return false };
+        let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave);
+        let end = Instant::now() + Duration::from_millis(250);
+        let mut f = f;
+        loop {
+            match tx.try_send(f) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Full(back)) if must && Instant::now() < end => {
+                    f = back;
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return false,
+            }
+        }
     }
 
     /// Shows a fresh one-time code for a guest to type. It stays valid until it pairs a device,
@@ -666,9 +712,9 @@ impl Node {
         rsock.set_read_timeout(Some(DEAD))?;
         let mut r = OpenReader::new(t, BufReader::with_capacity(128 << 10, rsock));
 
-        wire::write_frame(&mut w, &Frame::Hello { pair: pair.is_some(), name: self.0.name.clone(), resume: true })?;
+        wire::write_frame(&mut w, &Frame::Hello { pair: pair.is_some(), name: self.0.name.clone(), resume: true, kvm: wire::KVM })?;
         w.flush()?;
-        let Frame::Hello { pair: they_pair, name, resume } = wire::read_frame(&mut r)? else { return Err(denied("hello")) };
+        let Frame::Hello { pair: they_pair, name, resume, kvm } = wire::read_frame(&mut r)? else { return Err(denied("hello")) };
         let name = store::clean_name(&name);
 
         // Marked paired only when the link registers below: in between, discovery would see a
@@ -722,7 +768,7 @@ impl Node {
             st.next += 1;
             let conn = st.next;
             let initiator_id = if initiator { self.0.id } else { remote };
-            let link = Link { conn, initiator: initiator_id, tx: tx.clone(), sock: sock.try_clone()?, resume };
+            let link = Link { conn, initiator: initiator_id, tx: tx.clone(), sock: sock.try_clone()?, resume, kvm: kvm == wire::KVM };
             let p = st.peers.entry(remote).or_default();
             p.name = name.clone();
             p.paired |= just_paired;
@@ -763,7 +809,11 @@ impl Node {
         spawn("aun-write", move || writer(w, rx, wsock));
 
         let mut rx_files = Incoming::new(self, name.clone(), remote, tx);
-        let res = self.read_loop(&mut r, &mut rx_files);
+        let make = self.0.sink.lock().unwrap().clone();
+        let mut input = Injector::new(make());
+        let res = self.read_loop(&mut r, &mut rx_files, &mut input);
+        // Before anything else: a button the peer held stays down until this.
+        input.release();
         rx_files.keep_all();
         let _ = sock.shutdown(std::net::Shutdown::Both);
         {
@@ -781,10 +831,25 @@ impl Node {
         Ok(())
     }
 
-    fn read_loop(&self, r: &mut impl Read, files: &mut Incoming) -> io::Result<()> {
+    fn read_loop(&self, r: &mut impl Read, files: &mut Incoming, input: &mut Injector<Box<dyn Sink + Send>>) -> io::Result<()> {
+        let mut told = false;
         loop {
             files.tell_cancels();
             match wire::read_frame(r)? {
+                f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave) => {
+                    if !self.kvm() {
+                        input.release();
+                    } else {
+                        if !told {
+                            told = true;
+                            crate::log(format_args!("input from {} (injection allowed by the OS: {})", files.peer, kvm::allowed(false)));
+                            if !kvm::allowed(false) {
+                                (self.0.notify)(Note::Info("손쉬운 사용 권한이 없어 원격 조작을 받을 수 없어요".into()));
+                            }
+                        }
+                        input.apply(f);
+                    }
+                }
                 Frame::Ping => {}
                 Frame::Clip(text) if text.len() <= clip::MAX_TEXT => self.to_clipboard(clip::Content::Text(text)),
                 Frame::Clip(_) => {}
@@ -1102,7 +1167,7 @@ mod tests {
     #[test]
     fn input_after_a_missed_wake_notice_lets_links_back() {
         let d = std::env::temp_dir().join(format!("aun-unit-idle-{}", std::process::id()));
-        let cfg = Config { dir: d.join("cfg"), downloads: d.join("dl"), name: "n".into(), port: 0, discovery: false, clipboard: false, secrets: false };
+        let cfg = Config { dir: d.join("cfg"), downloads: d.join("dl"), name: "n".into(), port: 0, discovery: false, clipboard: false, secrets: false, kvm: false };
         let n = Node::start(cfg, |_| {}).unwrap();
         let s = Duration::from_secs;
         n.set_sleeping(true);

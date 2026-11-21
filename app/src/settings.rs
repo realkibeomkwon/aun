@@ -13,11 +13,13 @@ pub struct Settings {
     pub downloads: Option<PathBuf>,
     /// Share copies that password managers mark private. Off: they stay on this device.
     pub secrets: bool,
+    /// Let paired devices move this device's pointer. Off until switched on.
+    pub kvm: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { clipboard: true, dock: true, downloads: None, secrets: false }
+        Settings { clipboard: true, dock: true, downloads: None, secrets: false, kvm: false }
     }
 }
 
@@ -29,6 +31,7 @@ impl Settings {
                 Some(("clipboard", v)) => s.clipboard = v == "1",
                 Some(("dock", v)) => s.dock = v == "1",
                 Some(("secrets", v)) => s.secrets = v == "1",
+                Some(("kvm", v)) => s.kvm = v == "1",
                 Some(("downloads", v)) if !v.is_empty() => s.downloads = Some(v.into()),
                 _ => {}
             }
@@ -38,7 +41,7 @@ impl Settings {
 
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let mut text = format!("clipboard={}\ndock={}\nsecrets={}\n", self.clipboard as u8, self.dock as u8, self.secrets as u8);
+        let mut text = format!("clipboard={}\ndock={}\nsecrets={}\nkvm={}\n", self.clipboard as u8, self.dock as u8, self.secrets as u8, self.kvm as u8);
         // One line per key: a folder whose name has a line break isn't kept.
         if let Some(d) = self.downloads.as_ref().and_then(|d| d.to_str()).filter(|d| !d.contains(['\n', '\r'])) {
             text += &format!("downloads={d}\n");
@@ -56,11 +59,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aun-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(Settings::load(&dir), Settings::default(), "no file: defaults");
-        let off = Settings { clipboard: false, dock: false, downloads: Some("/Users/me/받은 파일=새".into()), secrets: true };
+        let off = Settings { clipboard: false, dock: false, downloads: Some("/Users/me/받은 파일=새".into()), secrets: true, kvm: true };
         off.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), off);
         std::fs::write(dir.join("settings.txt"), "junk\nclipboard=0\nfuture=7\n").unwrap();
-        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true, downloads: None, secrets: false });
+        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true, downloads: None, secrets: false, kvm: false });
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

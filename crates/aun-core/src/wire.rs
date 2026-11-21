@@ -23,12 +23,15 @@ pub const MAX_FRAME: usize = 4 << 20;
 pub const MAX_IMAGE: usize = 16 << 20;
 const CLIP_IMAGE: u8 = 9;
 pub const FILE_CHUNK: usize = 256 << 10;
+/// The `Kvm*` frames this build speaks, sent in `Hello`. Peers use them only when both say the
+/// same version (0, as an older build reads: none); a change to their layout bumps it.
+pub const KVM: u8 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     /// `resume`: this build answers `FileStart { resume: true }` with `FileFrom`. Older builds
-    /// send no such byte and never get asked.
-    Hello { pair: bool, name: String, resume: bool },
+    /// send no such byte and never get asked. `kvm`: the [`KVM`] version, 0 from older builds.
+    Hello { pair: bool, name: String, resume: bool, kvm: u8 },
     Spake(Vec<u8>),
     Confirm(Vec<u8>),
     Ping,
@@ -46,6 +49,15 @@ pub enum Frame {
     FileCancel { id: u32 },
     /// The answer to `FileStart { resume: true }`: send file `id` (the sender's id) from `offset`.
     FileFrom { id: u32, offset: u64 },
+    /// The pointer moved, in pixels, `(cx, cy)` in total since `route` began: one lost or late
+    /// move doesn't lose distance. `mn` counts moves in the route; an older one is dropped.
+    KvmMove { route: u32, mn: u32, cx: i32, cy: i32 },
+    /// Button 0 left, 1 right, 2 middle. `clicks`: which click of a run (2 for a double click).
+    KvmButton { button: u8, down: bool, clicks: u8 },
+    /// Scroll by pixels, positive moving the content right and down.
+    KvmWheel { dx: i16, dy: i16 },
+    /// The driver let go: release whatever it holds down.
+    KvmLeave,
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -76,11 +88,12 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
     }
     let mut b = Vec::with_capacity(64);
     match f {
-        Frame::Hello { pair, name, resume } => {
+        Frame::Hello { pair, name, resume, kvm } => {
             b.push(0);
             b.push(*pair as u8);
             put_str(&mut b, name);
             b.push(*resume as u8);
+            b.push(*kvm);
         }
         Frame::Spake(m) => (b.push(1), b.extend_from_slice(m)).1,
         Frame::Confirm(m) => (b.push(2), b.extend_from_slice(m)).1,
@@ -101,6 +114,15 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
         Frame::FileAbort { id, cancelled } => (b.push(8), b.extend_from_slice(&id.to_be_bytes()), b.push(*cancelled as u8)).2,
         Frame::FileCancel { id } => (b.push(10), b.extend_from_slice(&id.to_be_bytes())).1,
         Frame::FileFrom { id, offset } => (b.push(11), b.extend_from_slice(&id.to_be_bytes()), b.extend_from_slice(&offset.to_be_bytes())).2,
+        Frame::KvmMove { route, mn, cx, cy } => {
+            b.push(12);
+            for v in [route.to_be_bytes(), mn.to_be_bytes(), cx.to_be_bytes(), cy.to_be_bytes()] {
+                b.extend_from_slice(&v);
+            }
+        }
+        Frame::KvmButton { button, down, clicks } => b.extend_from_slice(&[13, *button, *down as u8, *clicks]),
+        Frame::KvmWheel { dx, dy } => (b.push(14), b.extend_from_slice(&dx.to_be_bytes()), b.extend_from_slice(&dy.to_be_bytes())).2,
+        Frame::KvmLeave => b.push(15),
         Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
     w.write_all(&(b.len() as u32).to_be_bytes())?;
@@ -131,7 +153,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
     Ok(match b[0] {
         0 => {
             let name = str_at(&b, 2)?;
-            Frame::Hello { pair: b.get(1) == Some(&1), resume: b.get(4 + name.len()) == Some(&1), name }
+            Frame::Hello { pair: b.get(1) == Some(&1), resume: b.get(4 + name.len()) == Some(&1), kvm: b.get(5 + name.len()).copied().unwrap_or(0), name }
         }
         1 => Frame::Spake(b.split_off(1)),
         2 => Frame::Confirm(b.split_off(1)),
@@ -154,6 +176,19 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
         8 => Frame::FileAbort { id: u32_at(&b, 1)?, cancelled: b.get(5) == Some(&1) },
         10 => Frame::FileCancel { id: u32_at(&b, 1)? },
         11 => Frame::FileFrom { id: u32_at(&b, 1)?, offset: b.get(5..13).map(|s| u64::from_be_bytes(s.try_into().unwrap())).ok_or_else(|| bad("short"))? },
+        12 => {
+            let i32_at = |i| u32_at(&b, i).map(|v| v as i32);
+            Frame::KvmMove { route: u32_at(&b, 1)?, mn: u32_at(&b, 5)?, cx: i32_at(9)?, cy: i32_at(13)? }
+        }
+        13 => match b.get(1..4) {
+            Some(&[button, down, clicks]) => Frame::KvmButton { button, down: down == 1, clicks },
+            _ => return Err(bad("short")),
+        },
+        14 => {
+            let i16_at = |i: usize| b.get(i..i + 2).map(|s| i16::from_be_bytes([s[0], s[1]])).ok_or_else(|| bad("short"));
+            Frame::KvmWheel { dx: i16_at(1)?, dy: i16_at(3)? }
+        }
+        15 => Frame::KvmLeave,
         CLIP_IMAGE => {
             b.remove(0);
             Frame::ClipImage(b)
@@ -264,8 +299,8 @@ mod tests {
 
     #[test]
     fn every_frame_round_trips() {
-        round(Frame::Hello { pair: true, name: "맥북".into(), resume: true });
-        round(Frame::Hello { pair: false, name: "맥북".into(), resume: false });
+        round(Frame::Hello { pair: true, name: "맥북".into(), resume: true, kvm: KVM });
+        round(Frame::Hello { pair: false, name: "맥북".into(), resume: false, kvm: 0 });
         round(Frame::Spake(vec![1, 2, 3]));
         round(Frame::Confirm(vec![9; 32]));
         round(Frame::Ping);
@@ -280,6 +315,11 @@ mod tests {
         round(Frame::FileAbort { id: 7, cancelled: true });
         round(Frame::ClipImage(vec![0x89, b'P', b'N', b'G']));
         round(Frame::FileCancel { id: 7 });
+        round(Frame::KvmMove { route: 3, mn: u32::MAX, cx: -5000, cy: i32::MAX });
+        round(Frame::KvmButton { button: 1, down: true, clicks: 2 });
+        round(Frame::KvmButton { button: 0, down: false, clicks: 1 });
+        round(Frame::KvmWheel { dx: -3, dy: i16::MAX });
+        round(Frame::KvmLeave);
     }
 
     /// A build from before the cancel byte still talks to this one: its abort reads as a failure.
@@ -293,7 +333,10 @@ mod tests {
     #[test]
     fn hello_and_file_start_from_an_older_build_offer_no_resume() {
         let hello = [&5u32.to_be_bytes()[..], &[0, 1], &1u16.to_be_bytes(), b"m"].concat();
-        assert_eq!(read_frame(&mut &hello[..]).unwrap(), Frame::Hello { pair: true, name: "m".into(), resume: false });
+        assert_eq!(read_frame(&mut &hello[..]).unwrap(), Frame::Hello { pair: true, name: "m".into(), resume: false, kvm: 0 });
+        // The build before KVM: it offers resume, and no input frames.
+        let hello = [&6u32.to_be_bytes()[..], &[0, 1], &1u16.to_be_bytes(), b"m", &[1]].concat();
+        assert_eq!(read_frame(&mut &hello[..]).unwrap(), Frame::Hello { pair: true, name: "m".into(), resume: true, kvm: 0 });
         let start = [&16u32.to_be_bytes()[..], &[5], &7u32.to_be_bytes(), &9u64.to_be_bytes(), &1u16.to_be_bytes(), b"f"].concat();
         assert_eq!(read_frame(&mut &start[..]).unwrap(), Frame::FileStart { id: 7, size: 9, name: "f".into(), mtime: None, resume: false });
     }
@@ -339,7 +382,7 @@ mod tests {
 
     #[test]
     fn hostile_frames_are_rejected_not_panicked() {
-        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff], &[0, 0, 0, 5, 11, 0, 0, 0, 7]] {
+        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff], &[0, 0, 0, 5, 11, 0, 0, 0, 7], &[0, 0, 0, 3, 13, 0, 1], &[0, 0, 0, 9, 12, 0, 0, 0, 1, 0, 0, 0, 1]] {
             assert!(read_frame(&mut &b[..]).is_err(), "{b:?}");
         }
     }
