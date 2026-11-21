@@ -34,6 +34,22 @@ pub fn secret_types<'a>(mut types: impl Iterator<Item = &'a str>) -> bool {
     types.any(|t| MAC_SECRET.contains(&t))
 }
 
+/// Apps that copy passwords as plain text with no private mark: a copy made while one of them
+/// is in front counts as secret. Apple's Passwords app, its window and its menu bar item.
+pub const MAC_SECRET_APPS: [&str; 2] = ["com.apple.Passwords", "com.apple.Passwords.MenuBarExtra"];
+
+pub fn secret_app(bundle_id: Option<&str>) -> bool {
+    bundle_id.is_some_and(|b| MAC_SECRET_APPS.contains(&b))
+}
+
+/// shortcut: the app in front when the poll sees the change, not the app that copied; a copy
+/// from a menu bar item over another app is missed. Upgrade if a password manager does that.
+#[cfg(target_os = "macos")]
+fn front_app() -> Option<String> {
+    let app = objc2_app_kit::NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    app.bundleIdentifier().map(|b| b.to_string())
+}
+
 #[cfg(target_os = "macos")]
 fn types_of(pb: &objc2_app_kit::NSPasteboard) -> Vec<String> {
     pb.types().map(|a| a.iter().map(|t| t.to_string()).collect()).unwrap_or_default()
@@ -41,7 +57,7 @@ fn types_of(pb: &objc2_app_kit::NSPasteboard) -> Vec<String> {
 
 #[cfg(target_os = "macos")]
 fn secret() -> bool {
-    secret_types(types_of(&objc2_app_kit::NSPasteboard::generalPasteboard()).iter().map(String::as_str))
+    secret_types(types_of(&objc2_app_kit::NSPasteboard::generalPasteboard()).iter().map(String::as_str)) || secret_app(front_app().as_deref())
 }
 
 /// Windows: what the clipboard says about itself. `ExcludeClipboardContentFromMonitorProcessing`
@@ -156,7 +172,8 @@ pub fn decode_png(png: &[u8], max_bytes: usize) -> Option<(usize, usize, Vec<u8>
 
 /// Runs forever. `incoming` carries what peers copied, for this clipboard; `changed` hears local
 /// copies (images from a thread of their own, so a big one doesn't hold up the clipboard).
-pub fn run(incoming: Receiver<Content>, changed: impl Fn(Content) + Send + Sync + 'static) {
+/// `share_secrets` says whether copies marked private go too.
+pub fn run(incoming: Receiver<Content>, share_secrets: impl Fn() -> bool, changed: impl Fn(Content) + Send + Sync + 'static) {
     // shortcut: 300 ms polling of the change counter; switch to AddClipboardFormatListener /
     // NSPasteboard notifications if wakeups ever show up in an energy profile.
     let tick = Duration::from_millis(300);
@@ -198,7 +215,7 @@ pub fn run(incoming: Receiver<Content>, changed: impl Fn(Content) + Send + Sync 
         if now.is_some() && now == seq {
             continue;
         }
-        if secret() {
+        if !share_secrets() && secret() {
             seq = now;
             continue;
         }
@@ -286,7 +303,7 @@ mod tests {
     #[ignore]
     fn poll_alone() {
         let (_tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || run(rx, |_| {}));
+        std::thread::spawn(move || run(rx, || false, |_| {}));
         std::thread::sleep(Duration::from_secs(40));
     }
 
@@ -313,6 +330,15 @@ mod tests {
         assert!(secret_flags(false, Some(Some(0)), None), "CanIncludeInClipboardHistory = 0");
         assert!(secret_flags(false, None, Some(Some(0))), "CanUploadToCloudClipboard = 0");
         assert!(secret_flags(false, Some(None), None), "present but unreadable");
+    }
+
+    #[test]
+    fn a_copy_made_in_apple_passwords_is_secret() {
+        // Apple's Passwords app puts plain text only, no private mark (seen on the device, 2026-11-21).
+        assert!(secret_app(Some("com.apple.Passwords")));
+        assert!(secret_app(Some("com.apple.Passwords.MenuBarExtra")));
+        assert!(!secret_app(Some("com.google.Chrome")));
+        assert!(!secret_app(None), "no frontmost app");
     }
 
     /// The real Windows clipboard: CI runners only (`cargo test` on a desk PC would clobber it).

@@ -20,7 +20,7 @@ fn node(tag: &str, name: &str) -> (Node, mpsc::Receiver<Note>) {
 fn restart(tag: &str, name: &str) -> (Node, mpsc::Receiver<Note>) {
     let (tx, rx) = mpsc::channel();
     let d = dir(tag);
-    let cfg = Config { dir: d.join("cfg"), downloads: d.join("dl"), name: name.into(), port: 0, discovery: false, clipboard: false };
+    let cfg = Config { dir: d.join("cfg"), downloads: d.join("dl"), name: name.into(), port: 0, discovery: false, clipboard: false, secrets: false };
     (Node::start(cfg, move |n| { let _ = tx.send(n); }).unwrap(), rx)
 }
 

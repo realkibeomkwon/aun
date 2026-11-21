@@ -82,6 +82,14 @@ impl Ui {
         self.save(tx);
     }
 
+    fn set_secrets(&mut self, on: bool, tx: &mut Tx) {
+        if let Some(n) = &self.node {
+            n.set_secrets(on);
+        }
+        self.settings.secrets = on;
+        self.save(tx);
+    }
+
     fn set_dock(&mut self, on: bool, tx: &mut Tx) {
         self.settings.dock = on;
         if let Some(h) = &self.handle {
@@ -291,6 +299,9 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     let mut prefs = row().key("prefs").w_full().gap(space::S2)
         .child(button("autostart".into(), if s.autostart { "로그인 시 실행 켜짐" } else { "로그인 시 실행 꺼짐" }, t, s.autostart, |s, tx| {
             s.set_autostart(!s.autostart, tx)
+        }))
+        .child(button("secrets".into(), if s.settings.secrets { "비밀번호 공유 켜짐" } else { "비밀번호 공유 꺼짐" }, t, s.settings.secrets, |s, tx| {
+            s.set_secrets(!s.settings.secrets, tx)
         }));
     if cfg!(target_os = "macos") {
         prefs = prefs.child(button("dock".into(), if s.settings.dock { "Dock 아이콘 표시" } else { "Dock 아이콘 숨김" }, t, s.settings.dock, |s, tx| {
@@ -503,7 +514,7 @@ fn main() {
             let _ = autostart::set(true);
         }
         let h = app.handle();
-        let cfg = Config { dir: dir.clone(), downloads: settings.downloads.clone().unwrap_or_else(downloads_dir), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: settings.clipboard };
+        let cfg = Config { dir: dir.clone(), downloads: settings.downloads.clone().unwrap_or_else(downloads_dir), name: device_name(), port: aun_core::node::PORT, discovery: true, clipboard: settings.clipboard, secrets: settings.secrets };
         let node = match Node::start(cfg, move |note| h.update(move |s: &mut Ui, tx| s.apply(note, tx))) {
             Ok(n) => Some(n),
             Err(e) => {

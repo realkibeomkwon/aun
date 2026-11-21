@@ -42,6 +42,8 @@ pub struct Config {
     pub port: u16,
     pub discovery: bool,
     pub clipboard: bool,
+    /// Send copies that password managers mark private, too.
+    pub secrets: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -115,6 +117,7 @@ struct Shared {
     dir: PathBuf,
     downloads: Mutex<PathBuf>,
     clip_on: AtomicBool,
+    secrets_on: AtomicBool,
     clip_tx: Mutex<Option<Sender<clip::Content>>>,
     st: Mutex<St>,
     notify: Box<dyn Fn(Note) + Send + Sync>,
@@ -146,6 +149,7 @@ impl Node {
             dir: cfg.dir,
             downloads: Mutex::new(cfg.downloads),
             clip_on: AtomicBool::new(cfg.clipboard),
+            secrets_on: AtomicBool::new(cfg.secrets),
             clip_tx: Mutex::new(None),
             st: Mutex::new(st),
             notify: Box::new(notify),
@@ -172,8 +176,8 @@ impl Node {
 
         let (tx, rx) = mpsc::channel();
         *node.0.clip_tx.lock().unwrap() = Some(tx);
-        let n = node.clone();
-        spawn("aun-clip", move || clip::run(rx, move |c| n.broadcast_clip(c)));
+        let (n, s) = (node.clone(), node.clone());
+        spawn("aun-clip", move || clip::run(rx, move || s.secrets(), move |c| n.broadcast_clip(c)));
         Ok(node)
     }
 
@@ -216,6 +220,12 @@ impl Node {
     }
     pub fn set_clipboard(&self, on: bool) {
         self.0.clip_on.store(on, Ordering::Relaxed);
+    }
+    pub fn secrets(&self) -> bool {
+        self.0.secrets_on.load(Ordering::Relaxed)
+    }
+    pub fn set_secrets(&self, on: bool) {
+        self.0.secrets_on.store(on, Ordering::Relaxed);
     }
 
     /// Shows a fresh one-time code for a guest to type. It stays valid until it pairs a device,
