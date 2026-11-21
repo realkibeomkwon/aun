@@ -52,6 +52,8 @@ struct Pad {
     last: Option<(f32, f32)>,
     /// The drag's travel already sent, while the button is down.
     held: Option<(f32, f32)>,
+    /// Scrolling not yet sent: a slow trackpad scroll comes in fractions of a pixel.
+    wheel: (f32, f32),
 }
 
 struct Ui {
@@ -135,7 +137,7 @@ impl Ui {
     fn open_pad(&mut self, id: Id, name: String) {
         self.close_pad();
         self.route = self.route.wrapping_add(1);
-        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None });
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0) });
     }
 
     /// Lets go of what the pad holds at the peer, then closes it.
@@ -149,7 +151,14 @@ impl Ui {
         #[cfg(test)]
         self.sent.borrow_mut().push(f.clone());
         if let Some(n) = &self.node {
-            n.send_input(id, f);
+            let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave);
+            let what = must.then(|| format!("{f:?}"));
+            if !n.send_input(id, f)
+                && let Some(what) = what
+            {
+                // A button left down at the peer would show up here.
+                aun_core::log(format_args!("input not sent: {what}"));
+            }
         }
     }
 
@@ -606,9 +615,14 @@ fn pad(s: &Ui, t: Theme) -> Option<El> {
             }
         })
         .on_wheel(|s: &mut Ui, w, _| {
-            if let Some(id) = s.pad.as_ref().map(|p| p.id) {
-                let px = |v: f32| v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                s.input(id, Frame::KvmWheel { dx: px(w.dx), dy: px(w.dy) });
+            let Some(p) = &mut s.pad else { return true };
+            let (x, y) = (p.wheel.0 + w.dx, p.wheel.1 + w.dy);
+            let px = |v: f32| v.trunc().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let (dx, dy) = (px(x), px(y));
+            p.wheel = (x - dx as f32, y - dy as f32);
+            let id = p.id;
+            if dx != 0 || dy != 0 {
+                s.input(id, Frame::KvmWheel { dx, dy });
             }
             true
         });
@@ -999,6 +1013,11 @@ mod tests {
         rt.pointer_move(cx + 16.0, cy + 30.0);
         rt.pointer_move(cx + 18.0, cy + 30.0);
         rt.frame(0.3);
+        // A slow scroll: fractions add up to a pixel before anything goes.
+        rt.wheel_xy(cx, cy + 30.0, 0.0, 0.6);
+        rt.frame(0.32);
+        rt.wheel_xy(cx, cy + 30.0, 0.0, 0.6);
+        rt.frame(0.34);
         let (x, y) = rt.find("pad-close").expect("the stop button");
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
@@ -1009,7 +1028,7 @@ mod tests {
             f => format!("{f:?}"),
         }).collect::<Vec<_>>();
         // Points times the gain, as a running total.
-        assert_eq!(sent, ["to 20,0", "to 30,0", "to 50,0", "down", "to 50,20", "to 50,60", "up", "to 54,60", "KvmLeave"]);
+        assert_eq!(sent, ["to 20,0", "to 30,0", "to 50,0", "down", "to 50,20", "to 50,60", "up", "to 54,60", "KvmWheel { dx: 0, dy: 1 }", "KvmLeave"]);
         assert!(rt.state.pad.is_none());
     }
 

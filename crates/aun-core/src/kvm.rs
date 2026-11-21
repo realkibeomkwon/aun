@@ -42,12 +42,14 @@ impl<S: Sink> Injector<S> {
     pub fn apply(&mut self, f: Frame) {
         match f {
             Frame::KvmMove { route, mn, cx, cy } => {
-                let (px, py) = match self.last {
+                let from = match self.last {
                     Some((r, m, _, _)) if r == route && mn <= m => return,
-                    Some((r, _, px, py)) if r == route => (px, py),
-                    _ => (0, 0),
+                    Some((r, _, px, py)) if r == route => Some((px, py)),
+                    // Joined midway (a replaced link, control allowed late): a baseline only.
+                    _ => (mn == 1).then_some((0, 0)),
                 };
                 self.last = Some((route, mn, cx, cy));
+                let Some((px, py)) = from else { return };
                 let (dx, dy) = (cx.wrapping_sub(px), cy.wrapping_sub(py));
                 if dx != 0 || dy != 0 {
                     self.sink.move_by(dx, dy, self.held);
@@ -289,8 +291,8 @@ mod win {
                 (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2), GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2))
             };
             // Absolute, so the system's pointer acceleration isn't applied a second time.
-            let x = (p.x + dx).clamp(x0, x0 + w - 1);
-            let y = (p.y + dy).clamp(y0, y0 + h - 1);
+            let x = p.x.saturating_add(dx).clamp(x0, x0 + w - 1);
+            let y = p.y.saturating_add(dy).clamp(y0, y0 + h - 1);
             let nx = ((x - x0) as i64 * 65535 / (w - 1) as i64) as i32;
             let ny = ((y - y0) as i64 * 65535 / (h - 1) as i64) as i32;
             send(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0);
@@ -362,6 +364,20 @@ pub(crate) mod tests {
         inj.apply(mv(1, 2, 18, -2)); // 2 late: older than 3
         inj.apply(mv(2, 1, 4, 4)); // a new route starts from nothing
         assert_eq!(*rec.0.lock().unwrap(), ["move 10 0 held 0", "move 15 -5 held 0", "move 4 4 held 0"]);
+    }
+
+    /// A link that replaced another, or control allowed with the pad already open, first sees a
+    /// move well into a route: it is where the pointer is now, not a distance to go.
+    #[test]
+    fn a_route_joined_midway_starts_from_its_next_move() {
+        let rec = Rec::default();
+        let mut inj = Injector::new(rec.clone());
+        inj.apply(mv(1, 40, 800, 300));
+        inj.apply(mv(1, 41, 806, 302));
+        inj.apply(Frame::KvmLeave);
+        inj.apply(mv(1, 42, 900, 302));
+        inj.apply(mv(1, 43, 901, 302));
+        assert_eq!(*rec.0.lock().unwrap(), ["move 6 2 held 0", "move 1 0 held 0"]);
     }
 
     #[test]
