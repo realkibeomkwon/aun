@@ -433,7 +433,7 @@ impl Node {
         st.outboxes.entry(id).or_default().queue.extend(queued.iter().cloned());
         drop(st);
         for path in again {
-            (self.0.notify)(Note::Info(format!("{}은(는) 이미 보내는 중이에요", file_name(&path))));
+            (self.0.notify)(Note::Info(format!("이미 보내는 중이에요: {}", file_name(&path))));
         }
         for (key, path) in queued {
             let total = std::fs::metadata(&path).map_or(0, |m| m.len());

@@ -392,7 +392,7 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         controls = controls.child(b);
     }
     if let Some((m, _)) = &s.message {
-        controls = controls.child(text(m.clone()).key("message").font(type_::LABEL).color(t.text_secondary));
+        controls = controls.child(text(m.clone()).key("message").font(type_::LABEL).color(t.text_secondary).wrap_anywhere());
     }
     let mut root = col().key("root").w_full().h_full().padding(space::S6).gap(space::S3).fill(t.bg).child(controls);
     if !s.transfers.is_empty() {
@@ -828,6 +828,28 @@ mod tests {
 
     /// A send the user cancelled (or that failed) can go again while the device is connected;
     /// a received file can't be asked for from this side.
+    /// A status message about a long file name wraps inside the window instead of being cut
+    /// at its edge.
+    #[test]
+    fn a_long_status_message_stays_inside_the_window() {
+        let mut rt = Runtime::new(Ui::new(None, None), view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let name = "「vol.1」 열도를 넘어 세계로 | ONE OK ROCK 라이브 모음 1탄 (full ver.) [가사해석].mp4";
+        rt.state.message = Some((format!("이미 보내는 중이에요: {name}"), Instant::now() + MESSAGE_FOR));
+        rt.invalidate();
+        rt.frame(1.0 / 60.0);
+        let long = rt.presented("message").expect("the message").0;
+        rt.state.message = Some(("짧은 안내".into(), Instant::now() + MESSAGE_FOR));
+        rt.invalidate();
+        // Let the height change settle (it moves on a layout spring).
+        for i in 2..60 {
+            rt.frame(i as f64 / 60.0);
+        }
+        let short = rt.presented("message").unwrap().0;
+        // presented: [x, y, width, height]. Cut to one line, the long one is no taller.
+        assert!(long[3] > short[3] * 1.5, "the long message wraps onto more lines: {long:?} vs {short:?}");
+    }
+
     #[test]
     fn a_stopped_send_offers_to_send_it_again() {
         let mut ui = Ui::new(None, None);
