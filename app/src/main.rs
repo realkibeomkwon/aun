@@ -405,18 +405,18 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
 static ARROW_DOWN: rune::Icon = rune::Icon {
     name: "aun-arrow-down",
     view: 24.0,
-    body: r#"<circle cx="12" cy="12" r="10.6" stroke="currentColor" stroke-width="2.625" fill="none"/><path d="M12 6V17.5M7.25 12.75L12 17.5L16.75 12.75" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M12 6V17.5M7.25 12.75L12 17.5L16.75 12.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 static ARROW_UP: rune::Icon = rune::Icon {
     name: "aun-arrow-up",
     view: 24.0,
-    body: r#"<circle cx="12" cy="12" r="10.6" stroke="currentColor" stroke-width="2.625" fill="none"/><path d="M12 18V6.5M7.25 11.25L12 6.5L16.75 11.25" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M12 18V6.5M7.25 11.25L12 6.5L16.75 11.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
 };
 
 static FAILED: rune::Icon = rune::Icon {
     name: "aun-failed",
     view: 24.0,
-    body: r#"<circle cx="12" cy="12" r="10.6" stroke="currentColor" stroke-width="2.625" fill="none"/><path d="M8 8L16 16M16 8L8 16" stroke="currentColor" stroke-width="3" stroke-linecap="round" fill="none"/>"#,
+    body: r#"<circle cx="12" cy="12" r="11" stroke="currentColor" stroke-width="1.75" fill="none"/><path d="M8 8L16 16M16 8L8 16" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>"#,
 };
 /// Rune's accents have no red; this one reads on light and dark cards alike.
 fn red() -> rune::Color {
