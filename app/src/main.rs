@@ -146,9 +146,10 @@ impl Ui {
                     Some(t) => (t.done, t.finished, t.failed, t.cancelled) = (done, finished, failed, cancelled),
                     None => self.transfers.insert(0, Transfer { key, label, path, incoming, done, total, finished, failed, cancelled }),
                 }
-                // Keep every unfinished one (a dropped pile waits in line) and the latest few done.
+                // Keep every unfinished one (a dropped pile waits in line) and the latest 100 done:
+                // a big pile stays checkable, at about 100 bytes a row.
                 let mut kept_done = 0;
-                self.transfers.retain(|t| !t.finished || { kept_done += 1; kept_done <= 6 });
+                self.transfers.retain(|t| !t.finished || { kept_done += 1; kept_done <= 100 });
             }
         }
     }
@@ -354,7 +355,7 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
     }
     if !s.transfers.is_empty() {
         let mut tl = col().key("transfers").w_full().gap(space::S1);
-        for x in s.transfers.iter().take(12) {
+        for x in &s.transfers {
             let pct = (x.done * 100).checked_div(x.total).unwrap_or(100);
             let state = match () {
                 _ if x.cancelled => "취소됨".to_owned(),
@@ -363,7 +364,7 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
                 _ => format!("{pct}%"),
             };
             let mut r = row().key(format!("t-{}", x.key)).w_full().gap(space::S2).center_y()
-                .child(text(x.label.clone()).font(type_::LABEL).color(t.text).grow(1.0))
+                .child(text(x.label.clone()).font(type_::LABEL).color(t.text).grow(1.0).shrink().wrap_anywhere())
                 .child(text(format!("{state} · {}", size(x.total))).font(type_::LABEL).color(t.text_secondary));
             let key = x.key;
             if !x.finished {
@@ -607,6 +608,37 @@ mod tests {
         }
         let (_, y) = rt.find("t-3").unwrap();
         assert!(y < 560.0, "scrolled into view: {y}");
+    }
+
+    fn finished(key: u64, label: String) -> Transfer {
+        Transfer { key, path: format!("{label}.bin").into(), label, incoming: true, done: 1, total: 1, finished: true, failed: false, cancelled: false }
+    }
+
+    /// A dropped pile of files: every row stays reachable, the oldest at the bottom.
+    #[test]
+    fn every_transfer_of_a_pile_can_be_scrolled_to() {
+        let mut ui = Ui::new(None, None);
+        ui.transfers = (1..=30).rev().map(|k| finished(k, format!("Windows 노트북 → 파일 {k}"))).collect();
+        let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        for i in 0..200 {
+            rt.wheel_xy(240.0, 300.0, 0.0, -40.0);
+            rt.frame(i as f64 / 60.0 + 0.1);
+        }
+        let (_, y) = rt.find("t-1").expect("the oldest of 30 rows");
+        assert!(y < 560.0, "scrolled into view: {y}");
+    }
+
+    /// A long file name wraps inside the window instead of pushing the row's button off it.
+    #[test]
+    fn a_long_file_name_keeps_its_row_inside_the_window() {
+        let mut ui = Ui::new(None, None);
+        let long = "아주_긴_파일_이름_".repeat(12) + "끝.mov";
+        ui.transfers = vec![finished(1, format!("Windows 노트북 → {long}"))];
+        let mut rt = Runtime::new(ui, view, (480.0, 560.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let (x, _) = rt.find("t-show-1").expect("the reveal button");
+        assert!(x < 480.0, "the button is inside the window: {x}");
     }
 
     #[test]
