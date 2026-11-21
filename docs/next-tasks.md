@@ -140,8 +140,8 @@ Windows(2026-11-21): Windows 11 Pro PC, release 빌드. 변경 전 `42967de`와 
 - Mac: `scripts/bundle-mac.sh`. `LSUIElement`는 넣지 않았다(앱이 "Dock 아이콘" 설정으로 직접 정한다). 번들 앱은 macOS 15부터 LAN 접근에 `NSLocalNetworkUsageDescription`가 필요해 넣었다. arm64만 만든다. 공증은 Developer ID가 없어 하지 않는다.
 - Windows: `app/build.rs`(winresource)로 아이콘과 버전 정보를, `.cargo/config.toml`로 정적 C 런타임을 넣었다. CI가 버전 정보와 `VCRUNTIME140` 미포함을 확인한다.
 - Mac 실기기(2026-11-21, CI 44905805181의 `Aun-mac.zip`을 `gh run download`로 받아 `/Applications`에 풀기): 아이콘 표시 확인(사용자). 로그상 Windows PC와 LAN(`192.168.0.15`)으로 링크가 올라간 뒤 Tailscale 링크로 바뀌었고, LaunchAgent는 `/Applications/Aun.app/Contents/MacOS/aun`을 가리킨다. `gh`로 받은 파일에는 quarantine 속성이 없어 Gatekeeper 경고는 시험되지 않았다. 로컬 네트워크 허용 창이 떴는지는 기록하지 않았다.
-- Windows 실기기(2026-11-21, 같은 실행의 `aun.exe`): 탐색기 아이콘과 속성 > 자세히의 제품 이름·버전 확인(사용자).
-- 남은 확인(실기기): 브라우저로 받은 zip의 첫 실행(Gatekeeper). 새 `aun.exe`의 첫 실행(SmartScreen)과 Mac 연결.
+- Windows 실기기(2026-11-21, 같은 실행의 `aun.exe`): 탐색기 아이콘과 속성 > 자세히의 제품 이름·버전 확인(사용자). 예전 exe를 끄고 새 exe를 실행하자 Mac 로그에서 옛 링크가 `ConnectionReset`으로 내려가고 3.8 s 뒤 LAN(`192.168.0.15:47810`)으로 새 링크가 올라왔다.
+- 남은 확인(실기기): 브라우저로 받은 zip의 첫 실행(Gatekeeper). 새 `aun.exe`의 SmartScreen 경고는 기록하지 않았다.
 
 이전 계획:
 
