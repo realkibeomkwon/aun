@@ -376,16 +376,20 @@ fn a_file_already_on_its_way_is_not_queued_again() {
     guest.cancel(*keys.iter().next().unwrap());
 }
 
-/// The next transfer note on `rx` that `want` accepts.
+/// The next transfer note on `rx` that `want` accepts. A timeout lists the notes passed over.
 fn next_transfer(rx: &mpsc::Receiver<Note>, what: &str, want: impl Fn(&Note) -> bool) -> Note {
     let end = Instant::now() + Duration::from_secs(30);
+    let mut skipped = Vec::new();
     loop {
-        assert!(Instant::now() < end, "timed out waiting for {what}");
-        if let Ok(n) = rx.recv_timeout(Duration::from_millis(100))
-            && matches!(n, Note::Transfer { .. })
-            && want(&n)
-        {
-            return n;
+        assert!(Instant::now() < end, "timed out waiting for {what}; passed over: {skipped:#?}");
+        if let Ok(n) = rx.recv_timeout(Duration::from_millis(100)) {
+            if matches!(n, Note::Transfer { .. }) && want(&n) {
+                return n;
+            }
+            // Progress is most of it and says little; keep the rest.
+            if !matches!(n, Note::Transfer { finished: false, done, .. } if done > 0) {
+                skipped.push(n);
+            }
         }
     }
 }
@@ -446,6 +450,9 @@ fn a_stopped_send_resumes_where_it_stopped() {
         assert!(done < size, "stopped before the end");
         (*after_in, *after_out) = (k_in, k_out);
         if drop_link {
+            // Woken before the old link's reader has seen the close, "connected" would still
+            // see that link, and the next send could find none (Windows, about 1 run in 10).
+            until("the old link to go", || !connected(&guest, &host) && !connected(&host, &guest));
             guest.set_sleeping(false);
             until("a reconnect after waking", || connected(&guest, &host) && connected(&host, &guest));
         }
@@ -457,9 +464,10 @@ fn a_stopped_send_resumes_where_it_stopped() {
     // Sends it again; returns where the receiver started.
     let again = |after_in: &mut u64, after_out: &mut u64| -> u64 {
         guest.send_file(host.id(), big.clone());
+        // The sender first: if the try never reaches the receiver, its notes say why.
+        let Note::Transfer { key: k_out, .. } = next_transfer(&gn, "the sender to finish", |n| ours(false, *after_out)(n) && matches!(n, Note::Transfer { finished: true, failed: false, .. })) else { unreachable!() };
         let Note::Transfer { key, done: from, .. } = next_transfer(&hn, "the next try", ours(true, *after_in)) else { unreachable!() };
         next_transfer(&hn, "the next try to finish", |n| matches!(n, Note::Transfer { key: k, finished: true, failed: false, .. } if *k == key));
-        let Note::Transfer { key: k_out, .. } = next_transfer(&gn, "the sender to finish", |n| ours(false, *after_out)(n) && matches!(n, Note::Transfer { finished: true, failed: false, .. })) else { unreachable!() };
         (*after_in, *after_out) = (key, k_out);
         from
     };
