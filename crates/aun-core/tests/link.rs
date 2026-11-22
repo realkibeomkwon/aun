@@ -517,10 +517,13 @@ impl aun_core::kvm::Sink for Rec {
     fn wheel(&mut self, dx: i32, dy: i32) {
         self.0.lock().unwrap().push(format!("wheel {dx} {dy}"));
     }
+    fn key(&mut self, hid: u16, down: bool) {
+        self.0.lock().unwrap().push(format!("key {hid:#x} {}", if down { "down" } else { "up" }));
+    }
 }
 
-/// Input from a peer lands only while allowed, and a button it held is let go when the link
-/// drops: a mouse button stuck down at the other desk is the accident to prevent.
+/// Input from a peer lands only while allowed, and a button or key it held is let go when the
+/// link drops: a mouse button or Shift stuck down at the other desk is the accident to prevent.
 #[test]
 fn injected_input_is_allowed_only_when_switched_on_and_let_go_when_the_link_drops() {
     use aun_core::wire::Frame;
@@ -547,9 +550,10 @@ fn injected_input_is_allowed_only_when_switched_on_and_let_go_when_the_link_drop
 
     assert!(guest.send_input(host.id(), Frame::KvmButton { button: 0, down: true, clicks: 1 }));
     assert!(guest.send_input(host.id(), Frame::KvmMove { route: 1, mn: 1, cx: 7, cy: -2 }));
-    until("the drag", || log().len() == 3);
+    assert!(guest.send_input(host.id(), Frame::KvmKey { hid: 0xE1, down: true }));
+    until("the shift drag", || log().len() == 4);
     guest.set_sleeping(true);
-    until("the release", || log().len() == 4);
-    assert_eq!(log(), ["wheel 0 3", "button 0 down", "move 7 -2 held 1", "button 0 up"]);
+    until("the release", || log().len() == 6);
+    assert_eq!(log(), ["wheel 0 3", "button 0 down", "move 7 -2 held 1", "key 0xe1 down", "key 0xe1 up", "button 0 up"]);
     assert!(!guest.send_input(host.id(), Frame::KvmLeave), "no link, nothing sent");
 }

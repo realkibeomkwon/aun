@@ -435,6 +435,7 @@ dependencies = [
  "snow",
  "spake2",
  "windows-sys 0.61.2",
+ "winit",
 ]
 
 [[package]]

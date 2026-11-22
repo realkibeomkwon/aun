@@ -54,6 +54,8 @@ struct Pad {
     held: Option<(f32, f32)>,
     /// Scrolling not yet sent: a slow trackpad scroll comes in fractions of a pixel.
     wheel: (f32, f32),
+    /// Keys sent down and not yet up (HID usages).
+    keys: Vec<u16>,
 }
 
 struct Ui {
@@ -137,7 +139,7 @@ impl Ui {
     fn open_pad(&mut self, id: Id, name: String) {
         self.close_pad();
         self.route = self.route.wrapping_add(1);
-        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0) });
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new() });
     }
 
     /// Lets go of what the pad holds at the peer, then closes it.
@@ -151,7 +153,7 @@ impl Ui {
         #[cfg(test)]
         self.sent.borrow_mut().push(f.clone());
         if let Some(n) = &self.node {
-            let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave);
+            let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. });
             let what = must.then(|| format!("{f:?}"));
             if !n.send_input(id, f)
                 && let Some(what) = what
@@ -160,6 +162,33 @@ impl Ui {
                 aun_core::log(format_args!("input not sent: {what}"));
             }
         }
+    }
+
+    /// A key on this keyboard while the pad has focus. Every key is taken, sent or not: Tab
+    /// would move focus off the pad, Space and Return press a button here.
+    fn pad_key(&mut self, e: &rune::PhysicalInput) -> bool {
+        let Some(p) = &mut self.pad else { return false };
+        let id = p.id;
+        let sent: Vec<Frame> = match *e {
+            rune::PhysicalInput::Key { key, pressed, .. } => {
+                let Some(hid) = aun_core::kvm::hid(key) else { return true };
+                let at = p.keys.iter().position(|&k| k == hid);
+                match (pressed, at) {
+                    (true, None) => p.keys.push(hid),
+                    (true, Some(_)) => {} // repeating: the peer's OS doesn't repeat it for us
+                    (false, None) => return true,
+                    (false, Some(i)) => drop(p.keys.remove(i)),
+                }
+                vec![Frame::KvmKey { hid, down: pressed }]
+            }
+            // Focus went (another control, another app): what is held here would stay down there.
+            rune::PhysicalInput::FocusLost => p.keys.drain(..).rev().map(|hid| Frame::KvmKey { hid, down: false }).collect(),
+            _ => return false,
+        };
+        for f in sent {
+            self.input(id, f);
+        }
+        true
     }
 
     fn pad_move(&mut self, dx: f32, dy: f32) {
@@ -571,7 +600,9 @@ fn pad(s: &Ui, t: Theme) -> Option<El> {
     let p = s.pad.as_ref()?;
     let area = el().key("pad-area").w_full().h(180.0).radius(radius::MD).fill(t.bg).border(1.0, tok::accent(0, true)).center()
         .label(format!("{} 트랙패드", p.name))
-        .child(text("여기서 움직이면 상대 커서가 움직여요 · 클릭, 끌기, 오른쪽 클릭, 스크롤").font(type_::LABEL).color(t.text_secondary))
+        .child(text("여기서 움직이면 상대 커서가 움직여요 · 클릭하면 키보드도 상대에게 가요").font(type_::LABEL).color(t.text_secondary))
+        .focusable(true)
+        .on_physical_input(|s: &mut Ui, e, _| s.pad_key(e))
         // Out and back in elsewhere is no move: the next point over the pad starts afresh.
         .on_hover_change(|s: &mut Ui, inside, _| {
             if let Some(p) = &mut s.pad
@@ -1031,6 +1062,60 @@ mod tests {
         // Points times the gain, as a running total.
         assert_eq!(sent, ["to 20,0", "to 30,0", "to 50,0", "down", "to 50,20", "to 50,60", "up", "to 54,60", "KvmWheel { dx: 0, dy: 1 }", "KvmLeave"]);
         assert!(rt.state.pad.is_none());
+    }
+
+    /// A click on the pad gives it the keyboard: keys go to the peer by where they are, and keys
+    /// still held when focus goes are let go there. (That Tab then stays on the pad can't be
+    /// seen headless: the harness sends no logical key behind a physical one. Checked on device.)
+    #[test]
+    fn the_pad_sends_keys_and_lets_go_when_it_loses_focus() {
+        use rune::{PhysicalInput, PhysicalKeyCode as K};
+        let mut ui = Ui::new(None, None);
+        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: None, paired: true, nearby: true, connected: true, kvm: true }];
+        ui.open_pad([3; 32], "PC".into());
+        let mut rt = Runtime::new(ui, view, (480.0, 700.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let (x, y) = rt.find("pad-area").expect("the pad");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        assert!(rt.has_focus(), "a click focuses the pad");
+        rt.state.sent.borrow_mut().clear();
+        let key = |key, pressed, repeat| PhysicalInput::Key { key, mods: Default::default(), pressed, repeat };
+        for e in [key(K::ShiftLeft, true, false), key(K::KeyA, true, false), key(K::KeyA, true, true), key(K::KeyA, false, false), key(K::Tab, true, false)] {
+            rt.physical_input(e);
+        }
+        rt.frame(0.2);
+        rt.physical_input(PhysicalInput::FocusLost);
+        rt.frame(0.3);
+        let sent: Vec<_> = rt.state.sent.borrow().iter().map(|f| format!("{f:?}")).collect();
+        let k = |hid: u16, down: bool| format!("{:?}", Frame::KvmKey { hid, down });
+        assert_eq!(sent, [k(0xE1, true), k(4, true), k(4, true), k(4, false), k(0x2B, true), k(0x2B, false), k(0xE1, false)]);
+    }
+
+    /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and
+    /// the Shift held at the peer must go up then, not whenever the pad closes.
+    #[test]
+    fn a_click_elsewhere_lets_go_of_keys_held_on_the_pad() {
+        use rune::{PhysicalInput, PhysicalKeyCode as K};
+        let mut ui = Ui::new(None, None);
+        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: None, paired: true, nearby: true, connected: true, kvm: true }];
+        ui.open_pad([3; 32], "PC".into());
+        let mut rt = Runtime::new(ui, view, (480.0, 700.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let (x, y) = rt.find("pad-area").expect("the pad");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        rt.physical_input(PhysicalInput::Key { key: K::ShiftLeft, mods: Default::default(), pressed: true, repeat: false });
+        rt.frame(0.2);
+        rt.state.sent.borrow_mut().clear();
+        // The clipboard switch: safe headless (no node, no settings folder).
+        let (x, y) = rt.find("clip").expect("the clipboard switch");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.3);
+        assert_eq!(*rt.state.sent.borrow(), [Frame::KvmKey { hid: 0xE1, down: false }]);
     }
 
     #[test]

@@ -195,7 +195,7 @@ impl Node {
             clip_on: AtomicBool::new(cfg.clipboard),
             secrets_on: AtomicBool::new(cfg.secrets),
             kvm_on: AtomicBool::new(cfg.kvm),
-            sink: Mutex::new(Arc::new(|| Box::new(kvm::Os))),
+            sink: Mutex::new(Arc::new(|| Box::new(kvm::Os::default()))),
             asleep: AtomicBool::new(false),
             idle: Mutex::new((None, Instant::now())),
             clip_tx: Mutex::new(None),
@@ -332,11 +332,11 @@ impl Node {
 
     /// Drives `id`'s pointer, if it is connected and speaks `Kvm*` frames; false if not sent.
     /// A move or a scroll is dropped when the link's queue is full (a file going out): the next
-    /// move carries the total. A button or a leave waits for room, up to a moment.
+    /// move carries the total. A button, a key or a leave waits for room, up to a moment.
     /// shortcut: input waits behind file chunks already queued; a queue of its own is step 2.
     pub fn send_input(&self, id: Id, f: Frame) -> bool {
         let Some(tx) = self.st().peers.get(&id).and_then(|p| p.link.as_ref()).filter(|l| l.kvm).map(|l| l.tx.clone()) else { return false };
-        let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave);
+        let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. });
         let end = Instant::now() + Duration::from_millis(250);
         let mut f = f;
         loop {
@@ -836,7 +836,7 @@ impl Node {
         loop {
             files.tell_cancels();
             match wire::read_frame(r)? {
-                f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave) => {
+                f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. }) => {
                     if !self.kvm() {
                         input.release();
                     } else {

@@ -25,7 +25,7 @@ const CLIP_IMAGE: u8 = 9;
 pub const FILE_CHUNK: usize = 256 << 10;
 /// The `Kvm*` frames this build speaks, sent in `Hello`. Peers use them only when both say the
 /// same version (0, as an older build reads: none); a change to their layout bumps it.
-pub const KVM: u8 = 1;
+pub const KVM: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -58,6 +58,9 @@ pub enum Frame {
     KvmWheel { dx: i16, dy: i16 },
     /// The driver let go: release whatever it holds down.
     KvmLeave,
+    /// A key by where it is, not what it types: a USB HID usage (page 7). `down` again while
+    /// held is the key repeating.
+    KvmKey { hid: u16, down: bool },
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -123,6 +126,7 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
         Frame::KvmButton { button, down, clicks } => b.extend_from_slice(&[13, *button, *down as u8, *clicks]),
         Frame::KvmWheel { dx, dy } => (b.push(14), b.extend_from_slice(&dx.to_be_bytes()), b.extend_from_slice(&dy.to_be_bytes())).2,
         Frame::KvmLeave => b.push(15),
+        Frame::KvmKey { hid, down } => (b.push(16), b.extend_from_slice(&hid.to_be_bytes()), b.push(*down as u8)).2,
         Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
     w.write_all(&(b.len() as u32).to_be_bytes())?;
@@ -189,6 +193,10 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
             Frame::KvmWheel { dx: i16_at(1)?, dy: i16_at(3)? }
         }
         15 => Frame::KvmLeave,
+        16 => match b.get(1..4) {
+            Some(&[h, l, down]) => Frame::KvmKey { hid: u16::from_be_bytes([h, l]), down: down == 1 },
+            _ => return Err(bad("short")),
+        },
         CLIP_IMAGE => {
             b.remove(0);
             Frame::ClipImage(b)
@@ -320,6 +328,8 @@ mod tests {
         round(Frame::KvmButton { button: 0, down: false, clicks: 1 });
         round(Frame::KvmWheel { dx: -3, dy: i16::MAX });
         round(Frame::KvmLeave);
+        round(Frame::KvmKey { hid: 0xE1, down: true });
+        round(Frame::KvmKey { hid: 4, down: false });
     }
 
     /// A build from before the cancel byte still talks to this one: its abort reads as a failure.
@@ -382,7 +392,7 @@ mod tests {
 
     #[test]
     fn hostile_frames_are_rejected_not_panicked() {
-        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff], &[0, 0, 0, 5, 11, 0, 0, 0, 7], &[0, 0, 0, 3, 13, 0, 1], &[0, 0, 0, 9, 12, 0, 0, 0, 1, 0, 0, 0, 1]] {
+        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff], &[0, 0, 0, 5, 11, 0, 0, 0, 7], &[0, 0, 0, 3, 13, 0, 1], &[0, 0, 0, 3, 16, 0, 4], &[0, 0, 0, 9, 12, 0, 0, 0, 1, 0, 0, 0, 1]] {
             assert!(read_frame(&mut &b[..]).is_err(), "{b:?}");
         }
     }

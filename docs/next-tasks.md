@@ -158,4 +158,4 @@ Windows(2026-11-21): Windows 11 Pro PC, release 빌드. 변경 전 `42967de`와 
 - 실기기 시험 통과(2026-11-22, Mac은 CI 44912189217의 `Aun-mac.zip`, Windows는 같은 실행의 `aun.exe`): 양방향(Mac ↔ Windows)으로 움직이기, 클릭, 더블클릭, 오른쪽 클릭, 스크롤, Finder·탐색기 끌기, 끌기 도중 "그만"을 누르면 받는 쪽 버튼이 떼어짐. 사용자 확인. Mac 로그 `input from KIBEOMKWON (injection allowed by the OS: true)`.
   - macOS 27에서는 입력을 주입하는 앱을 "손쉬운 사용"이 아니라 개인정보 보호 및 보안 > "System & App Protection Override"에서 허용한다. Aun이 목록에 자동으로 나타나지 않아 사용자가 +로 추가했다(원인 미확인). 추가한 뒤 Aun을 다시 시작하지 않아도 적용됐다.
   - 시험 뒤 고친 것: 좁은 창에서 기기 줄 버튼이 잘리던 것과 권한 안내 문구(`cc3c70c`, 실기기 미확인).
-- 남은 1단계: 키 입력(HID 표, 왕복 테스트).
+- 1단계 키 입력을 구현했다(2026-11-22, `docs/kvm-design.md` 8절 "키 입력"). 실기기 시험 항목: 글자·숫자·기호, Shift 조합, 화살표·Backspace·Enter·Tab(Tab이 Aun 안에서 포커스를 옮기지 않고 상대로 가는지), 키 반복, 오른쪽 Alt/Option·오른쪽 Ctrl/⌘·한/영(양방향, 결과를 3단계 자료로 기록), 키를 누른 채 다른 창 클릭하기와 "그만" 누르기(받는 쪽 키가 떼어지는지), Mac 보내는 쪽에서 ⌘Q.
