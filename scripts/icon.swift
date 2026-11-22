@@ -1,31 +1,70 @@
-// Builds the app icon from assets/src/icon-source.png (the rounded square on transparency)
+// Builds the app icon from assets/src/icon-source.png (the rounded square on a gray background)
 // and writes assets/Aun.icns and assets/aun.ico. Run from the repository root on a Mac:
 //   swift scripts/icon.swift
 // The outputs are committed, so CI (Windows included) doesn't need to run this.
 import AppKit
 
-let source = NSBitmapImageRep(data: try! Data(contentsOf: URL(fileURLWithPath: "assets/src/icon-source.png")))!
-// Clear the source's own soft shadow (translucent, gray rather than teal); the template adds one.
-for y in 0..<source.pixelsHigh {
-    for x in 0..<source.pixelsWide {
-        let c = source.colorAt(x: x, y: y)!
-        if c.alphaComponent > 0, c.alphaComponent < 0.95, c.greenComponent - c.redComponent < 0.08 {
-            source.setColor(NSColor(deviceRed: 0, green: 0, blue: 0, alpha: 0), atX: x, y: y)
+// The source is the rounded square on a flat gray background, which may cast a shadow onto it.
+let raw = NSBitmapImageRep(data: try! Data(contentsOf: URL(fileURLWithPath: "assets/src/icon-source.png")))!
+let W = raw.pixelsWide, H = raw.pixelsHigh
+// Redrawn into RGBA bytes (premultiplied; all opaque so far), rows top to bottom, so the cut below
+// can set alpha.
+let source = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: W, pixelsHigh: H, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                              isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: W * 4, bitsPerPixel: 32)!
+NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: source)
+raw.draw(in: NSRect(x: 0, y: 0, width: W, height: H))
+NSGraphicsContext.current = nil
+let px = source.bitmapData!
+func at(_ x: Int, _ y: Int) -> Int { (y * W + x) * 4 }
+// Teal: green and blue well above red. The gray background and its shadow are neutral, and the
+// cream pointer has blue below red, so neither counts.
+func tealness(_ x: Int, _ y: Int) -> Int { min(Int(px[at(x, y) + 1]), Int(px[at(x, y) + 2])) - Int(px[at(x, y)]) }
+func teal(_ x: Int, _ y: Int) -> Bool { tealness(x, y) > 30 }
+
+// Cut the square out. It is convex, so in each row and each column it is one span from its first
+// teal pixel to its last; everything outside is background. The 3 px at each end of a span take
+// their alpha from how teal they are next to the teal just inside, and that pixel's color.
+var alpha = [Double](repeating: 0, count: W * H)
+func span(_ n: Int, _ count: Int, _ pos: (Int, Int) -> (Int, Int), _ out: (Int, Double) -> Void) {
+    for line in 0..<n {
+        guard let lo = (0..<count).first(where: { teal(pos(line, $0).0, pos(line, $0).1) }),
+              let hi = (0..<count).reversed().first(where: { teal(pos(line, $0).0, pos(line, $0).1) }), hi - lo > 8 else { continue }
+        for i in lo...hi { out(pos(line, i).0 + pos(line, i).1 * W, 1) }
+        for (edge, inward) in [(lo, 1), (hi, -1)] {
+            let ref = pos(line, edge + 4 * inward), r = Double(max(1, tealness(ref.0, ref.1)))
+            for k in -3...1 {
+                let i = edge + k * inward
+                guard i >= 0, i < count else { continue }
+                let p = pos(line, i)
+                out(p.0 + p.1 * W, max(0, min(1, Double(tealness(p.0, p.1)) / r)))
+            }
         }
     }
 }
+var rows = alpha, cols = alpha
+span(H, W, { (y, x) in (x, y) }) { rows[$0] = $1 }
+span(W, H, { (x, y) in (x, y) }) { cols[$0] = $1 }
+for y in 0..<H {
+    for x in 0..<W {
+        let a = min(rows[y * W + x], cols[y * W + x]), i = at(x, y)
+        // A blend of teal and gray takes the teal from just inside, toward the center.
+        let (ix, iy) = a > 0 && a < 1 ? (x + (x < W / 2 ? 4 : -4), y + (y < H / 2 ? 4 : -4)) : (x, y)
+        for c in 0..<3 { px[i + c] = UInt8((Double(px[at(ix, iy) + c]) * a).rounded()) }
+        px[i + 3] = UInt8((a * 255).rounded())
+        alpha[y * W + x] = a
+    }
+}
 
-// The rounded square's bounds in the source: its teal pixels.
+// The rounded square's bounds.
 var box = (x0: Int.max, y0: Int.max, x1: 0, y1: 0)
-for y in 0..<source.pixelsHigh {
-    for x in 0..<source.pixelsWide where source.colorAt(x: x, y: y)!.alphaComponent > 0.5
-        && source.colorAt(x: x, y: y)!.redComponent < 0.3 {
+for y in 0..<H {
+    for x in 0..<W where alpha[y * W + x] > 0.5 {
         box = (min(box.x0, x), min(box.y0, y), max(box.x1, x), max(box.y1, y))
     }
 }
 // NSImage's origin is bottom-left; the bitmap's rows go down.
-let crop = NSRect(x: box.x0, y: source.pixelsHigh - 1 - box.y1, width: box.x1 - box.x0 + 1, height: box.y1 - box.y0 + 1)
-let image = NSImage(size: NSSize(width: source.pixelsWide, height: source.pixelsHigh))
+let crop = NSRect(x: box.x0, y: H - 1 - box.y1, width: box.x1 - box.x0 + 1, height: box.y1 - box.y0 + 1)
+let image = NSImage(size: NSSize(width: W, height: H))
 image.addRepresentation(source)
 
 // Apple's macOS icon template: on a 1024 canvas the body is 824 (100 margin each side) with a
@@ -101,7 +140,6 @@ try! Data(rgba).write(to: URL(fileURLWithPath: "assets/tray.rgba"))
 
 // macOS menu bar: the two pointers alone as a template image (black, the shape in alpha), 36 px
 // for 18 pt on a Retina display. A pixel's share of pointer: how much brighter than the teal it is.
-let W = source.pixelsWide, H = source.pixelsHigh
 let shape = bitmap(W)
 var pbox = (x0: Int.max, y0: Int.max, x1: 0, y1: 0)
 for y in 0..<H {
@@ -109,7 +147,7 @@ for y in 0..<H {
         let c = source.colorAt(x: x, y: y)!
         guard c.alphaComponent > 0.9 else { continue }
         let lum = 0.3 * c.redComponent + 0.59 * c.greenComponent + 0.11 * c.blueComponent
-        let share = max(0, min(1, (lum - 0.5) / 0.3))
+        let share = max(0, min(1, (lum - 0.62) / 0.15)) // the teal reaches about 0.6 at its lightest
         shape.setColor(NSColor(deviceRed: 0, green: 0, blue: 0, alpha: share), atX: x, y: y)
         if share > 0.5 { pbox = (min(pbox.x0, x), min(pbox.y0, y), max(pbox.x1, x), max(pbox.y1, y)) }
     }
