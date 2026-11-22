@@ -59,6 +59,7 @@
 - 선(wire)에는 **USB HID 사용 코드**(Keyboard/Keypad page 0x07)를 싣는다. 물리 키 위치 기준이라 배열(한글 2벌식, 영문, 일본어)과 무관하다. 문자를 보내지 않는다. 받는 쪽 OS의 입력기가 글자를 만든다.
 - macOS: `kCGKeyboardEventKeycode`(가상 키 코드, ANSI 위치 기준) ↔ HID 표. Windows: 스캔 코드(세트 1, 확장 플래그 포함) ↔ HID 표. 두 표는 코드에 상수 배열로 둔다(약 110개 키). 공개 표(USB HID Usage Tables 1.4, Apple `Events.h`, Microsoft "Keyboard scan codes")에서 만든다.
 - 수정 키 대응: 기본은 **물리 위치 그대로** 보낸다(Mac Command는 Windows 키, Option은 Alt, Control은 Ctrl). "Mac 단축키 습관 유지" 옵션을 켜면 Mac에서 Windows로 갈 때 Command와 Control을 맞바꿔 ⌘C가 Ctrl+C가 되게 한다.
+  - 구현(3단계, 2026-11-22): 보내는 쪽 설정 `swap`(패드 머리의 "⌘·Ctrl 맞바꾸기", 기본 켬). 켜져 있으면 패드가 HID Control(0xE0/0xE4)과 GUI(0xE3/0xE7)를 왼쪽·오른쪽 각각 맞바꿔 보낸다. 프로토콜은 그대로다(`Hello`에 상대 OS가 없어 받는 쪽에서는 할 수 없다). Mac 패드의 ⌘C는 Windows에서 Ctrl+C, Windows 패드의 Ctrl+C는 Mac에서 ⌘C가 된다. 설정 버튼을 누르면 패드가 포커스를 잃어 눌린 키를 먼저 떼므로, 바꾼 뒤 엉뚱한 키가 눌린 채 남지 않는다.
 - 한/영 키, 한자 키: HID `Lang1`(0x90), `Lang2`(0x91). macOS에서는 `kVK_JIS_Kana`/`Eisu`가 아니라 입력 소스 전환이므로, Mac이 받는 쪽일 때 `Lang1`은 입력 소스 전환 단축키(기본 Ctrl+Space 또는 Caps Lock)로 바꿔 주입하는 옵션이 필요하다. 실기기 확인 필수.
 - 눌린 키 집합을 양쪽이 기억한다. 건너감이 끝나거나 링크가 끊기면 받는 쪽은 눌린 키·버튼을 모두 뗀다(아래 안전장치).
 

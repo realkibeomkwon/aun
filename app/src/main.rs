@@ -19,6 +19,8 @@ const MESSAGE_FOR: Duration = Duration::from_secs(5);
 const FLASH_FOR: Duration = Duration::from_millis(1500);
 /// Pixels the remote pointer moves per point moved on the pad.
 const PAD_GAIN: f32 = 2.0;
+/// The pad's ⌘/Ctrl switch (`Settings::swap`), off and on.
+const SWAP: [&str; 2] = ["⌘·Ctrl 맞바꾸기 꺼짐", "⌘·Ctrl 맞바꾸기 켜짐"];
 
 use aun_core::wire::Frame;
 use aun_core::{Config, Id, Node, Note, PeerView};
@@ -167,11 +169,18 @@ impl Ui {
     /// A key on this keyboard while the pad has focus. Every key is taken, sent or not: Tab
     /// would move focus off the pad, Space and Return press a button here.
     fn pad_key(&mut self, e: &rune::PhysicalInput) -> bool {
+        let swap = self.settings.swap;
         let Some(p) = &mut self.pad else { return false };
         let id = p.id;
         let sent: Vec<Frame> = match *e {
             rune::PhysicalInput::Key { key, pressed, .. } => {
                 let Some(hid) = aun_core::kvm::hid(key) else { return true };
+                // Control and ⌘ (the Windows key), left and right.
+                let hid = match hid {
+                    0xE0 | 0xE4 if swap => hid + 3,
+                    0xE3 | 0xE7 if swap => hid - 3,
+                    _ => hid,
+                };
                 let at = p.keys.iter().position(|&k| k == hid);
                 match (pressed, at) {
                     (true, None) => p.keys.push(hid),
@@ -659,8 +668,12 @@ fn pad(s: &Ui, t: Theme) -> Option<El> {
             true
         });
     Some(col().key("pad").w_full().gap(space::S2).padding(space::S3).radius(radius::MD).fill(t.card).border(1.0, t.card_border)
-        .child(row().w_full().center_y().gap(space::S2)
+        .child(row().w_full().center_y().gap(space::S2).flex_wrap()
             .child(text(format!("{} 원격 조작 중", p.name)).font(type_::LABEL).color(t.text).grow(1.0))
+            .child(button("pad-swap".into(), SWAP[s.settings.swap as usize], t, s.settings.swap, |s, tx| {
+                s.settings.swap = !s.settings.swap;
+                s.save(tx);
+            }))
             .child(button("pad-close".into(), "그만", t, false, |s, _| s.close_pad())))
         .child(area))
 }
@@ -1093,6 +1106,34 @@ mod tests {
         assert_eq!(sent, [k(0xE1, true), k(4, true), k(4, true), k(4, false), k(0x2B, true), k(0x2B, false), k(0xE1, false)]);
     }
 
+    /// ⌘C on a Mac pad is Ctrl+C at the peer (and Ctrl is ⌘ there), unless switched off. (The
+    /// switch is a button, so the pad has let go of every key before it flips.)
+    #[test]
+    fn the_pad_sends_command_as_control_unless_switched_off() {
+        use rune::{PhysicalInput, PhysicalKeyCode as K};
+        let mut ui = Ui::new(None, None);
+        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: None, paired: true, nearby: true, connected: true, kvm: true }];
+        ui.open_pad([3; 32], "PC".into());
+        let mut rt = Runtime::new(ui, view, (480.0, 700.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        let (x, y) = rt.find("pad-area").expect("the pad");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        rt.state.sent.borrow_mut().clear();
+        let key = |key, pressed| PhysicalInput::Key { key, mods: Default::default(), pressed, repeat: false };
+        for e in [key(K::SuperLeft, true), key(K::KeyC, true), key(K::KeyC, false), key(K::SuperLeft, false), key(K::ControlRight, true), key(K::ControlRight, false)] {
+            rt.physical_input(e);
+        }
+        rt.frame(0.2);
+        rt.state.settings.swap = false;
+        rt.physical_input(key(K::SuperRight, true));
+        rt.frame(0.3);
+        let sent: Vec<_> = rt.state.sent.borrow().iter().map(|f| format!("{f:?}")).collect();
+        let k = |hid: u16, down: bool| format!("{:?}", Frame::KvmKey { hid, down });
+        assert_eq!(sent, [k(0xE0, true), k(6, true), k(6, false), k(0xE0, false), k(0xE7, true), k(0xE7, false), k(0xE7, true)]);
+    }
+
     /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and
     /// the Shift held at the peer must go up then, not whenever the pad closes.
     #[test]
@@ -1187,15 +1228,17 @@ mod tests {
         assert!(x < 480.0, "the button is inside the window: {x}");
     }
 
-    /// A connected device has three buttons; at the narrowest window none of them is cut off.
+    /// A connected device has three buttons, and its open pad two; at the narrowest window none of
+    /// them is cut off.
     #[test]
     fn a_connected_device_s_buttons_stay_inside_the_window() {
         for w in [420.0, 480.0] {
             let mut ui = Ui::new(None, None);
             ui.peers = vec![PeerView { id: [3; 32], name: "Kibeoms-Mac-mini".into(), addr: None, paired: true, nearby: true, connected: true, kvm: true }];
-            let mut rt = Runtime::new(ui, view, (w, 560.0), Env { system_dark: false, scale: 2.0 });
+            ui.open_pad([3; 32], "Kibeoms-Mac-mini".into());
+            let mut rt = Runtime::new(ui, view, (w, 900.0), Env { system_dark: false, scale: 2.0 });
             rt.frame(0.0);
-            for key in ["send-030303030303", "pad-030303030303", "forget-030303030303"] {
+            for key in ["send-030303030303", "pad-030303030303", "forget-030303030303", "pad-swap", "pad-close"] {
                 let (r, _) = rt.presented(key).unwrap_or_else(|| panic!("{key}"));
                 assert!(r[0] + r[2] <= w - 24.0, "{key} ends at {} in a {w} pt window", r[0] + r[2]);
             }
