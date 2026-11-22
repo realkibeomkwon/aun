@@ -159,3 +159,10 @@ Windows(2026-11-21): Windows 11 Pro PC, release 빌드. 변경 전 `42967de`와 
   - macOS 27에서는 입력을 주입하는 앱을 "손쉬운 사용"이 아니라 개인정보 보호 및 보안 > "System & App Protection Override"에서 허용한다. Aun이 목록에 자동으로 나타나지 않아 사용자가 +로 추가했다(원인 미확인). 추가한 뒤 Aun을 다시 시작하지 않아도 적용됐다.
   - 시험 뒤 고친 것: 좁은 창에서 기기 줄 버튼이 잘리던 것과 권한 안내 문구(`cc3c70c`, 실기기 미확인).
 - 1단계 키 입력을 구현했다(2026-11-22, `docs/kvm-design.md` 8절 "키 입력"). 실기기 시험 항목: 글자·숫자·기호, Shift 조합, 화살표·Backspace·Enter·Tab(Tab이 Aun 안에서 포커스를 옮기지 않고 상대로 가는지), 키 반복, 오른쪽 Alt/Option·오른쪽 Ctrl/⌘·한/영(양방향, 결과를 3단계 자료로 기록), 키를 누른 채 다른 창 클릭하기와 "그만" 누르기(받는 쪽 키가 떼어지는지), Mac 보내는 쪽에서 ⌘Q.
+- 키 입력 실기기 시험(2026-11-22, CI 44971190007 빌드 `d3d1f90`, 사용자 확인):
+  - 양방향으로 문자·숫자 키가 들어간다.
+  - Windows → Mac에서 처음에는 Backspace와 Enter만 들어가지 않았다. 원인은 새 빌드가 macOS 권한을 잃은 것이었다(Mac 로그 `injection allowed by the OS: false`). System & App Protection Override에서 Aun을 지웠다가 다시 추가하자 들어갔다. 권한이 없을 때 macOS 27은 주입한 일반 문자는 통과시키고 Return·Delete 같은 제어 키는 막는 것으로 보인다(관찰한 것은 이 두 키뿐).
+  - 같은 주입 코드로 TextEdit에 A·B·Backspace·Return·C를 넣는 시험(권한 있는 프로세스)에서 Backspace와 Return이 동작했다. 보내는 쪽 Mac 패드도 Backspace·Enter를 받는 것을 디버그 빌드로 확인했다.
+  - 예상한 한계: 수정 키(Ctrl/Alt ↔ ⌘/Option)는 물리 위치대로 가고, Mac 받는 쪽은 한/영을 버린다(3단계).
+  - 미확인: Tab, 키 반복, 누른 채 포커스 잃기, Mac 보내는 쪽 ⌘Q.
+  - 남은 문제: ad-hoc 서명이라 새 빌드마다 macOS 권한을 다시 추가해야 한다. 서명 인증서를 고정하면 유지될 가능성이 있다(미확인).

@@ -132,7 +132,7 @@ impl Ui {
         self.save(tx);
         // macOS drops posted input without Accessibility; asking opens the system's request.
         if on && self.node.is_some() && !aun_core::kvm::allowed(true) {
-            self.say("시스템 설정 > 개인정보 보호 및 보안에서 Aun을 허용하세요 (macOS 27은 \"System & App Protection Override\", 그 전은 \"손쉬운 사용\". 목록에 없으면 + 로 추가)", tx);
+            self.say("시스템 설정 > 개인정보 보호 및 보안에서 Aun을 허용하세요 (macOS 27은 \"System & App Protection Override\", 그 전은 \"손쉬운 사용\". 목록에 없으면 + 로 추가하고, 새 버전을 설치한 뒤에는 지웠다가 다시 추가)", tx);
         }
     }
 

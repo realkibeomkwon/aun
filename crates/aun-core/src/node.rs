@@ -842,9 +842,11 @@ impl Node {
                     } else {
                         if !told {
                             told = true;
+                            // Untrusted on macOS 27, posted characters still land but Return and Delete don't (seen
+                            // 2026-11-22): a new ad-hoc build loses the grant until re-added.
                             crate::log(format_args!("input from {} (injection allowed by the OS: {})", files.peer, kvm::allowed(false)));
                             if !kvm::allowed(false) {
-                                (self.0.notify)(Note::Info("macOS가 입력 제어를 허용하지 않아 원격 조작을 받을 수 없어요".into()));
+                                (self.0.notify)(Note::Info("macOS 권한이 없어 Return, Delete 같은 키가 들어가지 않을 수 있어요. 개인정보 보호 및 보안에서 Aun을 지웠다가 다시 추가하세요".into()));
                             }
                         }
                         input.apply(f);
