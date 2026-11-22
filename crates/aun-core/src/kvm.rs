@@ -261,6 +261,10 @@ mod mac {
     pub const MODIFIERS: u64 = 0x1E_0000;
     const OPTION: u64 = 0x8_0000;
     const RETURN: u16 = 0x24;
+    /// `kCGEventFlagMaskSecondaryFn`, `kVK_Function`, and the flag every event has at rest.
+    const FN: u64 = 0x80_0000;
+    const FN_KEY: u16 = 0x3F;
+    const NON_COALESCED: u64 = 0x100;
     /// HID Lang1 (한/영 on a Korean keyboard) and Lang2 (한자).
     const LANG1: u16 = 0x90;
     const LANG2: u16 = 0x91;
@@ -388,7 +392,28 @@ mod mac {
                     CGEventSetFlags(e, flags);
                 }
                 CGEventPost(HID_TAP, e);
+                let fn_on = CGEventGetFlags(e) & FN != 0;
                 CFRelease(e);
+                if fn_on {
+                    self.settle();
+                }
+            }
+        }
+
+        /// Puts the system's modifier state back to the modifiers held. A posted event with the
+        /// function flag (F-keys and arrows carry it) leaves it set, and every event after it
+        /// inherits it: an `f` typed next is Globe+F, which fills the screen with the front
+        /// window (seen 2026-11-22).
+        fn settle(&self) {
+            // SAFETY: a new event, posted and released here.
+            unsafe {
+                let e = CGEventCreateKeyboardEvent(std::ptr::null_mut(), FN_KEY, false);
+                if !e.is_null() {
+                    CGEventSetType(e, FLAGS_CHANGED);
+                    CGEventSetFlags(e, self.flags() | NON_COALESCED);
+                    CGEventPost(HID_TAP, e);
+                    CFRelease(e);
+                }
             }
         }
     }
@@ -452,6 +477,9 @@ mod mac {
                             CFRelease(e);
                         }
                     }
+                }
+                if down {
+                    self.settle(); // the shortcut's own modifiers and function flag
                 }
                 return;
             }
