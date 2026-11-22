@@ -12,7 +12,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -79,10 +79,53 @@ pub struct PeerView {
     pub kvm: bool,
 }
 
+/// A link's write queue in two lanes: input and control go out ahead of file chunks and
+/// clipboards already queued (docs/kvm-design.md 5), so a key doesn't wait behind 1 MiB of data.
+/// A bulk frame also puts a `None` in the fast lane: the writer sleeps on that lane alone.
+#[derive(Clone)]
+struct Tx {
+    fast: SyncSender<Option<Frame>>,
+    bulk: SyncSender<Frame>,
+}
+
+fn queue() -> (Tx, Receiver<Option<Frame>>, Receiver<Frame>) {
+    let (fast, fast_rx) = mpsc::sync_channel(64);
+    let (bulk, bulk_rx) = mpsc::sync_channel(4);
+    (Tx { fast, bulk }, fast_rx, bulk_rx)
+}
+
+impl Tx {
+    fn is_fast(f: &Frame) -> bool {
+        matches!(f, Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::Ping | Frame::FileFrom { .. } | Frame::FileCancel { .. })
+    }
+
+    /// Waits for room; Err once the link is gone.
+    fn send(&self, f: Frame) -> Result<(), ()> {
+        if Tx::is_fast(&f) {
+            return self.fast.send(Some(f)).map_err(drop);
+        }
+        self.bulk.send(f).map_err(drop)?;
+        let _ = self.fast.try_send(None); // full: the writer has fast frames to wake it anyway
+        Ok(())
+    }
+
+    fn try_send(&self, f: Frame) -> Result<(), TrySendError<Frame>> {
+        if Tx::is_fast(&f) {
+            return self.fast.try_send(Some(f)).map_err(|e| match e {
+                TrySendError::Full(f) => TrySendError::Full(f.unwrap()),
+                TrySendError::Disconnected(f) => TrySendError::Disconnected(f.unwrap()),
+            });
+        }
+        self.bulk.try_send(f)?;
+        let _ = self.fast.try_send(None);
+        Ok(())
+    }
+}
+
 struct Link {
     conn: u64,
     initiator: Id,
-    tx: SyncSender<Frame>,
+    tx: Tx,
     sock: TcpStream,
     /// The peer's build can say where a stopped file goes on from.
     resume: bool,
@@ -331,9 +374,9 @@ impl Node {
     }
 
     /// Drives `id`'s pointer, if it is connected and speaks `Kvm*` frames; false if not sent.
-    /// A move or a scroll is dropped when the link's queue is full (a file going out): the next
-    /// move carries the total. A button, a key or a leave waits for room, up to a moment.
-    /// shortcut: input waits behind file chunks already queued; a queue of its own is step 2.
+    /// It goes ahead of file chunks. A move or a scroll is dropped when the input queue is full
+    /// (the socket stalled): the next move carries the total. A button, a key or a leave waits
+    /// for room, up to a moment.
     pub fn send_input(&self, id: Id, f: Frame) -> bool {
         let Some(tx) = self.st().peers.get(&id).and_then(|p| p.link.as_ref()).filter(|l| l.kvm).map(|l| l.tx.clone()) else { return false };
         let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. });
@@ -602,7 +645,7 @@ impl Node {
 
     /// Sends one file; every outcome ends in a finished note. `ask`: it stopped before, so ask the
     /// receiver how much it kept and send only the rest.
-    fn stream_file(&self, tx: SyncSender<Frame>, ask: bool, key: u64, peer_id: Id, peer: &str, path: &Path) -> io::Result<()> {
+    fn stream_file(&self, tx: Tx, ask: bool, key: u64, peer_id: Id, peer: &str, path: &Path) -> io::Result<()> {
         let cancelled = || self.st().cancelled.contains(&key);
         let meta = std::fs::metadata(path).ok();
         let total = meta.as_ref().map_or(0, |m| m.len());
@@ -762,7 +805,7 @@ impl Node {
         }
 
         // Authenticated. Register, then run the writer on its own thread and read here.
-        let (tx, rx) = mpsc::sync_channel::<Frame>(4);
+        let (tx, fast, bulk) = queue();
         let (conn, dup) = {
             let mut st = self.st();
             st.next += 1;
@@ -806,7 +849,7 @@ impl Node {
         self.wake_clip();
         let up = Instant::now();
         let wsock = sock.try_clone()?;
-        spawn("aun-write", move || writer(w, rx, wsock));
+        spawn("aun-write", move || writer(w, fast, bulk, wsock));
 
         let mut rx_files = Incoming::new(self, name.clone(), remote, tx);
         let make = self.0.sink.lock().unwrap().clone();
@@ -929,17 +972,30 @@ fn handshake(sock: &TcpStream, key: &[u8], initiator: bool) -> io::Result<(State
     Ok((hs.into_stateless_transport_mode().map_err(e)?, h, remote))
 }
 
-/// Writes queued frames; flushes when the queue runs dry so small frames share one Noise message.
-fn writer(mut w: SealWriter<TcpStream>, rx: Receiver<Frame>, sock: TcpStream) {
+/// Writes queued frames, every fast one ahead of the next bulk one (see [`Tx`]). Flushes when
+/// the queues run dry so small frames share one Noise message, and after fast frames written
+/// between bulk ones so they don't sit in the buffer behind the next chunk.
+fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Receiver<Frame>, sock: TcpStream) {
     let res = (|| -> io::Result<()> {
         loop {
-            let f = match rx.recv_timeout(PING) {
-                Ok(f) => f,
-                Err(RecvTimeoutError::Timeout) => Frame::Ping,
+            match fast.recv_timeout(PING) {
+                Ok(Some(f)) => wire::write_frame(&mut w, &f)?,
+                Ok(None) => {}
+                Err(RecvTimeoutError::Timeout) => wire::write_frame(&mut w, &Frame::Ping)?,
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
-            };
-            wire::write_frame(&mut w, &f)?;
-            while let Ok(f) = rx.try_recv() {
+            }
+            loop {
+                let mut wrote = false;
+                while let Ok(f) = fast.try_recv() {
+                    if let Some(f) = f {
+                        wire::write_frame(&mut w, &f)?;
+                        wrote = true;
+                    }
+                }
+                let Ok(f) = bulk.try_recv() else { break };
+                if wrote {
+                    w.flush()?;
+                }
                 wire::write_frame(&mut w, &f)?;
             }
             w.flush()?;
@@ -968,14 +1024,14 @@ struct Incoming<'a> {
     peer: String,
     remote: Id,
     /// This link's queue, for telling the sender a file was cancelled.
-    tx: SyncSender<Frame>,
+    tx: Tx,
     files: HashMap<u32, InFile>,
     /// Cancels not yet sent: the queue was full (it holds our own outgoing chunks).
     untold: Vec<u32>,
 }
 
 impl<'a> Incoming<'a> {
-    fn new(node: &'a Node, peer: String, remote: Id, tx: SyncSender<Frame>) -> Self {
+    fn new(node: &'a Node, peer: String, remote: Id, tx: Tx) -> Self {
         Incoming { node, peer, remote, tx, files: HashMap::new(), untold: Vec::new() }
     }
 
@@ -1029,7 +1085,9 @@ impl<'a> Incoming<'a> {
         if resume {
             // Off this thread: a reader blocked on a full queue can stall both writers.
             let tx = self.tx.clone();
-            spawn("aun-from", move || drop(tx.send(Frame::FileFrom { id, offset: done })));
+            spawn("aun-from", move || {
+                let _ = tx.send(Frame::FileFrom { id, offset: done });
+            });
         }
         let out = BufWriter::with_capacity(512 << 10, file);
         let key = {
@@ -1202,15 +1260,39 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let out = TcpStream::connect(l.local_addr().unwrap()).unwrap();
         let (inp, _) = l.accept().unwrap();
-        let (tx, rx) = mpsc::sync_channel(4);
+        let (tx, fast, bulk) = queue();
         tx.send(Frame::Clip("a".into())).unwrap();
         tx.send(Frame::Clip("b".into())).unwrap();
         let w = SealWriter::new(Arc::new(ti), out.try_clone().unwrap());
-        thread::spawn(move || writer(w, rx, out));
+        thread::spawn(move || writer(w, fast, bulk, out));
         inp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut r = OpenReader::new(Arc::new(tr), inp);
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::Clip("a".into()));
         assert_eq!(wire::read_frame(&mut r).expect("second frame within 2 s, not at the next ping"), Frame::Clip("b".into()));
+        drop(tx);
+    }
+
+    /// A key pressed while a file goes out is written before the chunks already queued.
+    #[test]
+    fn input_goes_out_ahead_of_file_data_already_queued() {
+        let (ti, tr) = transports();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let out = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (inp, _) = l.accept().unwrap();
+        let (tx, fast, bulk) = queue();
+        for _ in 0..4 {
+            tx.send(Frame::FileData { id: 1, data: vec![0; 1000] }).unwrap();
+        }
+        // Queued while the file lane is full, as a key pressed mid-transfer is.
+        tx.try_send(Frame::KvmKey { hid: 4, down: true }).unwrap();
+        let w = SealWriter::new(Arc::new(ti), out.try_clone().unwrap());
+        thread::spawn(move || writer(w, fast, bulk, out));
+        inp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut r = OpenReader::new(Arc::new(tr), inp);
+        assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::KvmKey { hid: 4, down: true });
+        for _ in 0..4 {
+            assert!(matches!(wire::read_frame(&mut r).unwrap(), Frame::FileData { .. }));
+        }
         drop(tx);
     }
 }
