@@ -169,6 +169,8 @@ impl<S: Sink> Injector<S> {
                 let at = self.keys.iter().position(|&k| k == hid);
                 match (down, at) {
                     (true, None) => self.keys.push(hid),
+                    // 한/영 and 한자 switch on each down (a Mac presses a shortcut for them).
+                    (true, Some(_)) if matches!(hid, 0x90 | 0x91) => return,
                     (true, Some(_)) => {} // a repeat: the OS doesn't repeat injected keys itself
                     // Not held here: an up could end a press at this device's own keyboard.
                     (false, None) => return,
@@ -298,6 +300,7 @@ mod mac {
         fn CGEventSetIntegerValueField(e: Ref, field: u32, v: i64);
         fn CGEventCreateKeyboardEvent(source: Ref, key: u16, down: bool) -> Ref;
         fn CGEventSetFlags(e: Ref, flags: u64);
+        fn CGEventGetFlags(e: Ref) -> u64;
         fn CGEventSetType(e: Ref, kind: u32);
         fn CGEventPost(tap: u32, e: Ref);
         fn CGGetActiveDisplayList(max: u32, out: *mut u32, count: *mut u32) -> i32;
@@ -442,7 +445,9 @@ mod mac {
                     unsafe {
                         let e = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, d);
                         if !e.is_null() {
-                            CGEventSetFlags(e, flags);
+                            // Added to the event's own: an F-key without its function flag
+                            // doesn't fire a shortcut set to it (seen with F19, 2026-11-22).
+                            CGEventSetFlags(e, CGEventGetFlags(e) | flags);
                             CGEventPost(HID_TAP, e);
                             CFRelease(e);
                         }
@@ -611,6 +616,18 @@ pub(crate) mod tests {
             #[cfg(any(target_os = "macos", windows))]
             assert_eq!(scancode(h).is_some(), !absent.contains(&k), "{k:?}: a code on this OS");
         }
+    }
+
+    /// 한/영 and 한자 switch something each time they go down: a repeat would switch it back.
+    #[test]
+    fn hangul_and_hanja_do_not_repeat() {
+        let rec = Rec::default();
+        let mut inj = Injector::new(rec.clone());
+        for (hid, down) in [(0x90, true), (0x90, true), (0x90, false), (0x91, true), (0x91, true)] {
+            inj.apply(Frame::KvmKey { hid, down });
+        }
+        drop(inj);
+        assert_eq!(*rec.0.lock().unwrap(), ["key 0x90 down", "key 0x90 up", "key 0x91 down", "key 0x91 up"]);
     }
 
     #[test]
