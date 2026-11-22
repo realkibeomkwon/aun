@@ -164,5 +164,6 @@ Windows(2026-11-21): Windows 11 Pro PC, release 빌드. 변경 전 `42967de`와 
   - Windows → Mac에서 처음에는 Backspace와 Enter만 들어가지 않았다. 원인은 새 빌드가 macOS 권한을 잃은 것이었다(Mac 로그 `injection allowed by the OS: false`). System & App Protection Override에서 Aun을 지웠다가 다시 추가하자 들어갔다. 권한이 없을 때 macOS 27은 주입한 일반 문자는 통과시키고 Return·Delete 같은 제어 키는 막는 것으로 보인다(관찰한 것은 이 두 키뿐).
   - 같은 주입 코드로 TextEdit에 A·B·Backspace·Return·C를 넣는 시험(권한 있는 프로세스)에서 Backspace와 Return이 동작했다. 보내는 쪽 Mac 패드도 Backspace·Enter를 받는 것을 디버그 빌드로 확인했다.
   - 예상한 한계: 수정 키(Ctrl/Alt ↔ ⌘/Option)는 물리 위치대로 가고, Mac 받는 쪽은 한/영을 버린다(3단계).
-  - 미확인: Tab, 키 반복, 누른 채 포커스 잃기, Mac 보내는 쪽 ⌘Q.
+  - 추가 시험(2026-11-22, 사용자 확인): Tab은 받는 쪽에 들어가고 보내는 쪽 Aun의 포커스를 옮기지 않는다. 키 반복이 되고 떼면 멈춘다. Shift를 누른 채 다른 버튼이나 "그만"을 누르면 받는 쪽 Shift가 떼어진다.
+  - Mac 보내는 쪽 ⌘Q: 키가 상대에게 가고(Windows에서 Win+Q로 검색 창이 열림) 동시에 AppKit 메뉴가 Mac Aun을 종료한다. 링크가 끊기며 Windows의 Win 키는 떼어졌다. 한 키가 두 곳에서 처리되는 문제로 남겨 둔다(Quit 메뉴 단축키를 바꿀지는 사용자 결정, 3단계의 수정 키 맞바꾸기와 함께 정한다).
   - 남은 문제: ad-hoc 서명이라 새 빌드마다 macOS 권한을 다시 추가해야 한다. 서명 인증서를 고정하면 유지될 가능성이 있다(미확인).
