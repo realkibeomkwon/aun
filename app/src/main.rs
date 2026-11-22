@@ -67,6 +67,9 @@ struct Pad {
     focused: bool,
     /// When the last input source switch was sent.
     switched: Option<Instant>,
+    /// Keys that, with these modifiers (macOS flags), switch this Mac's input source
+    /// (`kvm::input_source_combos`): kept here, the switch goes as 한/영.
+    combos: Vec<(rune::PhysicalKeyCode, u64)>,
 }
 
 struct Ui {
@@ -152,7 +155,7 @@ impl Ui {
         self.route = self.route.wrapping_add(1);
         let lang = aun_core::kvm::lang_keys();
         aun_core::log(format_args!("pad: keys sent as 한/영 (0x90) or 한자 (0x91): {lang:?}"));
-        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang, focused: false, switched: None });
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang, focused: false, switched: None, combos: aun_core::kvm::input_source_combos() });
     }
 
     /// Lets go of what the pad holds at the peer, then closes it.
@@ -186,7 +189,11 @@ impl Ui {
         let id = p.id;
         p.focused = !matches!(e, rune::PhysicalInput::FocusLost);
         let sent: Vec<Frame> = match *e {
-            rune::PhysicalInput::Key { key, pressed, .. } => {
+            rune::PhysicalInput::Key { key, pressed, mods, .. } => {
+                let held = [(mods.shift, 0x2_0000), (mods.ctrl, 0x4_0000), (mods.alt, 0x8_0000), (mods.logo, 0x10_0000)].iter().filter(|m| m.0).fold(0, |f, m| f | m.1);
+                if pressed && p.combos.contains(&(key, held)) {
+                    return true; // its up finds nothing held and goes nowhere either
+                }
                 let hid = p.lang.iter().find(|l| l.0 == key).map(|l| l.1).or_else(|| aun_core::kvm::hid(key));
                 let Some(hid) = hid else { return true };
                 let hid = swapped(hid, swap);
@@ -1265,6 +1272,22 @@ mod tests {
         std::thread::sleep(SAME_SWITCH);
         ui.input_source_changed();
         assert_eq!(ui.sent.borrow().len(), 4, "a switch after that is another one");
+    }
+
+    /// ⌃Space set to switch the Mac's input source reaches the pad as Control and Space too: the
+    /// Space stays here (the switch itself goes as 한/영), or the PC would get Win+Space.
+    #[test]
+    fn the_input_source_shortcut_s_key_stays_here() {
+        use rune::{PhysicalInput, PhysicalKeyCode as K};
+        let key = |key, pressed, ctrl| PhysicalInput::Key { key, mods: rune::Mods { ctrl, ..Default::default() }, pressed, repeat: false };
+        let mut ui = Ui::new(None, None);
+        ui.open_pad([3; 32], "PC".into());
+        ui.pad.as_mut().unwrap().combos = vec![(K::Space, 0x4_0000)];
+        for e in [key(K::ControlLeft, true, true), key(K::Space, true, true), key(K::Space, false, true), key(K::ControlLeft, false, false), key(K::Space, true, false)] {
+            ui.pad_key(&e);
+        }
+        let k = |hid, down| Frame::KvmKey { hid, down };
+        assert_eq!(*ui.sent.borrow(), [k(0xE3, true), k(0xE3, false), k(0x2C, true)]);
     }
 
     /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and

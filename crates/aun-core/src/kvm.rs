@@ -76,6 +76,23 @@ pub fn lang_keys() -> Vec<(KeyCode, u16)> {
     Vec::new()
 }
 
+/// macOS: the input source shortcuts that take modifiers (⌃Space by default), as the key and
+/// its modifier flags (Shift `0x20000`, Control `0x40000`, Option `0x80000`, ⌘ `0x100000`).
+/// Unlike a bare F-key, such a key reaches the app as well as switching the source (Space after
+/// Control, checked 2026-11-22). Elsewhere none.
+pub fn input_source_combos() -> Vec<(KeyCode, u64)> {
+    #[cfg(target_os = "macos")]
+    return mac::input_sources()
+        .into_iter()
+        .flatten()
+        .map(|s| (s.0, s.1 & 0x1E_0000))
+        .filter(|s| s.1 != 0)
+        .filter_map(|s| KEYS.iter().find(|k| scancode(k.1) == Some(s.0.into())).map(|k| (k.0, s.1)))
+        .collect();
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
 /// macOS: calls `f` on the main thread each time the input source changes, for the life of the
 /// process. The key that switches it (Caps Lock remapped to F18, ⌃Space) goes to the system and
 /// no app sees it (checked 2026-11-22), so the switch is all a sender can know of 한/영.
@@ -543,6 +560,8 @@ mod win {
 
     /// In `dwExtraInfo` of what Aun injects, so a later capture hook can tell it apart.
     pub const MARK: usize = 0x4155_4E31; // "AUN1"
+    /// A virtual key no layout assigns (`0xE8`), pressed to keep Win or Alt from acting alone.
+    const MASK_KEY: u16 = 0xE8;
     /// Pixels of scrolling per wheel notch (`WHEEL_DELTA`, 120).
     /// shortcut: a guess at what a notch scrolls; tune on the device.
     const PX_PER_NOTCH: i32 = 40;
@@ -620,6 +639,21 @@ mod win {
             if let Some(vk) = [(0x90, VK_HANGUL), (0x91, VK_HANJA)].iter().find(|l| l.0 == hid).map(|l| l.1) {
                 if down {
                     crate::log(format_args!("input: {} from the peer", if hid == 0x90 { "한/영" } else { "한자" }));
+                }
+                // With Win or Alt held (a Mac's ⌃Space with Control sent as Win), the key alone
+                // going up next would open Start or the menu bar: an unassigned key in between
+                // makes it a combination, as AutoHotkey's menu mask does.
+                // SAFETY: plain reads of the keyboard state.
+                let held = [VK_LWIN, VK_RWIN, VK_MENU].iter().any(|&k| unsafe { GetAsyncKeyState(k.into()) } < 0);
+                if down && held {
+                    for up in [0, KEYEVENTF_KEYUP] {
+                        let mask = INPUT {
+                            r#type: INPUT_KEYBOARD,
+                            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: MASK_KEY, wScan: 0, dwFlags: up, time: 0, dwExtraInfo: MARK } },
+                        };
+                        // SAFETY: one initialised INPUT of the size given.
+                        unsafe { SendInput(1, &mask, size_of::<INPUT>() as i32) };
+                    }
                 }
                 let input = INPUT {
                     r#type: INPUT_KEYBOARD,
