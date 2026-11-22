@@ -66,21 +66,29 @@ const MISSING: &[(KeyCode, u32)] = &[(KeyCode::CapsLock, 0x39), (KeyCode::IntlBa
 const MISSING: &[(KeyCode, u32)] = &[];
 
 /// Keys on this keyboard that are 한/영 or 한자 here, and the wire code each goes as (HID Lang1,
-/// Lang2) instead of its own. macOS: the keys of the input source shortcuts that take no modifier
-/// (a Caps Lock remapped to F18, say; ⌃Space goes as itself). Windows: the keys the Korean layout
-/// turns into `VK_HANGUL` and `VK_HANJA` (right Alt and right Ctrl on most). Elsewhere none.
+/// Lang2) instead of its own. Windows: the keys the Korean layout turns into `VK_HANGUL` and
+/// `VK_HANJA` (right Alt and right Ctrl on most). Elsewhere none: a Mac's input source key never
+/// reaches an app, see [`on_input_source_change`].
 pub fn lang_keys() -> Vec<(KeyCode, u16)> {
-    #[cfg(target_os = "macos")]
-    return mac::input_sources()
-        .into_iter()
-        .flatten()
-        .filter(|s| s.1 & mac::MODIFIERS == 0)
-        .filter_map(|s| KEYS.iter().find(|k| scancode(k.1) == Some(s.0.into())).map(|k| (k.0, 0x90)))
-        .collect();
     #[cfg(windows)]
     return win::lang_keys();
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(windows))]
     Vec::new()
+}
+
+/// macOS: calls `f` on the main thread each time the input source changes, for the life of the
+/// process. The key that switches it (Caps Lock remapped to F18, ⌃Space) goes to the system and
+/// no app sees it (checked 2026-11-22), so the switch is all a sender can know of 한/영.
+#[cfg(target_os = "macos")]
+pub fn on_input_source_change(f: impl Fn() + 'static) {
+    use block2::RcBlock;
+    use objc2_foundation::{NSDistributedNotificationCenter, NSString};
+    let center = NSDistributedNotificationCenter::defaultCenter();
+    let name = NSString::from_str("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged");
+    let block = RcBlock::new(move |_| f());
+    // SAFETY: no object filter, no queue: delivered on the main run loop, where `f` may run.
+    let token = unsafe { center.addObserverForName_object_queue_usingBlock(Some(&name), None, None, &block) };
+    std::mem::forget(token);
 }
 
 /// macOS's "Select the previous input source" and "next" shortcuts from their entries in
@@ -260,8 +268,6 @@ mod mac {
     /// Modifier key codes (`kVK_*`) and their `kCGEventFlagMask*`: Shift, Control, Option, Command.
     const MODS: [(u32, u64); 8] = [(0x38, 0x2_0000), (0x3C, 0x2_0000), (0x3B, 0x4_0000), (0x3E, 0x4_0000), (0x3A, 0x8_0000), (0x3D, 0x8_0000), (0x37, 0x10_0000), (0x36, 0x10_0000)];
 
-    /// Shift, Control, Option, Command in modifier flags.
-    pub const MODIFIERS: u64 = 0x1E_0000;
     const OPTION: u64 = 0x8_0000;
     const RETURN: u16 = 0x24;
     /// `kCGEventFlagMaskSecondaryFn`, `kVK_Function`, and the flag every event has at rest.

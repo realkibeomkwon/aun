@@ -60,6 +60,8 @@ struct Pad {
     keys: Vec<u16>,
     /// Keys here sent as 한/영 or 한자 (`kvm::lang_keys`), read when the pad opens.
     lang: Vec<(rune::PhysicalKeyCode, u16)>,
+    /// The pad has the keyboard: clicked or typed on, not lost it since.
+    focused: bool,
 }
 
 struct Ui {
@@ -145,7 +147,7 @@ impl Ui {
         self.route = self.route.wrapping_add(1);
         let lang = aun_core::kvm::lang_keys();
         aun_core::log(format_args!("pad: keys sent as 한/영 (0x90) or 한자 (0x91): {lang:?}"));
-        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang });
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang, focused: false });
     }
 
     /// Lets go of what the pad holds at the peer, then closes it.
@@ -177,6 +179,7 @@ impl Ui {
         let swap = self.settings.swap;
         let Some(p) = &mut self.pad else { return false };
         let id = p.id;
+        p.focused = !matches!(e, rune::PhysicalInput::FocusLost);
         let sent: Vec<Frame> = match *e {
             rune::PhysicalInput::Key { key, pressed, .. } => {
                 let hid = p.lang.iter().find(|l| l.0 == key).map(|l| l.1).or_else(|| aun_core::kvm::hid(key));
@@ -201,6 +204,15 @@ impl Ui {
         // ⌘ held here: AppKit would also run the menu item (⌘Q quits Aun) for the key going there.
         menu_off(self.command_held());
         true
+    }
+
+    /// macOS switched the input source. With the pad focused, that was 한/영 meant for the peer:
+    /// the key itself (Caps Lock, F18, ⌃Space) goes to the system only and never reaches the pad.
+    fn input_source_changed(&mut self) {
+        let Some(p) = self.pad.as_ref().filter(|p| p.focused) else { return };
+        let id = p.id;
+        self.input(id, Frame::KvmKey { hid: 0x90, down: true });
+        self.input(id, Frame::KvmKey { hid: 0x90, down: false });
     }
 
     /// Whether ⌘ on this keyboard (whatever it is sent as) is down on the pad.
@@ -644,7 +656,7 @@ fn pad(s: &Ui, t: Theme) -> Option<El> {
             let id = p.id;
             match d.phase {
                 rune::Phase::Down => {
-                    p.held = Some((0.0, 0.0));
+                    (p.held, p.focused) = (Some((0.0, 0.0)), true);
                     s.input(id, Frame::KvmButton { button: 0, down: true, clicks: d.clicks.min(255) as u8 });
                 }
                 rune::Phase::Move => {
@@ -1019,6 +1031,11 @@ fn main() {
                 aun_core::power::watch(n);
             }
             s.tray = tray::Tray::new(h.clone(), s.settings.clipboard);
+            #[cfg(target_os = "macos")]
+            {
+                let h = h.clone();
+                aun_core::kvm::on_input_source_change(move || h.update(|s: &mut Ui, _| s.input_source_changed()));
+            }
             aun_core::log(format_args!("tray {}", if s.tray.is_some() { "up" } else { "unavailable" }));
             s.handle = Some(h);
         });
@@ -1211,6 +1228,28 @@ mod tests {
         }
         let k = |hid, down| Frame::KvmKey { hid, down };
         assert_eq!(*ui.sent.borrow(), [k(0x90, true), k(0x90, false), k(0x91, true), k(0x91, false), k(0x6E, true)]);
+    }
+
+    /// A Mac never shows an app the key that switches its input source (Caps Lock remapped to
+    /// F18 went to the system only, 2026-11-22), so the switch itself is sent as 한/영: once per
+    /// switch while the pad has the keyboard, never after it lost it.
+    #[test]
+    fn an_input_source_switch_on_the_focused_pad_goes_as_hangul() {
+        use rune::PhysicalInput;
+        let mut ui = Ui::new(None, None);
+        ui.open_pad([3; 32], "PC".into());
+        ui.input_source_changed(); // not focused yet
+        ui.pad_key(&PhysicalInput::Key { key: rune::PhysicalKeyCode::KeyA, mods: Default::default(), pressed: true, repeat: false });
+        ui.sent.borrow_mut().clear();
+        ui.input_source_changed();
+        ui.pad_key(&PhysicalInput::FocusLost);
+        ui.sent.borrow_mut().clear();
+        ui.input_source_changed();
+        assert!(ui.sent.borrow().is_empty(), "after focus went");
+        ui.pad_key(&PhysicalInput::Modifiers(Default::default())); // the keyboard is back
+        ui.input_source_changed();
+        let k = |hid, down| Frame::KvmKey { hid, down };
+        assert_eq!(*ui.sent.borrow(), [k(0x90, true), k(0x90, false)]);
     }
 
     /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and
