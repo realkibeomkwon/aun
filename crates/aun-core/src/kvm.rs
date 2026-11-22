@@ -65,18 +65,21 @@ const MISSING: &[(KeyCode, u32)] = &[(KeyCode::CapsLock, 0x39), (KeyCode::IntlBa
 #[cfg(windows)]
 const MISSING: &[(KeyCode, u32)] = &[];
 
-/// Keys on this keyboard that switch the input source, sent as 한/영 (Lang1): on macOS, the keys
-/// of the input source shortcuts that take no modifier (a Caps Lock remapped to F18, say). A
-/// shortcut with modifiers (macOS's own ⌃Space) is sent as itself. Elsewhere none.
-pub fn lang1_keys() -> Vec<KeyCode> {
+/// Keys on this keyboard that are 한/영 or 한자 here, and the wire code each goes as (HID Lang1,
+/// Lang2) instead of its own. macOS: the keys of the input source shortcuts that take no modifier
+/// (a Caps Lock remapped to F18, say; ⌃Space goes as itself). Windows: the keys the Korean layout
+/// turns into `VK_HANGUL` and `VK_HANJA` (right Alt and right Ctrl on most). Elsewhere none.
+pub fn lang_keys() -> Vec<(KeyCode, u16)> {
     #[cfg(target_os = "macos")]
     return mac::input_sources()
         .into_iter()
         .flatten()
         .filter(|s| s.1 & mac::MODIFIERS == 0)
-        .filter_map(|s| KEYS.iter().find(|k| scancode(k.1) == Some(s.0.into())).map(|k| k.0))
+        .filter_map(|s| KEYS.iter().find(|k| scancode(k.1) == Some(s.0.into())).map(|k| (k.0, 0x90)))
         .collect();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    return win::lang_keys();
+    #[cfg(not(any(target_os = "macos", windows)))]
     Vec::new()
 }
 
@@ -465,6 +468,9 @@ mod mac {
                 _ => None,
             };
             if let Some((code, flags)) = tap {
+                if down {
+                    crate::log(format_args!("input: {} from the peer, pressing key {code:#x} flags {flags:#x}", if hid == LANG1 { "한/영" } else { "한자" }));
+                }
                 for d in [true, false].into_iter().filter(|_| down) {
                     // SAFETY: a new event, posted and released here.
                     unsafe {
@@ -507,7 +513,7 @@ mod mac {
 
 #[cfg(windows)]
 mod win {
-    use super::{Os, Sink};
+    use super::{KeyCode, Os, Sink};
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -525,6 +531,25 @@ mod win {
         };
         // SAFETY: one initialised INPUT of the size given.
         unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+    }
+
+    /// See `super::lang_keys`.
+    pub fn lang_keys() -> Vec<(KeyCode, u16)> {
+        // SAFETY: this thread's layout and a lookup in it.
+        let hkl = unsafe { GetKeyboardLayout(0) };
+        if hkl as usize & 0x3FF != 0x12 {
+            return Vec::new(); // not Korean: VK_KANA, VK_KANJI share these codes
+        }
+        super::KEYS
+            .iter()
+            .filter_map(|&(k, hid)| {
+                let sc = super::scancode(hid)?;
+                // SAFETY: as above.
+                let vk = unsafe { MapVirtualKeyExW(sc, MAPVK_VSC_TO_VK_EX, hkl) } as u16;
+                let lang = [(VK_HANGUL, 0x90), (VK_HANJA, 0x91)].iter().find(|l| l.0 == vk)?.1;
+                (lang != hid).then_some((k, lang))
+            })
+            .collect()
     }
 
     impl Sink for Os {
@@ -567,6 +592,20 @@ mod win {
         }
 
         fn key(&mut self, hid: u16, down: bool) {
+            // 한/영 and 한자 by virtual key: as scan codes they mean something only to some
+            // layouts (0x72 is no key in KBDKOR.DLL), and the IME acts on the virtual key.
+            if let Some(vk) = [(0x90, VK_HANGUL), (0x91, VK_HANJA)].iter().find(|l| l.0 == hid).map(|l| l.1) {
+                if down {
+                    crate::log(format_args!("input: {} from the peer", if hid == 0x90 { "한/영" } else { "한자" }));
+                }
+                let input = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: if down { 0 } else { KEYEVENTF_KEYUP }, time: 0, dwExtraInfo: MARK } },
+                };
+                // SAFETY: one initialised INPUT of the size given.
+                unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+                return;
+            }
             let Some(sc) = super::scancode(hid) else { return };
             // By scan code: a virtual key would type what the key means in this PC's layout.
             let mut flags = KEYEVENTF_SCANCODE;

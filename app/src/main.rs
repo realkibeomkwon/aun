@@ -58,8 +58,8 @@ struct Pad {
     wheel: (f32, f32),
     /// Keys sent down and not yet up (HID usages).
     keys: Vec<u16>,
-    /// Keys here sent as 한/영 (`kvm::lang1_keys`), read when the pad opens.
-    lang1: Vec<rune::PhysicalKeyCode>,
+    /// Keys here sent as 한/영 or 한자 (`kvm::lang_keys`), read when the pad opens.
+    lang: Vec<(rune::PhysicalKeyCode, u16)>,
 }
 
 struct Ui {
@@ -143,7 +143,9 @@ impl Ui {
     fn open_pad(&mut self, id: Id, name: String) {
         self.close_pad();
         self.route = self.route.wrapping_add(1);
-        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang1: aun_core::kvm::lang1_keys() });
+        let lang = aun_core::kvm::lang_keys();
+        aun_core::log(format_args!("pad: keys sent as 한/영 (0x90) or 한자 (0x91): {lang:?}"));
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang });
     }
 
     /// Lets go of what the pad holds at the peer, then closes it.
@@ -177,7 +179,7 @@ impl Ui {
         let id = p.id;
         let sent: Vec<Frame> = match *e {
             rune::PhysicalInput::Key { key, pressed, .. } => {
-                let hid = if p.lang1.contains(&key) { Some(0x90) } else { aun_core::kvm::hid(key) };
+                let hid = p.lang.iter().find(|l| l.0 == key).map(|l| l.1).or_else(|| aun_core::kvm::hid(key));
                 let Some(hid) = hid else { return true };
                 let hid = swapped(hid, swap);
                 let at = p.keys.iter().position(|&k| k == hid);
@@ -1194,19 +1196,21 @@ mod tests {
         }
     }
 
-    /// The key that switches this Mac's input source (a Caps Lock remapped to F18) goes to the
-    /// peer as 한/영; other keys go as themselves.
+    /// Keys that are 한/영 or 한자 on this keyboard go to the peer as those: a Mac's input source
+    /// key (a Caps Lock remapped to F18), a Korean PC layout's right Ctrl (한자). The ⌘/Ctrl swap
+    /// doesn't turn 한자 into ⌘.
     #[test]
-    fn the_input_source_key_goes_as_hangul() {
+    fn the_keyboard_s_hangul_and_hanja_keys_go_as_those() {
         use rune::{PhysicalInput, PhysicalKeyCode as K};
         let key = |key, pressed| PhysicalInput::Key { key, mods: Default::default(), pressed, repeat: false };
         let mut ui = Ui::new(None, None);
         ui.open_pad([3; 32], "PC".into());
-        ui.pad.as_mut().unwrap().lang1 = vec![K::F18];
-        for e in [key(K::F18, true), key(K::F18, false), key(K::F19, true)] {
+        ui.pad.as_mut().unwrap().lang = vec![(K::F18, 0x90), (K::ControlRight, 0x91)];
+        for e in [key(K::F18, true), key(K::F18, false), key(K::ControlRight, true), key(K::ControlRight, false), key(K::F19, true)] {
             ui.pad_key(&e);
         }
-        assert_eq!(*ui.sent.borrow(), [Frame::KvmKey { hid: 0x90, down: true }, Frame::KvmKey { hid: 0x90, down: false }, Frame::KvmKey { hid: 0x6E, down: true }]);
+        let k = |hid, down| Frame::KvmKey { hid, down };
+        assert_eq!(*ui.sent.borrow(), [k(0x90, true), k(0x90, false), k(0x91, true), k(0x91, false), k(0x6E, true)]);
     }
 
     /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and
