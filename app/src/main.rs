@@ -325,7 +325,7 @@ impl Ui {
                 self.close_pad();
                 self.say("상대가 응답하지 않아 원격 조작을 멈췄어요", tx);
             }
-            Note::InputLost(_) => {}
+            Note::InputLost(_) | Note::Returned { .. } => {} // the pad sends no KvmEnter
             Note::Copied(paths) => {
                 let n = paths.len();
                 self.copied = paths.into_iter().filter(|p| p.is_file()).collect();

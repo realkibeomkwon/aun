@@ -504,12 +504,23 @@ fn a_stopped_send_resumes_where_it_stopped() {
     std::fs::remove_dir_all(dir("resume-host")).unwrap();
 }
 
+/// Records what it is given; its pointer moves on a 100 × 100 screen.
 #[derive(Clone, Default)]
-struct Rec(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+struct Rec(std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::sync::Arc<std::sync::Mutex<(f64, f64)>>);
+
+const SCREEN: aun_core::kvm::Bounds = aun_core::kvm::Bounds { x0: 0.0, y0: 0.0, x1: 100.0, y1: 100.0 };
 
 impl aun_core::kvm::Sink for Rec {
-    fn move_by(&mut self, dx: i32, dy: i32, held: u8) {
+    fn move_by(&mut self, dx: i32, dy: i32, held: u8, edge: Option<u8>) -> Option<u16> {
         self.0.lock().unwrap().push(format!("move {dx} {dy} held {held}"));
+        let mut p = self.1.lock().unwrap();
+        let out = edge.and_then(|side| aun_core::kvm::past(SCREEN, side, *p, dx.into(), dy.into()));
+        *p = ((p.0 + f64::from(dx)).clamp(0.0, 99.0), (p.1 + f64::from(dy)).clamp(0.0, 99.0));
+        out
+    }
+    fn enter(&mut self, side: u8, at: u16) {
+        *self.1.lock().unwrap() = aun_core::kvm::entry(SCREEN, side, at);
+        self.0.lock().unwrap().push(format!("enter {side} {at}"));
     }
     fn button(&mut self, b: u8, down: bool, _: u8) {
         self.0.lock().unwrap().push(format!("button {b} {}", if down { "down" } else { "up" }));
@@ -626,4 +637,25 @@ fn a_stalled_link_lets_go_of_held_input_and_tells_the_sender() {
     assert!(told < Duration::from_millis(900), "told after {told:?}");
     assert!(released < Duration::from_millis(1600), "let go after {released:?}");
     assert!(connected(&host, &guest), "let go for the silence, not a closed link");
+}
+
+/// A crossing goes over the link and back: the driven side starts the pointer at the edge it
+/// entered by, and pushing back out through it tells the driver where.
+#[test]
+fn a_crossing_comes_back_through_the_edge_it_entered_by() {
+    use aun_core::wire::Frame;
+    let (host, _hn) = node("cross-host", "Host");
+    let (guest, gn) = node("cross-guest", "Guest");
+    let rec = Rec::default();
+    let r = rec.clone();
+    host.set_sink(move || Box::new(r.clone()));
+    host.set_kvm(true);
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    assert!(guest.send_input(host.id(), Frame::KvmEnter { route: 9, side: 0, at: 0 }));
+    assert!(guest.send_input(host.id(), Frame::KvmMove { route: 9, mn: 1, cx: 20, cy: 30 }));
+    assert!(guest.send_input(host.id(), Frame::KvmMove { route: 9, mn: 2, cx: -1, cy: 30 }));
+    let back = std::iter::from_fn(|| gn.recv_timeout(Duration::from_secs(5)).ok()).find(|n| matches!(n, Note::Returned { .. }));
+    assert_eq!(back, Some(Note::Returned { id: host.id(), route: 9, at: (30.0f64 / 99.0 * 65535.0).round() as u16 }));
+    assert_eq!(*rec.0.lock().unwrap(), ["enter 0 0", "move 20 30 held 0", "move -21 0 held 0"]);
 }

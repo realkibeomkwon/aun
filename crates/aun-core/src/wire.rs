@@ -63,6 +63,12 @@ pub enum Frame {
     /// A key by where it is, not what it types: a USB HID usage (page 7). `down` again while
     /// held is the key repeating.
     KvmKey { hid: u16, down: bool },
+    /// The driver's pointer crossed over: put it at the `side` edge (0 left, 1 right, 2 top,
+    /// 3 bottom of the driven's screens: where the driver is), `at` along it (0..=65535). The
+    /// moves of `route` follow; pushing back out through that edge answers `KvmReturn`.
+    KvmEnter { route: u32, side: u8, at: u16 },
+    /// The driven's pointer went back out through the entry edge of `route`, `at` along it.
+    KvmReturn { route: u32, at: u16 },
 }
 
 fn bad(msg: &str) -> io::Error {
@@ -129,6 +135,8 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
         Frame::KvmWheel { dx, dy } => (b.push(14), b.extend_from_slice(&dx.to_be_bytes()), b.extend_from_slice(&dy.to_be_bytes())).2,
         Frame::KvmLeave => b.push(15),
         Frame::KvmKey { hid, down } => (b.push(16), b.extend_from_slice(&hid.to_be_bytes()), b.push(*down as u8)).2,
+        Frame::KvmEnter { route, side, at } => (b.push(17), b.extend_from_slice(&route.to_be_bytes()), b.push(*side), b.extend_from_slice(&at.to_be_bytes())).3,
+        Frame::KvmReturn { route, at } => (b.push(18), b.extend_from_slice(&route.to_be_bytes()), b.extend_from_slice(&at.to_be_bytes())).2,
         Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
     w.write_all(&(b.len() as u32).to_be_bytes())?;
@@ -197,6 +205,15 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
         15 => Frame::KvmLeave,
         16 => match b.get(1..4) {
             Some(&[h, l, down]) => Frame::KvmKey { hid: u16::from_be_bytes([h, l]), down: down == 1 },
+            _ => return Err(bad("short")),
+        },
+        17 => match b.get(5..8) {
+            Some(&[side @ 0..4, h, l]) => Frame::KvmEnter { route: u32_at(&b, 1)?, side, at: u16::from_be_bytes([h, l]) },
+            Some(_) => return Err(bad("side")),
+            None => return Err(bad("short")),
+        },
+        18 => match b.get(5..7) {
+            Some(&[h, l]) => Frame::KvmReturn { route: u32_at(&b, 1)?, at: u16::from_be_bytes([h, l]) },
             _ => return Err(bad("short")),
         },
         CLIP_IMAGE => {
@@ -332,6 +349,8 @@ mod tests {
         round(Frame::KvmLeave);
         round(Frame::KvmKey { hid: 0xE1, down: true });
         round(Frame::KvmKey { hid: 4, down: false });
+        round(Frame::KvmEnter { route: u32::MAX, side: 3, at: 0x8001 });
+        round(Frame::KvmReturn { route: 7, at: u16::MAX });
     }
 
     /// A build from before the cancel byte still talks to this one: its abort reads as a failure.
@@ -394,7 +413,7 @@ mod tests {
 
     #[test]
     fn hostile_frames_are_rejected_not_panicked() {
-        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff], &[0, 0, 0, 5, 11, 0, 0, 0, 7], &[0, 0, 0, 3, 13, 0, 1], &[0, 0, 0, 3, 16, 0, 4], &[0, 0, 0, 9, 12, 0, 0, 0, 1, 0, 0, 0, 1]] {
+        for b in [&[0, 0, 0, 0][..], &[0xff, 0xff, 0xff, 0xff], &[0, 0, 0, 1, 99], &[0, 0, 0, 3, 5, 0, 0], &[0, 0, 0, 2, 4, 0xff], &[0, 0, 0, 5, 11, 0, 0, 0, 7], &[0, 0, 0, 3, 13, 0, 1], &[0, 0, 0, 3, 16, 0, 4], &[0, 0, 0, 9, 12, 0, 0, 0, 1, 0, 0, 0, 1], &[0, 0, 0, 7, 17, 0, 0, 0, 1, 0, 0], &[0, 0, 0, 8, 17, 0, 0, 0, 1, 4, 0, 0], &[0, 0, 0, 6, 18, 0, 0, 0, 1, 0]] {
             assert!(read_frame(&mut &b[..]).is_err(), "{b:?}");
         }
     }

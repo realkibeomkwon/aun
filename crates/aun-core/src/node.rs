@@ -66,6 +66,9 @@ pub enum Note {
     /// Input sent to this peer got no word back for [`DRIVER_LOST`]: stop driving it. Told once;
     /// the next input sent starts over.
     InputLost(Id),
+    /// The pointer of a crossing to this peer came back out through the edge it entered by,
+    /// `at` along it (`Frame::KvmReturn`).
+    Returned { id: Id, route: u32, at: u16 },
     /// A file going out or coming in. `path` is the source, or where an incoming file lands.
     /// `cancelled` (with `failed`) when either side called it off. `peer_id` is who it is with,
     /// to send it again.
@@ -106,7 +109,7 @@ fn queue() -> (Tx, Receiver<Option<Frame>>, Receiver<Frame>) {
 
 impl Tx {
     fn is_fast(f: &Frame) -> bool {
-        matches!(f, Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::Ping | Frame::FileFrom { .. } | Frame::FileCancel { .. })
+        matches!(f, Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. } | Frame::KvmReturn { .. } | Frame::Ping | Frame::FileFrom { .. } | Frame::FileCancel { .. })
     }
 
     /// Waits for room; Err once the link is gone.
@@ -933,7 +936,7 @@ impl Node {
             let f = wire::read_frame(r)?;
             *live.heard.lock().unwrap() = Instant::now();
             match f {
-                f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. }) => {
+                f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. }) => {
                     // Driven, this side answers every BEAT: the writer may be asleep for 10 s.
                     let on = !matches!(f, Frame::KvmLeave);
                     if live.driven.swap(on, Ordering::Relaxed) != on {
@@ -952,10 +955,13 @@ impl Node {
                                 (self.0.notify)(Note::Info("macOS 권한이 없어 Return, Delete 같은 키가 들어가지 않을 수 있어요. 개인정보 보호 및 보안에서 Aun을 지웠다가 다시 추가하세요".into()));
                             }
                         }
-                        input.apply(f);
+                        if let Some(back) = input.apply(f) {
+                            let _ = files.tx.try_send(back);
+                        }
                     }
                 }
                 Frame::Ping => {}
+                Frame::KvmReturn { route, at } => (self.0.notify)(Note::Returned { id: files.remote, route, at }),
                 Frame::Clip(text) if text.len() <= clip::MAX_TEXT => self.to_clipboard(clip::Content::Text(text)),
                 Frame::Clip(_) => {}
                 Frame::ClipImage(png) => self.to_clipboard(clip::Content::Png(png)),

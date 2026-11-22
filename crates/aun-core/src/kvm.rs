@@ -125,10 +125,51 @@ fn input_sources(entries: [Option<(bool, i64, i64)>; 2]) -> [Option<(u16, u64)>;
     out
 }
 
+/// The box around every screen, in pixels: `x0`, `y0` on it, `x1`, `y1` just past it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bounds {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+}
+
+/// `v` from `a` to the last pixel before `b`, as 0..=65535.
+fn frac(v: f64, a: f64, b: f64) -> u16 {
+    ((v - a) / (b - a - 1.0).max(1.0)).clamp(0.0, 1.0).mul_add(65535.0, 0.5) as u16
+}
+
+/// Where a pointer entering by `side`'s edge (as in `KvmEnter`) at `at` along it starts: on
+/// the edge's own pixels, so the first push back out leaves again.
+pub fn entry(b: Bounds, side: u8, at: u16) -> (f64, f64) {
+    let along = |a: f64, z: f64| (a + f64::from(at) / 65535.0 * (z - a - 1.0)).round();
+    match side {
+        0 => (b.x0, along(b.y0, b.y1)),
+        1 => (b.x1 - 1.0, along(b.y0, b.y1)),
+        2 => (along(b.x0, b.x1), b.y0),
+        _ => (along(b.x0, b.x1), b.y1 - 1.0),
+    }
+}
+
+/// Where along `side`'s edge a pointer at `p` moving by `(dx, dy)` goes out past it, if it does.
+pub fn past(b: Bounds, side: u8, p: (f64, f64), dx: f64, dy: f64) -> Option<u16> {
+    let (x, y) = (p.0 + dx, p.1 + dy);
+    let out = match side {
+        0 => x < b.x0,
+        1 => x >= b.x1,
+        2 => y < b.y0,
+        _ => y >= b.y1,
+    };
+    out.then(|| if side < 2 { frac(p.1, b.y0, b.y1) } else { frac(p.0, b.x0, b.x1) })
+}
+
 /// Where input lands: the OS, or a recorder in tests.
 pub trait Sink {
-    /// Moves the pointer by pixels; `held` has bit `b` set for each button `b` down.
-    fn move_by(&mut self, dx: i32, dy: i32, held: u8);
+    /// Moves the pointer by pixels; `held` has bit `b` set for each button `b` down. With an
+    /// `edge` (a side, as in `KvmEnter`), a move out past it says where along it ([`past`]).
+    fn move_by(&mut self, dx: i32, dy: i32, held: u8, edge: Option<u8>) -> Option<u16>;
+    /// Puts the pointer where one entering by `side` at `at` starts ([`entry`]).
+    fn enter(&mut self, side: u8, at: u16);
     fn button(&mut self, button: u8, down: bool, clicks: u8);
     fn wheel(&mut self, dx: i32, dy: i32);
     /// `hid`: see [`hid`]. A down while held is a repeat.
@@ -136,8 +177,11 @@ pub trait Sink {
 }
 
 impl<S: Sink + ?Sized> Sink for Box<S> {
-    fn move_by(&mut self, dx: i32, dy: i32, held: u8) {
-        (**self).move_by(dx, dy, held)
+    fn move_by(&mut self, dx: i32, dy: i32, held: u8, edge: Option<u8>) -> Option<u16> {
+        (**self).move_by(dx, dy, held, edge)
+    }
+    fn enter(&mut self, side: u8, at: u16) {
+        (**self).enter(side, at)
     }
     fn button(&mut self, button: u8, down: bool, clicks: u8) {
         (**self).button(button, down, clicks)
@@ -158,27 +202,40 @@ pub struct Injector<S: Sink> {
     held: u8,
     /// In the order pressed.
     keys: Vec<u16>,
+    /// The edge the pointer of a crossing came in by (`KvmEnter`): out through it, it goes back.
+    edge: Option<u8>,
 }
 
 impl<S: Sink> Injector<S> {
     pub fn new(sink: S) -> Self {
-        Injector { sink, last: None, held: 0, keys: Vec::new() }
+        Injector { sink, last: None, held: 0, keys: Vec::new(), edge: None }
     }
 
-    pub fn apply(&mut self, f: Frame) {
+    /// Applies one frame from the driver; returns the answer to send it back, if any (a
+    /// `KvmReturn` once the pointer goes back out through the edge it came in by).
+    pub fn apply(&mut self, f: Frame) -> Option<Frame> {
         match f {
+            Frame::KvmEnter { route: _, side, at } => {
+                // A move numbered 1 of this route starts from here, as any new route's does.
+                self.last = None;
+                self.edge = Some(side);
+                self.sink.enter(side, at);
+            }
             Frame::KvmMove { route, mn, cx, cy } => {
                 let from = match self.last {
-                    Some((r, m, _, _)) if r == route && mn <= m => return,
+                    Some((r, m, _, _)) if r == route && mn <= m => return None,
                     Some((r, _, px, py)) if r == route => Some((px, py)),
                     // Joined midway (a replaced link, control allowed late): a baseline only.
                     _ => (mn == 1).then_some((0, 0)),
                 };
                 self.last = Some((route, mn, cx, cy));
-                let Some((px, py)) = from else { return };
+                let (px, py) = from?;
                 let (dx, dy) = (cx.wrapping_sub(px), cy.wrapping_sub(py));
-                if dx != 0 || dy != 0 {
-                    self.sink.move_by(dx, dy, self.held);
+                if (dx != 0 || dy != 0)
+                    && let Some(at) = self.sink.move_by(dx, dy, self.held, self.edge)
+                {
+                    self.edge = None; // once: the driver ends the route with KvmLeave
+                    return Some(Frame::KvmReturn { route, at });
                 }
             }
             Frame::KvmButton { button, down, clicks } if button < 3 => {
@@ -186,7 +243,7 @@ impl<S: Sink> Injector<S> {
                 // An up for a button not held (or a second down) changes nothing on the OS's side
                 // either way; sending it could end a press made at this device's own mouse.
                 if down == (self.held & bit != 0) {
-                    return;
+                    return None;
                 }
                 self.held ^= bit;
                 self.sink.button(button, down, clicks.max(1));
@@ -198,16 +255,17 @@ impl<S: Sink> Injector<S> {
                 match (down, at) {
                     (true, None) => self.keys.push(hid),
                     // 한/영 and 한자 switch on each down (a Mac presses a shortcut for them).
-                    (true, Some(_)) if matches!(hid, 0x90 | 0x91) => return,
+                    (true, Some(_)) if matches!(hid, 0x90 | 0x91) => return None,
                     (true, Some(_)) => {} // a repeat: the OS doesn't repeat injected keys itself
                     // Not held here: an up could end a press at this device's own keyboard.
-                    (false, None) => return,
+                    (false, None) => return None,
                     (false, Some(i)) => drop(self.keys.remove(i)),
                 }
                 self.sink.key(hid, down);
             }
             _ => {}
         }
+        None
     }
 
     /// Lets go of every key and button held down here, keys last pressed first.
@@ -222,6 +280,7 @@ impl<S: Sink> Injector<S> {
         }
         self.held = 0;
         self.last = None;
+        self.edge = None;
     }
 }
 
@@ -254,7 +313,7 @@ pub fn allowed(prompt: bool) -> bool {
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use super::{Os, Sink};
+    use super::{Bounds, Os, Sink};
     use std::ffi::c_void;
 
     #[repr(C)]
@@ -395,24 +454,29 @@ mod mac {
         }
     }
 
-    /// The bounding box of every active display.
+    /// The bounding box of every active display, in global display points.
     /// shortcut: a box, so a point in the gap beside a shorter display passes; the window server
-    /// keeps the pointer on a screen anyway. Use the screens themselves if that shows up.
-    fn clamp(p: Point) -> Point {
+    /// keeps the pointer on a screen anyway. Use the screens themselves with several displays.
+    pub fn bounds() -> Option<Bounds> {
         let mut ids = [0u32; 16];
         let mut n = 0;
         // SAFETY: `ids` holds 16 entries, the most asked for.
         if unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } != 0 || n == 0 {
-            return p;
+            return None;
         }
-        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        let mut b = Bounds { x0: f64::MAX, y0: f64::MAX, x1: f64::MIN, y1: f64::MIN };
         for &d in &ids[..n as usize] {
             // SAFETY: `d` came from the display list.
             let r = unsafe { CGDisplayBounds(d) };
-            (x0, y0) = (x0.min(r.origin.x), y0.min(r.origin.y));
-            (x1, y1) = (x1.max(r.origin.x + r.size.x - 1.0), y1.max(r.origin.y + r.size.y - 1.0));
+            (b.x0, b.y0) = (b.x0.min(r.origin.x), b.y0.min(r.origin.y));
+            (b.x1, b.y1) = (b.x1.max(r.origin.x + r.size.x), b.y1.max(r.origin.y + r.size.y));
         }
-        Point { x: p.x.clamp(x0, x1), y: p.y.clamp(y0, y1) }
+        Some(b)
+    }
+
+    fn clamp(p: Point, b: Option<Bounds>) -> Point {
+        let Some(b) = b else { return p };
+        Point { x: p.x.clamp(b.x0, b.x1 - 1.0), y: p.y.clamp(b.y0, b.y1 - 1.0) }
     }
 
     impl Os {
@@ -459,10 +523,8 @@ mod mac {
         }
     }
 
-    impl Sink for Os {
-        fn move_by(&mut self, dx: i32, dy: i32, held: u8) {
-            let p = location();
-            let to = clamp(Point { x: p.x + dx as f64, y: p.y + dy as f64 });
+    impl Os {
+        fn move_to(&self, to: Point, dx: i32, dy: i32, held: u8) {
             // Held, it is a drag of the lowest button held: apps track drags by that event type.
             let (kind, button) = match (0..3).find(|b| held & (1 << b) != 0) {
                 Some(b) => (DRAGGED[b], b as u32),
@@ -478,6 +540,21 @@ mod mac {
                 }
                 self.post(e);
             }
+        }
+    }
+
+    impl Sink for Os {
+        fn move_by(&mut self, dx: i32, dy: i32, held: u8, edge: Option<u8>) -> Option<u16> {
+            let (p, b) = (location(), bounds());
+            let out = edge.zip(b).and_then(|(side, b)| super::past(b, side, (p.x, p.y), dx.into(), dy.into()));
+            self.move_to(clamp(Point { x: p.x + dx as f64, y: p.y + dy as f64 }, b), dx, dy, held);
+            out
+        }
+
+        fn enter(&mut self, side: u8, at: u16) {
+            let Some(b) = bounds() else { return };
+            let (x, y) = super::entry(b, side, at);
+            self.move_to(Point { x, y }, 0, 0, 0);
         }
 
         fn button(&mut self, button: u8, down: bool, clicks: u8) {
@@ -553,7 +630,7 @@ mod mac {
 
 #[cfg(windows)]
 mod win {
-    use super::{KeyCode, Os, Sink};
+    use super::{Bounds, KeyCode, Os, Sink};
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -594,20 +671,36 @@ mod win {
             .collect()
     }
 
+    /// The virtual screen: the box around every monitor, in pixels.
+    pub fn bounds() -> Bounds {
+        // SAFETY: plain reads of the virtual screen.
+        let (x0, y0, w, h) = unsafe { (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2), GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2)) };
+        Bounds { x0: x0.into(), y0: y0.into(), x1: (x0 + w).into(), y1: (y0 + h).into() }
+    }
+
+    /// Puts the pointer at `(x, y)`, kept on the virtual screen `b`. Absolute, so the system's
+    /// pointer acceleration isn't applied a second time.
+    fn move_to(b: Bounds, x: f64, y: f64) {
+        let (x, y) = (x.clamp(b.x0, b.x1 - 1.0), y.clamp(b.y0, b.y1 - 1.0));
+        let nx = ((x - b.x0) * 65535.0 / (b.x1 - b.x0 - 1.0)) as i32;
+        let ny = ((y - b.y0) * 65535.0 / (b.y1 - b.y0 - 1.0)) as i32;
+        send(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0);
+    }
+
     impl Sink for Os {
-        fn move_by(&mut self, dx: i32, dy: i32, _held: u8) {
+        fn move_by(&mut self, dx: i32, dy: i32, _held: u8, edge: Option<u8>) -> Option<u16> {
             let mut p = POINT { x: 0, y: 0 };
-            // SAFETY: plain reads of the cursor and the virtual screen.
-            let (x0, y0, w, h) = unsafe {
-                GetCursorPos(&mut p);
-                (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2), GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2))
-            };
-            // Absolute, so the system's pointer acceleration isn't applied a second time.
-            let x = p.x.saturating_add(dx).clamp(x0, x0 + w - 1);
-            let y = p.y.saturating_add(dy).clamp(y0, y0 + h - 1);
-            let nx = ((x - x0) as i64 * 65535 / (w - 1) as i64) as i32;
-            let ny = ((y - y0) as i64 * 65535 / (h - 1) as i64) as i32;
-            send(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0);
+            // SAFETY: a plain read of the cursor.
+            unsafe { GetCursorPos(&mut p) };
+            let (b, p) = (bounds(), (f64::from(p.x), f64::from(p.y)));
+            move_to(b, p.0 + f64::from(dx), p.1 + f64::from(dy));
+            edge.and_then(|side| super::past(b, side, p, dx.into(), dy.into()))
+        }
+
+        fn enter(&mut self, side: u8, at: u16) {
+            let b = bounds();
+            let (x, y) = super::entry(b, side, at);
+            move_to(b, x, y);
         }
 
         fn button(&mut self, button: u8, down: bool, _clicks: u8) {
@@ -684,7 +777,10 @@ mod win {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 impl Sink for Os {
-    fn move_by(&mut self, _: i32, _: i32, _: u8) {}
+    fn move_by(&mut self, _: i32, _: i32, _: u8, _: Option<u8>) -> Option<u16> {
+        None
+    }
+    fn enter(&mut self, _: u8, _: u16) {}
     fn button(&mut self, _: u8, _: bool, _: u8) {}
     fn wheel(&mut self, _: i32, _: i32) {}
     fn key(&mut self, _: u16, _: bool) {}
@@ -695,12 +791,24 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    /// Records what it is given; its pointer moves on a 100 × 100 screen.
     #[derive(Clone, Default)]
-    pub struct Rec(pub Arc<Mutex<Vec<String>>>);
+    pub struct Rec(pub Arc<Mutex<Vec<String>>>, Arc<Mutex<(f64, f64)>>);
+
+    pub const SCREEN: Bounds = Bounds { x0: 0.0, y0: 0.0, x1: 100.0, y1: 100.0 };
 
     impl Sink for Rec {
-        fn move_by(&mut self, dx: i32, dy: i32, held: u8) {
+        fn move_by(&mut self, dx: i32, dy: i32, held: u8, edge: Option<u8>) -> Option<u16> {
             self.0.lock().unwrap().push(format!("move {dx} {dy} held {held}"));
+            let mut p = self.1.lock().unwrap();
+            let out = edge.and_then(|side| past(SCREEN, side, *p, dx.into(), dy.into()));
+            *p = ((p.0 + f64::from(dx)).clamp(0.0, 99.0), (p.1 + f64::from(dy)).clamp(0.0, 99.0));
+            out
+        }
+        fn enter(&mut self, side: u8, at: u16) {
+            let p = entry(SCREEN, side, at);
+            *self.1.lock().unwrap() = p;
+            self.0.lock().unwrap().push(format!("enter at {},{}", p.0, p.1));
         }
         fn button(&mut self, b: u8, down: bool, clicks: u8) {
             self.0.lock().unwrap().push(format!("button {b} {} x{clicks}", if down { "down" } else { "up" }));
@@ -789,6 +897,43 @@ pub(crate) mod tests {
             "key 0xe1 down", "key 0x4 down", "key 0x4 down", "key 0x4 up", "key 0x5 down", "button 0 down x1",
             "key 0x5 up", "key 0xe1 up", "button 0 up x1", "key 0xe0 down", "key 0xe0 up",
         ]);
+    }
+
+    #[test]
+    fn the_entry_point_is_on_the_edge_and_one_push_out_leaves_where_it_came_in() {
+        let b = Bounds { x0: -1920.0, y0: 0.0, x1: 0.0, y1: 1080.0 };
+        assert_eq!(entry(b, 0, 0), (-1920.0, 0.0));
+        assert_eq!(entry(b, 1, 65535), (-1.0, 1079.0));
+        assert_eq!(entry(b, 3, 32768), (-960.0, 1079.0));
+        for (side, at) in [(0, 0), (1, 12345), (2, 65535), (3, 40000)] {
+            let p = entry(b, side, at);
+            let (dx, dy) = [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)][side as usize];
+            let back = past(b, side, p, dx, dy).expect("one pixel out leaves");
+            assert!(back.abs_diff(at) < 65535 / 1000, "side {side}: in at {at}, out at {back}");
+            assert_eq!(past(b, side, p, -dx, -dy), None, "a move inward stays");
+            assert_eq!(past(b, side, p, dy, dx), None, "a move along the edge stays");
+        }
+        // The other edges are no way back.
+        assert_eq!(past(b, 0, (-1.0, 500.0), 5.0, 0.0), None);
+    }
+
+    /// A crossing starts at the edge it entered by, moves from there, and going back out through
+    /// it answers once with where; moving out through another edge doesn't.
+    #[test]
+    fn a_crossing_returns_once_through_the_edge_it_came_in_by() {
+        let rec = Rec::default();
+        let mut inj = Injector::new(rec.clone());
+        assert_eq!(inj.apply(Frame::KvmEnter { route: 5, side: 0, at: 65535 / 2 }), None);
+        assert_eq!(inj.apply(mv(5, 1, 30, 0)), None);
+        assert_eq!(inj.apply(mv(5, 2, 300, 0)), None, "out through the right edge: no way back");
+        assert_eq!(inj.apply(mv(5, 3, 330, 40)), None);
+        assert_eq!(inj.apply(mv(5, 4, 231, 40)), None, "back to x 0 (from 99: the right edge held it)");
+        assert_eq!(inj.apply(mv(5, 5, 228, 40)), Some(Frame::KvmReturn { route: 5, at: frac(89.0, 0.0, 100.0) }));
+        assert_eq!(inj.apply(mv(5, 6, 220, 40)), None, "answered once");
+        assert_eq!(rec.0.lock().unwrap()[0], "enter at 0,49");
+        // The pad's route has no entry edge: never answers.
+        inj.apply(Frame::KvmLeave);
+        assert_eq!(inj.apply(mv(6, 1, -500, 0)), None);
     }
 
     fn mv(route: u32, mn: u32, cx: i32, cy: i32) -> Frame {
