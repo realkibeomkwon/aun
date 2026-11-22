@@ -109,6 +109,9 @@ struct State {
     /// The screens' box as last read, as `f64` bits: read again when the pointer seems past it.
     bounds: [AtomicU64; 4],
     tap: AtomicPtr<c_void>,
+    /// The input source shortcuts, as wire key and modifiers ([`kvm::input_source_keys`]): sent
+    /// as 한/영. Read once as the tap starts.
+    lang: Vec<(u16, u64)>,
     /// Why the last crossing ended ([`Why`]), for the sender's log.
     why: AtomicU8,
     /// Where the cursor went out, kept there while across (see the move case in [`tap`]).
@@ -272,6 +275,14 @@ extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
                 st.end(None, Why::ESCAPE);
                 return std::ptr::null_mut();
             }
+            // The input source shortcut (this Mac: Caps Lock made F18) is 한/영 over there, sent
+            // on the way down; its up goes nowhere. Swallowed, this Mac's own source stays.
+            if kvm::is_input_source_key(hid, flags, &st.lang) {
+                if kind == KEY_DOWN && st.send(Captured::Key(0x90, true)) {
+                    st.send(Captured::Key(0x90, false));
+                }
+                return std::ptr::null_mut();
+            }
             Captured::Key(hid, kind == KEY_DOWN)
         }
         FLAGS_CHANGED => {
@@ -327,6 +338,7 @@ impl Cross {
             bounds: [b.x0, b.y0, b.x1, b.y1].map(|v| AtomicU64::new(v.to_bits())),
             tap: AtomicPtr::new(std::ptr::null_mut()),
             why: AtomicU8::new(Why::STOPPED),
+            lang: kvm::input_source_keys(),
             lock: [AtomicU64::new(0), AtomicU64::new(0)],
         });
         let (made_tx, made) = mpsc::sync_channel(1);

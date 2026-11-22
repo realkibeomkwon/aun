@@ -165,6 +165,20 @@ pub fn lang_keys() -> Vec<(KeyCode, u16)> {
 /// its modifier flags (Shift `0x20000`, Control `0x40000`, Option `0x80000`, ⌘ `0x100000`).
 /// Unlike a bare F-key, such a key reaches the app as well as switching the source (Space after
 /// Control, checked 2026-11-22). Elsewhere none.
+/// macOS: every input source shortcut on, as a wire key and the modifier flags it takes (0 for
+/// none, as this Mac's F18): what a capture sends as 한/영. Unlike [`input_source_combos`], which
+/// leaves out the ones the system keeps from apps, the capture tap sees those too.
+#[cfg(target_os = "macos")]
+pub fn input_source_keys() -> Vec<(u16, u64)> {
+    mac::input_sources().into_iter().flatten().filter_map(|(code, flags)| Some((hid_of(code.into())?, flags & 0x1E_0000))).collect()
+}
+
+/// Whether wire key `hid`, with modifier flags `flags` (macOS `kCGEventFlagMask*`) held, is one
+/// of `keys` ([`input_source_keys`]).
+pub fn is_input_source_key(hid: u16, flags: u64, keys: &[(u16, u64)]) -> bool {
+    keys.iter().any(|&(h, m)| h == hid && flags & 0x1E_0000 == m)
+}
+
 pub fn input_source_combos() -> Vec<(KeyCode, u64)> {
     #[cfg(target_os = "macos")]
     return mac::input_sources()
@@ -1186,6 +1200,18 @@ pub(crate) mod tests {
         // The pad's route has no entry edge: never answers.
         inj.apply(Frame::KvmLeave);
         assert_eq!(inj.apply(mv(6, 1, -500, 0)), None);
+    }
+
+    /// Caps Lock made F18 (no modifiers) and ⌃Space are input source keys only as set: F18 with
+    /// its function flag still is, ⌃⌥Space and a plain Space aren't.
+    #[test]
+    fn input_source_keys_match_by_key_and_modifiers() {
+        let keys = [(0x6D, 0), (0x2C, 0x4_0000)];
+        assert!(is_input_source_key(0x6D, 0x80_0100, &keys), "F18, function and rest flags aside");
+        assert!(is_input_source_key(0x2C, 0x4_0001, &keys), "⌃Space");
+        assert!(!is_input_source_key(0x2C, 0xC_0000, &keys), "⌃⌥Space");
+        assert!(!is_input_source_key(0x2C, 0, &keys), "Space");
+        assert!(!is_input_source_key(0x6D, 0x2_0000, &keys), "⇧F18");
     }
 
     #[test]
