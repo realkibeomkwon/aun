@@ -25,7 +25,9 @@ const CLIP_IMAGE: u8 = 9;
 pub const FILE_CHUNK: usize = 256 << 10;
 /// The `Kvm*` frames this build speaks, sent in `Hello`. Peers use them only when both say the
 /// same version (0, as an older build reads: none); a change to their layout bumps it.
-pub const KVM: u8 = 2;
+/// 3: each side writes every 250 ms while input goes either way (`node::BEAT`); an older
+/// peer's silence would read as a stalled link.
+pub const KVM: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {

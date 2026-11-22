@@ -30,6 +30,13 @@ use crate::{clip, discovery};
 pub const PORT: u16 = 47810;
 const PING: Duration = Duration::from_secs(10);
 const DEAD: Duration = Duration::from_secs(35);
+/// While input goes either way on a link, each side writes at least this often (a `Ping` when
+/// idle), so the other can tell a stalled link from a quiet one (docs/kvm-design.md 7).
+const BEAT: Duration = Duration::from_millis(250);
+/// Silence from the receiving side after which the sending side stops driving it.
+const DRIVER_LOST: Duration = Duration::from_millis(500);
+/// Silence from the sending side after which the receiving side lets go of what it holds.
+const DRIVEN_LOST: Duration = Duration::from_secs(1);
 const CODE_TRIES: u32 = 3;
 const STACK: usize = 256 << 10;
 /// How often paired devices at a typed address are redialled, and a wake from sleep looked for.
@@ -56,6 +63,9 @@ pub enum Note {
     /// Peers, links or the pairing code changed: read `peers()` / `code()` again.
     Changed,
     Info(String),
+    /// Input sent to this peer got no word back for [`DRIVER_LOST`]: stop driving it. Told once;
+    /// the next input sent starts over.
+    InputLost(Id),
     /// A file going out or coming in. `path` is the source, or where an incoming file lands.
     /// `cancelled` (with `failed`) when either side called it off. `peer_id` is who it is with,
     /// to send it again.
@@ -122,10 +132,47 @@ impl Tx {
     }
 }
 
+/// What a link's reader and writer share to keep input from sticking (docs/kvm-design.md 7).
+struct Live {
+    /// When the last frame came in.
+    heard: Mutex<Instant>,
+    input: Mutex<Injector<Box<dyn Sink + Send>>>,
+    /// Since when this side has been sending input (until its `KvmLeave`).
+    driving: Mutex<Option<Instant>>,
+    /// The peer has been sending input: from its first input frame to its `KvmLeave`.
+    driven: AtomicBool,
+}
+
+impl Live {
+    fn new(sink: Box<dyn Sink + Send>) -> Self {
+        Live { heard: Mutex::new(Instant::now()), input: Mutex::new(Injector::new(sink)), driving: Mutex::new(None), driven: AtomicBool::new(false) }
+    }
+
+    /// Acts on silence from the peer, and says how long the writer may wait for a frame.
+    fn check(&self, peer: &str, lost: &dyn Fn()) -> Duration {
+        let heard = self.heard.lock().unwrap().elapsed();
+        let mut driving = self.driving.lock().unwrap();
+        // Counted from the first input too: the peer pinged only every 10 s before it.
+        if driving.is_some_and(|since| heard.min(since.elapsed()) > DRIVER_LOST) {
+            *driving = None;
+            crate::log(format_args!("input to {peer}: no word back for {} ms, stopped", heard.as_millis()));
+            lost();
+        }
+        let driven = self.driven.load(Ordering::Relaxed);
+        if driven && heard > DRIVEN_LOST {
+            self.driven.store(false, Ordering::Relaxed);
+            self.input.lock().unwrap().release();
+            crate::log(format_args!("input from {peer}: silent for {} ms, let go of what it held", heard.as_millis()));
+        }
+        if driving.is_some() || self.driven.load(Ordering::Relaxed) { BEAT } else { PING }
+    }
+}
+
 struct Link {
     conn: u64,
     initiator: Id,
     tx: Tx,
+    live: Arc<Live>,
     sock: TcpStream,
     /// The peer's build can say where a stopped file goes on from.
     resume: bool,
@@ -378,7 +425,11 @@ impl Node {
     /// (the socket stalled): the next move carries the total. A button, a key or a leave waits
     /// for room, up to a moment.
     pub fn send_input(&self, id: Id, f: Frame) -> bool {
-        let Some(tx) = self.st().peers.get(&id).and_then(|p| p.link.as_ref()).filter(|l| l.kvm).map(|l| l.tx.clone()) else { return false };
+        let Some((tx, live)) = self.st().peers.get(&id).and_then(|p| p.link.as_ref()).filter(|l| l.kvm).map(|l| (l.tx.clone(), l.live.clone())) else { return false };
+        {
+            let mut driving = live.driving.lock().unwrap();
+            *driving = if matches!(f, Frame::KvmLeave) { None } else { Some(driving.unwrap_or_else(Instant::now)) };
+        }
         let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. });
         let end = Instant::now() + Duration::from_millis(250);
         let mut f = f;
@@ -806,12 +857,14 @@ impl Node {
 
         // Authenticated. Register, then run the writer on its own thread and read here.
         let (tx, fast, bulk) = queue();
+        let make = self.0.sink.lock().unwrap().clone();
+        let live = Arc::new(Live::new(make()));
         let (conn, dup) = {
             let mut st = self.st();
             st.next += 1;
             let conn = st.next;
             let initiator_id = if initiator { self.0.id } else { remote };
-            let link = Link { conn, initiator: initiator_id, tx: tx.clone(), sock: sock.try_clone()?, resume, kvm: kvm == wire::KVM };
+            let link = Link { conn, initiator: initiator_id, tx: tx.clone(), live: live.clone(), sock: sock.try_clone()?, resume, kvm: kvm == wire::KVM };
             let p = st.peers.entry(remote).or_default();
             p.name = name.clone();
             p.paired |= just_paired;
@@ -849,14 +902,13 @@ impl Node {
         self.wake_clip();
         let up = Instant::now();
         let wsock = sock.try_clone()?;
-        spawn("aun-write", move || writer(w, fast, bulk, wsock));
+        let (node, wlive, wname) = (self.clone(), live.clone(), name.clone());
+        spawn("aun-write", move || writer(w, fast, bulk, wsock, &wlive, &wname, &|| (node.0.notify)(Note::InputLost(remote))));
 
         let mut rx_files = Incoming::new(self, name.clone(), remote, tx);
-        let make = self.0.sink.lock().unwrap().clone();
-        let mut input = Injector::new(make());
-        let res = self.read_loop(&mut r, &mut rx_files, &mut input);
+        let res = self.read_loop(&mut r, &mut rx_files, &live);
         // Before anything else: a button the peer held stays down until this.
-        input.release();
+        live.input.lock().unwrap().release();
         rx_files.keep_all();
         let _ = sock.shutdown(std::net::Shutdown::Both);
         {
@@ -874,12 +926,20 @@ impl Node {
         Ok(())
     }
 
-    fn read_loop(&self, r: &mut impl Read, files: &mut Incoming, input: &mut Injector<Box<dyn Sink + Send>>) -> io::Result<()> {
+    fn read_loop(&self, r: &mut impl Read, files: &mut Incoming, live: &Live) -> io::Result<()> {
         let mut told = false;
         loop {
             files.tell_cancels();
-            match wire::read_frame(r)? {
+            let f = wire::read_frame(r)?;
+            *live.heard.lock().unwrap() = Instant::now();
+            match f {
                 f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. }) => {
+                    // Driven, this side answers every BEAT: the writer may be asleep for 10 s.
+                    let on = !matches!(f, Frame::KvmLeave);
+                    if live.driven.swap(on, Ordering::Relaxed) != on {
+                        let _ = files.tx.fast.try_send(None);
+                    }
+                    let mut input = live.input.lock().unwrap();
                     if !self.kvm() {
                         input.release();
                     } else {
@@ -974,11 +1034,13 @@ fn handshake(sock: &TcpStream, key: &[u8], initiator: bool) -> io::Result<(State
 
 /// Writes queued frames, every fast one ahead of the next bulk one (see [`Tx`]). Flushes when
 /// the queues run dry so small frames share one Noise message, and after fast frames written
-/// between bulk ones so they don't sit in the buffer behind the next chunk.
-fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Receiver<Frame>, sock: TcpStream) {
+/// between bulk ones so they don't sit in the buffer behind the next chunk. Wakes every [`BEAT`]
+/// while input goes either way, to answer and to watch for silence ([`Live::check`]).
+fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Receiver<Frame>, sock: TcpStream, live: &Live, peer: &str, lost: &dyn Fn()) {
     let res = (|| -> io::Result<()> {
         loop {
-            match fast.recv_timeout(PING) {
+            let wait = live.check(peer, lost);
+            match fast.recv_timeout(wait) {
                 Ok(Some(f)) => wire::write_frame(&mut w, &f)?,
                 Ok(None) => {}
                 Err(RecvTimeoutError::Timeout) => wire::write_frame(&mut w, &Frame::Ping)?,
@@ -1254,6 +1316,10 @@ mod tests {
         assert!(slept(s(65), s(5)), "a minute asleep");
     }
 
+    fn idle() -> Live {
+        Live::new(Box::new(kvm::tests::Rec::default()))
+    }
+
     #[test]
     fn the_writer_flushes_the_last_frame_of_a_burst() {
         let (ti, tr) = transports();
@@ -1264,7 +1330,7 @@ mod tests {
         tx.send(Frame::Clip("a".into())).unwrap();
         tx.send(Frame::Clip("b".into())).unwrap();
         let w = SealWriter::new(Arc::new(ti), out.try_clone().unwrap());
-        thread::spawn(move || writer(w, fast, bulk, out));
+        thread::spawn(move || writer(w, fast, bulk, out, &idle(), "peer", &|| {}));
         inp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut r = OpenReader::new(Arc::new(tr), inp);
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::Clip("a".into()));
@@ -1286,7 +1352,7 @@ mod tests {
         // Queued while the file lane is full, as a key pressed mid-transfer is.
         tx.try_send(Frame::KvmKey { hid: 4, down: true }).unwrap();
         let w = SealWriter::new(Arc::new(ti), out.try_clone().unwrap());
-        thread::spawn(move || writer(w, fast, bulk, out));
+        thread::spawn(move || writer(w, fast, bulk, out, &idle(), "peer", &|| {}));
         inp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut r = OpenReader::new(Arc::new(tr), inp);
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::KvmKey { hid: 4, down: true });

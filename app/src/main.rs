@@ -320,6 +320,12 @@ impl Ui {
                 self.say(m, tx);
                 self.refresh();
             }
+            // Nothing held here, but the peer may be gone mid-drag: stop, and say why.
+            Note::InputLost(id) if self.pad.as_ref().is_some_and(|p| p.id == id) => {
+                self.close_pad();
+                self.say("상대가 응답하지 않아 원격 조작을 멈췄어요", tx);
+            }
+            Note::InputLost(_) => {}
             Note::Copied(paths) => {
                 let n = paths.len();
                 self.copied = paths.into_iter().filter(|p| p.is_file()).collect();
@@ -1470,6 +1476,23 @@ mod tests {
         let short = rt.presented("message").unwrap().0;
         // presented: [x, y, width, height]. Cut to one line, the long one is no taller.
         assert!(long[3] > short[3] * 1.5, "the long message wraps onto more lines: {long:?} vs {short:?}");
+    }
+
+    /// The node saying the driven peer went silent closes that peer's pad (letting go there) and
+    /// says why; the same note about another peer leaves the pad open.
+    #[test]
+    fn a_silent_peer_closes_its_pad() {
+        let mut ui = Ui::new(None, None);
+        ui.peers = vec![PeerView { id: [3; 32], name: "PC".into(), addr: None, paired: true, nearby: true, connected: true, kvm: true }];
+        ui.open_pad([3; 32], "PC".into());
+        let mut rt = Runtime::new(ui, view, (480.0, 760.0), Env { system_dark: false, scale: 2.0 });
+        rt.frame(0.0);
+        rt.update(|s, tx| s.apply(Note::InputLost([4; 32]), tx));
+        assert!(rt.state.pad.is_some(), "another peer's note");
+        rt.update(|s, tx| s.apply(Note::InputLost([3; 32]), tx));
+        assert!(rt.state.pad.is_none());
+        assert_eq!(rt.state.sent.borrow().last(), Some(&Frame::KvmLeave));
+        assert!(rt.state.message.as_ref().is_some_and(|(m, _)| m.contains("응답하지 않아")));
     }
 
     /// Sending a file that is already going: a banner says so, the row it would repeat is

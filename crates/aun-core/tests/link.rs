@@ -560,3 +560,70 @@ fn injected_input_is_allowed_only_when_switched_on_and_let_go_when_the_link_drop
     until("the guest to drop the link", || !connected(&guest, &host));
     assert!(!guest.send_input(host.id(), Frame::KvmLeave), "no link, nothing sent");
 }
+
+/// Forwards one connection to `to` until `frozen`, then stops passing bytes without closing
+/// anything: a link stalled on bad Wi-Fi or a peer hung, not one that ended.
+fn relay(to: SocketAddr, frozen: std::sync::Arc<std::sync::atomic::AtomicBool>) -> SocketAddr {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (a, _) = l.accept().unwrap();
+        let b = std::net::TcpStream::connect(to).unwrap();
+        for (mut from, mut into) in [(a.try_clone().unwrap(), b.try_clone().unwrap()), (b, a)] {
+            let frozen = frozen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 64 << 10];
+                loop {
+                    let Ok(n @ 1..) = from.read(&mut buf) else { return };
+                    // Frozen: hold both ends open and pass nothing more, the stall is the point.
+                    while frozen.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    if into.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    at
+}
+
+/// While input goes across, a link that goes silent without closing makes the receiving side
+/// let go of what it holds within a second and tells the sending side within half of one. A quiet
+/// link that is still up does neither.
+#[test]
+fn a_stalled_link_lets_go_of_held_input_and_tells_the_sender() {
+    use aun_core::wire::Frame;
+    let (host, _hn) = node("stall-host", "Host");
+    let (guest, gn) = node("stall-guest", "Guest");
+    let rec = Rec::default();
+    let r = rec.clone();
+    host.set_sink(move || Box::new(r.clone()));
+    host.set_kvm(true);
+    let frozen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    guest.pair(relay(addr(&host), frozen.clone()), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let log = || rec.0.lock().unwrap().clone();
+
+    assert!(guest.send_input(host.id(), Frame::KvmButton { button: 0, down: true, clicks: 1 }));
+    assert!(guest.send_input(host.id(), Frame::KvmKey { hid: 0xE1, down: true }));
+    until("the shift drag", || log().len() == 2);
+    // Held with nothing else sent: each side's beat keeps the other from giving up.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(log().len(), 2, "nothing let go while the link is up");
+    assert!(!gn.try_iter().any(|n| matches!(n, Note::InputLost(_))), "the sender isn't told while the link is up");
+
+    frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+    let at = Instant::now();
+    let lost = std::iter::from_fn(|| gn.recv_timeout(Duration::from_secs(5)).ok()).find(|n| matches!(n, Note::InputLost(_)));
+    assert_eq!(lost, Some(Note::InputLost(host.id())), "told within 5 s");
+    let told = at.elapsed();
+    until("the release", || log().len() == 4);
+    let released = at.elapsed();
+    assert_eq!(log()[2..], ["key 0xe1 up", "button 0 up"]);
+    assert!(told < Duration::from_millis(900), "told after {told:?}");
+    assert!(released < Duration::from_millis(1600), "let go after {released:?}");
+    assert!(connected(&host, &guest), "let go for the silence, not a closed link");
+}
