@@ -65,6 +65,38 @@ const MISSING: &[(KeyCode, u32)] = &[(KeyCode::CapsLock, 0x39), (KeyCode::IntlBa
 #[cfg(windows)]
 const MISSING: &[(KeyCode, u32)] = &[];
 
+/// Keys on this keyboard that switch the input source, sent as 한/영 (Lang1): on macOS, the keys
+/// of the input source shortcuts that take no modifier (a Caps Lock remapped to F18, say). A
+/// shortcut with modifiers (macOS's own ⌃Space) is sent as itself. Elsewhere none.
+pub fn lang1_keys() -> Vec<KeyCode> {
+    #[cfg(target_os = "macos")]
+    return mac::input_sources()
+        .into_iter()
+        .flatten()
+        .filter(|s| s.1 & mac::MODIFIERS == 0)
+        .filter_map(|s| KEYS.iter().find(|k| scancode(k.1) == Some(s.0.into())).map(|k| k.0))
+        .collect();
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
+/// macOS's "Select the previous input source" and "next" shortcuts from their entries in
+/// `com.apple.symbolichotkeys` (enabled, key code, modifier flags): a key code and flags each,
+/// None where off. An entry not there is macOS's default, ⌃Space and ⌃⌥Space.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn input_sources(entries: [Option<(bool, i64, i64)>; 2]) -> [Option<(u16, u64)>; 2] {
+    const DEFAULT: [(u16, u64); 2] = [(0x31, 0x4_0000), (0x31, 0xC_0000)];
+    let mut out = [None; 2];
+    for (i, e) in entries.into_iter().enumerate() {
+        out[i] = match e {
+            None => Some(DEFAULT[i]),
+            Some((true, code @ 0..0xFFFF, flags)) => Some((code as u16, flags as u64)),
+            Some(_) => None, // off, or no key
+        };
+    }
+    out
+}
+
 /// Where input lands: the OS, or a recorder in tests.
 pub trait Sink {
     /// Moves the pointer by pixels; `held` has bit `b` set for each button `b` down.
@@ -223,6 +255,40 @@ mod mac {
     /// Modifier key codes (`kVK_*`) and their `kCGEventFlagMask*`: Shift, Control, Option, Command.
     const MODS: [(u32, u64); 8] = [(0x38, 0x2_0000), (0x3C, 0x2_0000), (0x3B, 0x4_0000), (0x3E, 0x4_0000), (0x3A, 0x8_0000), (0x3D, 0x8_0000), (0x37, 0x10_0000), (0x36, 0x10_0000)];
 
+    /// Shift, Control, Option, Command in modifier flags.
+    pub const MODIFIERS: u64 = 0x1E_0000;
+    const OPTION: u64 = 0x8_0000;
+    const RETURN: u16 = 0x24;
+    /// HID Lang1 (한/영 on a Korean keyboard) and Lang2 (한자).
+    const LANG1: u16 = 0x90;
+    const LANG2: u16 = 0x91;
+
+    /// The input source shortcuts as they are set now (see `super::input_sources`).
+    pub fn input_sources() -> [Option<(u16, u64)>; 2] {
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUserDefaults};
+        fn get(d: &NSDictionary, key: &str) -> Option<Retained<AnyObject>> {
+            d.objectForKey(&NSString::from_str(key))
+        }
+        let all = NSUserDefaults::standardUserDefaults()
+            .persistentDomainForName(&NSString::from_str("com.apple.symbolichotkeys"))
+            .and_then(|d| d.objectForKey(&NSString::from_str("AppleSymbolicHotKeys")))
+            .and_then(|a| a.downcast::<NSDictionary>().ok());
+        let entry = |id: &str| -> Option<(bool, i64, i64)> {
+            let e = get(all.as_deref()?, id)?.downcast::<NSDictionary>().ok()?;
+            let on = get(&e, "enabled").and_then(|v| v.downcast::<NSNumber>().ok()).is_some_and(|v| v.boolValue());
+            let params = get(&e, "value").and_then(|v| v.downcast::<NSDictionary>().ok()).and_then(|v| get(&v, "parameters"))?.downcast::<NSArray>().ok()?;
+            let n = |i| params.objectAtIndex(i).downcast::<NSNumber>().ok().map(|n| n.integerValue() as i64);
+            if params.count() < 3 {
+                return Some((false, 0, 0));
+            }
+            Some((on, n(1)?, n(2)?))
+        };
+        // 60 and 61: AppKit's ids for the previous and next input source.
+        super::input_sources([entry("60"), entry("61")])
+    }
+
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGEventCreate(source: Ref) -> Ref;
@@ -363,6 +429,27 @@ mod mac {
         }
 
         fn key(&mut self, hid: u16, down: bool) {
+            // A Mac keyboard has neither: 한/영 is the input source shortcut, 한자 the Korean
+            // input method's ⌥Return. Pressed once on the way down.
+            let tap = match hid {
+                LANG1 => input_sources().into_iter().flatten().next(),
+                LANG2 => Some((RETURN, OPTION)),
+                _ => None,
+            };
+            if let Some((code, flags)) = tap {
+                for d in [true, false].into_iter().filter(|_| down) {
+                    // SAFETY: a new event, posted and released here.
+                    unsafe {
+                        let e = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, d);
+                        if !e.is_null() {
+                            CGEventSetFlags(e, flags);
+                            CGEventPost(HID_TAP, e);
+                            CFRelease(e);
+                        }
+                    }
+                }
+                return;
+            }
             let Some(code) = super::scancode(hid) else { return };
             let m = MODS.iter().position(|m| m.0 == code);
             if let Some(i) = m {
@@ -497,12 +584,23 @@ pub(crate) mod tests {
         }
     }
 
+    /// 한/영 on a Mac is whichever input source shortcut is on: this Mac's own setup (Caps Lock
+    /// remapped to F18 for "next", F19 for "previous"), one switched off, and none set.
+    #[test]
+    fn the_input_source_shortcut_is_the_first_one_on() {
+        assert_eq!(input_sources([Some((true, 80, 0)), Some((true, 79, 0))]), [Some((80, 0)), Some((79, 0))]);
+        assert_eq!(input_sources([Some((false, 49, 0x4_0000)), Some((true, 79, 0))]), [None, Some((79, 0))]);
+        assert_eq!(input_sources([Some((true, 65535, 0)), None]), [None, Some((0x31, 0xC_0000))]);
+        assert_eq!(input_sources([None, None]), [Some((0x31, 0x4_0000)), Some((0x31, 0xC_0000))]);
+    }
+
     /// Every key has one wire code and back, and this OS injects every key it has: one the
     /// table names that the OS has but can't be given would be dropped at the receiver unnoticed.
     #[test]
     fn every_key_round_trips_and_this_os_can_inject_the_ones_it_has() {
         use KeyCode as K;
-        // Keys with no place on this OS's keyboards; anything else must have a code.
+        // Keys with no place on this OS's keyboards; anything else must have a code. (A Mac
+        // receiver turns Lang1 and Lang2 into shortcuts instead: `mac::Os::key`.)
         #[cfg(target_os = "macos")]
         let absent = [K::ContextMenu, K::Convert, K::F21, K::F22, K::F23, K::F24, K::Help, K::KanaMode, K::Lang1, K::Lang2, K::Lang3, K::Lang4, K::Lang5, K::NonConvert, K::Pause, K::PrintScreen, K::ScrollLock];
         #[cfg(windows)]
