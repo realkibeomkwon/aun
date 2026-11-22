@@ -697,3 +697,17 @@ fn a_stalled_link_lets_go_of_held_input_while_files_go_both_ways() {
         let _ = std::fs::remove_dir_all(dir(tag)); // files still open on Windows: left for the OS
     }
 }
+
+/// Input to a peer that doesn't allow it is dropped there and not answered, so the sender is told
+/// it got no word back (a crossing comes home instead of swallowing input for nothing).
+#[test]
+fn input_a_peer_does_not_allow_tells_the_sender() {
+    use aun_core::wire::Frame;
+    let (host, _hn) = node("deny-host", "Host");
+    let (guest, gn) = node("deny-guest", "Guest");
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    assert!(guest.send_input(host.id(), Frame::KvmEnter { route: 1, side: 0, at: 0 }));
+    let lost = std::iter::from_fn(|| gn.recv_timeout(Duration::from_secs(3)).ok()).find(|n| matches!(n, Note::InputLost(_)));
+    assert_eq!(lost, Some(Note::InputLost(host.id())));
+}

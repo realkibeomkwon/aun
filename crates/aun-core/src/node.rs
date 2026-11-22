@@ -441,9 +441,8 @@ impl Node {
     }
 
     /// Drives `id`'s pointer, if it is connected and speaks `Kvm*` frames; false if not sent.
-    /// It goes ahead of file chunks. A move or a scroll is dropped when the input queue is full
-    /// (the socket stalled): the next move carries the total. A button, a key or a leave waits
-    /// for room, up to a moment.
+    /// It goes ahead of file chunks. Input that may drop ([`Frame::must_arrive`]) is dropped when
+    /// the input queue is full (the socket stalled); the rest waits for room, up to a moment.
     pub fn send_input(&self, id: Id, f: Frame) -> bool {
         let Some((tx, live)) = self.st().peers.get(&id).and_then(|p| p.link.as_ref()).filter(|l| l.kvm).map(|l| (l.tx.clone(), l.live.clone())) else { return false };
         {
@@ -454,7 +453,7 @@ impl Node {
                 let _ = live.wake.try_send(());
             }
         }
-        let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. });
+        let must = f.must_arrive();
         let end = Instant::now() + Duration::from_millis(250);
         let mut f = f;
         loop {
@@ -962,7 +961,8 @@ impl Node {
             match f {
                 f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. }) => {
                     // Driven, this side answers every BEAT: the writer may be asleep for 10 s.
-                    let on = !matches!(f, Frame::KvmLeave);
+                    // Not allowed here, nothing answers: the driver stops after DRIVER_LOST.
+                    let on = !matches!(f, Frame::KvmLeave) && self.kvm();
                     if live.driven.swap(on, Ordering::Relaxed) != on {
                         let _ = files.tx.fast.try_send(None);
                         let _ = live.wake.try_send(());

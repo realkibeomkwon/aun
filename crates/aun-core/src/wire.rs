@@ -71,6 +71,15 @@ pub enum Frame {
     KvmReturn { route: u32, at: u16 },
 }
 
+impl Frame {
+    /// Input that must arrive, so it waits a moment for room in a full queue: a button, a key, a
+    /// leave, or a crossing's start (without it the driven side has no way back). A move or a
+    /// scroll may drop: the next move carries the total.
+    pub fn must_arrive(&self) -> bool {
+        matches!(self, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. })
+    }
+}
+
 fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_owned())
 }

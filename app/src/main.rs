@@ -177,7 +177,7 @@ impl Ui {
         #[cfg(test)]
         self.sent.borrow_mut().push(f.clone());
         if let Some(n) = &self.node {
-            let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. });
+            let must = f.must_arrive();
             let what = must.then(|| format!("{f:?}"));
             if !n.send_input(id, f)
                 && let Some(what) = what
@@ -350,15 +350,18 @@ impl Ui {
                 self.say(m, tx);
                 self.refresh();
             }
-            // Nothing held here, but the peer may be gone mid-drag: stop, and say why.
-            Note::InputLost(id) if self.pad.as_ref().is_some_and(|p| p.id == id) => {
-                self.close_pad();
-                self.say("상대가 응답하지 않아 원격 조작을 멈췄어요", tx);
-            }
-            Note::InputLost(_id) => {
+            // Nothing held here, but the peer may be gone mid-drag (or not allow input): stop, and
+            // say why. Across, input comes back here.
+            Note::InputLost(id) => {
                 #[cfg(target_os = "macos")]
-                if let Some(c) = &self.cross {
-                    c.lost(_id);
+                if let Some(c) = &self.cross
+                    && c.lost(id)
+                {
+                    self.say("상대가 응답하지 않아 이 기기로 돌아왔어요 (상대에서 원격 조작 허용이 켜져 있는지 확인하세요)", tx);
+                }
+                if self.pad.as_ref().is_some_and(|p| p.id == id) {
+                    self.close_pad();
+                    self.say("상대가 응답하지 않아 원격 조작을 멈췄어요 (상대에서 원격 조작 허용이 켜져 있는지 확인하세요)", tx);
                 }
             }
             Note::Returned { id: _id, route: _route, at: _at } => {

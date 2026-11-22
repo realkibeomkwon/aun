@@ -11,7 +11,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use crate::kvm::{self, Bounds, Captured, Driver};
@@ -81,6 +81,7 @@ const DELTA_Y: u32 = 5;
 const KEYCODE: u32 = 9;
 const SCROLL_POINT_Y: u32 = 96;
 const SCROLL_POINT_X: u32 = 97;
+const SOURCE_USER_DATA: u32 = 42;
 /// Shift, Control, Option, Command (`kCGEventFlagMask*`): none may be down as a crossing starts.
 const MODIFIERS: u64 = 0x1E_0000;
 const CAPS_LOCK: u16 = 0x39;
@@ -178,6 +179,10 @@ extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
         unsafe { CGEventTapEnable(st.tap.load(Ordering::Relaxed), true) };
         return e;
     }
+    // What Aun itself posted (a peer driving this Mac): never a crossing, never swallowed.
+    if field(SOURCE_USER_DATA) == kvm::MARK {
+        return e;
+    }
     if !st.crossed.load(Ordering::SeqCst) {
         // Only a plain move starts one: a button or modifier down here would never come up here.
         // SAFETY: as above.
@@ -258,8 +263,11 @@ impl Cross {
     /// Err when macOS doesn't let Aun see input: Input Monitoring asked for, or not granted.
     pub fn start(node: Node, side: u8, swap: bool) -> Result<Cross, String> {
         // SAFETY: plain calls.
-        if !unsafe { CGPreflightListenEventAccess() } && !unsafe { CGRequestListenEventAccess() } {
-            return Err("listen access not granted".into());
+        let listen = unsafe { CGPreflightListenEventAccess() };
+        crate::log(format_args!("cross: Input Monitoring granted: {listen}, Accessibility: {}", kvm::allowed(false)));
+        // SAFETY: a plain call; it opens the system's request the first time.
+        if !listen && !unsafe { CGRequestListenEventAccess() } {
+            return Err("Input Monitoring not granted".into());
         }
         let (out, rx) = mpsc::sync_channel(QUEUE);
         let b = kvm::screen_bounds().ok_or("no display")?;
@@ -302,10 +310,11 @@ impl Cross {
                 st.end(None);
             }
         }).map_err(|e| e.to_string())?;
-        let rl = made.recv().ok().flatten().ok_or("event tap not allowed")?;
+        let rl = made.recv().ok().flatten().ok_or("event tap not made (a permission missing?)")?;
         let cross = Cross { st: st.clone(), rl, target: Default::default(), route: Default::default(), swap: Arc::new(AtomicBool::new(swap)) };
-        let (target, route, swap) = (cross.target.clone(), cross.route.clone(), cross.swap.clone());
-        std::thread::Builder::new().name("aun-cross".into()).spawn(move || sender(rx, &st, &node, &target, &route, &swap)).map_err(|e| e.to_string())?;
+        let (target, route, swap, weak) = (cross.target.clone(), cross.route.clone(), cross.swap.clone(), Arc::downgrade(&st));
+        drop(st); // the sender holds it weakly: gone with the tap, its queue closes and it ends
+        std::thread::Builder::new().name("aun-cross".into()).spawn(move || sender(rx, &weak, &node, &target, &route, &swap)).map_err(|e| e.to_string())?;
         crate::log(format_args!("cross: watching the {} edge", ["left", "right", "top", "bottom"][usize::from(side.min(3))]));
         Ok(cross)
     }
@@ -330,19 +339,28 @@ impl Cross {
         }
     }
 
-    /// `id` stopped answering (`Note::InputLost`): input back here.
-    pub fn lost(&self, id: Id) {
+    /// `id` stopped answering (`Note::InputLost`): input back here. True if that ended a crossing.
+    pub fn lost(&self, id: Id) -> bool {
+        let across = self.st.crossed.load(Ordering::SeqCst);
         if *self.target.lock().unwrap() == Some(id) {
             self.st.end(None);
+            return across;
         }
+        false
     }
 }
 
 impl Drop for Cross {
     fn drop(&mut self) {
+        self.st.peer.store(false, Ordering::Relaxed);
         self.st.end(None);
-        // SAFETY: the tap thread's run loop, alive while that thread runs it.
-        unsafe { CFRunLoopStop(self.rl as Ref) };
+        // SAFETY: the tap (alive until its thread invalidates it after the run loop stops), then
+        // that thread's run loop. Off first, so a stop that lands before the loop runs leaves no
+        // live tap.
+        unsafe {
+            CGEventTapEnable(self.st.tap.load(Ordering::Relaxed), false);
+            CFRunLoopStop(self.rl as Ref);
+        }
     }
 }
 
@@ -355,7 +373,7 @@ pub fn release_cursor() {
 
 /// Sends what the tap took, in order, and one `KvmLeave` per crossing that ended. Wakes every
 /// 50 ms while across to see an end, asleep otherwise.
-fn sender(rx: Receiver<Captured>, st: &State, node: &Node, target: &Mutex<Option<Id>>, route: &AtomicU32, swap: &AtomicBool) {
+fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<Option<Id>>, route: &AtomicU32, swap: &AtomicBool) {
     let mut d = Driver::default();
     let (mut started, mut left) = (0u32, 0u32);
     let mut to: Option<Id> = None;
@@ -378,6 +396,7 @@ fn sender(rx: Receiver<Captured>, st: &State, node: &Node, target: &Mutex<Option
                 Err(_) => return,
             }
         };
+        let Some(st) = st.upgrade() else { return };
         for c in first.into_iter().chain(rx.try_iter()) {
             if let Captured::Enter(_) = c {
                 if started != left {
@@ -397,8 +416,10 @@ fn sender(rx: Receiver<Captured>, st: &State, node: &Node, target: &Mutex<Option
             if let crate::wire::Frame::KvmEnter { route: r, .. } = f {
                 route.store(r, Ordering::SeqCst);
             }
-            if !node.send_input(id, f) {
-                st.end(None); // no link that speaks input: nothing to drive
+            // A move or scroll dropped on a full queue is no reason: the next move carries it.
+            let must = f.must_arrive();
+            if !node.send_input(id, f) && must {
+                st.end(None); // no link that speaks input, or stuck: nothing to drive
             }
         }
         if started != left && st.ends.load(Ordering::SeqCst) > left {

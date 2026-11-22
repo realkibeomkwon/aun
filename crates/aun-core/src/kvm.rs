@@ -80,6 +80,11 @@ pub fn mac_modifier(code: u16, flags: u64) -> Option<(u16, bool)> {
     MODS.iter().find(|m| m.0 == code).map(|m| (m.1, flags & m.2 != 0))
 }
 
+/// On what Aun injects ("AUN1"), so its own capture can tell it apart: Windows `dwExtraInfo`,
+/// macOS `kCGEventSourceUserData`.
+#[cfg(target_os = "macos")]
+pub(crate) const MARK: i64 = 0x4155_4E31;
+
 /// Control and ⌘ (the Windows key) swapped, left and right, when `swap` (the app's setting).
 pub fn swapped(hid: u16, swap: bool) -> u16 {
     match hid {
@@ -421,6 +426,19 @@ mod mac {
     type Ref = *mut c_void;
 
     const HID_TAP: u32 = 0;
+    /// `kCGEventSourceUserData`: carries [`super::MARK`] on what Aun posts, so its own capture
+    /// tap lets it by (a pad pushing this Mac's pointer past the edge isn't a crossing).
+    const USER_DATA: u32 = 42;
+
+    /// Posts `e` marked as Aun's own.
+    /// SAFETY: `e` is a live event.
+    unsafe fn post_marked(e: Ref) {
+        // SAFETY: as the caller promises.
+        unsafe {
+            CGEventSetIntegerValueField(e, USER_DATA, super::MARK);
+            CGEventPost(HID_TAP, e);
+        }
+    }
     const CLICK_STATE: u32 = 1;
     const DELTA_X: u32 = 4;
     const DELTA_Y: u32 = 5;
@@ -586,7 +604,7 @@ mod mac {
                     // A key's own function and keypad flags stay: a Shift-arrow is still an arrow.
                     CGEventSetFlags(e, flags | CGEventGetFlags(e) & (FN | NUMPAD));
                 }
-                CGEventPost(HID_TAP, e);
+                post_marked(e);
                 let fn_on = CGEventGetFlags(e) & FN != 0;
                 CFRelease(e);
                 if fn_on {
@@ -606,7 +624,7 @@ mod mac {
                 if !e.is_null() {
                     CGEventSetType(e, FLAGS_CHANGED);
                     CGEventSetFlags(e, self.flags() | NON_COALESCED);
-                    CGEventPost(HID_TAP, e);
+                    post_marked(e);
                     CFRelease(e);
                 }
             }
@@ -684,7 +702,7 @@ mod mac {
                             // Added to the event's own: an F-key without its function flag
                             // doesn't fire a shortcut set to it (seen with F19, 2026-11-22).
                             CGEventSetFlags(e, CGEventGetFlags(e) & !(FN | NUMPAD) | own_flags(code) | flags);
-                            CGEventPost(HID_TAP, e);
+                            post_marked(e);
                             CFRelease(e);
                         }
                     }
