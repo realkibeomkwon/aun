@@ -56,12 +56,77 @@ pub fn hid(key: KeyCode) -> Option<u16> {
 fn scancode(hid: u16) -> Option<u32> {
     use winit::platform::scancode::PhysicalKeyExtScancode;
     let key = KEYS.iter().find(|k| k.1 == hid)?.0;
-    winit::keyboard::PhysicalKey::Code(key).to_scancode().or_else(|| MISSING.iter().find(|m| m.0 == key).map(|m| m.1))
+    MISSING.iter().find(|m| m.0 == key).map(|m| m.1).or_else(|| winit::keyboard::PhysicalKey::Code(key).to_scancode())
 }
 
-/// Keys this OS has that winit's table leaves out (its reverse table has some of them).
+/// The wire key for this OS's own code for it ([`scancode`] backwards).
+#[cfg(any(target_os = "macos", windows))]
+pub fn hid_of(code: u32) -> Option<u16> {
+    KEYS.iter().map(|k| k.1).find(|&h| scancode(h) == Some(code))
+}
+
+/// Ctrl, Alt (Option), Shift and Esc, either side: the way home from a crossing, never sent on
+/// (docs/kvm-design.md 7.3). `mods` has bit `i` set for HID modifier `0xE0 + i` held.
+pub fn escape(hid: u16, mods: u8) -> bool {
+    hid == 0x29 && mods & 0x11 != 0 && mods & 0x44 != 0 && mods & 0x22 != 0
+}
+
+/// macOS: the modifier key a `flagsChanged` event with key code `code` is about, as a wire key,
+/// and whether it went down, from the event's per-side flag bits (`NX_DEVICE*KEYMASK`): with
+/// both Shifts held, the Shift flag alone can't say which went up.
+pub fn mac_modifier(code: u16, flags: u64) -> Option<(u16, bool)> {
+    // kVK_*, the HID usage, the device bit.
+    const MODS: [(u16, u16, u64); 8] = [(0x3B, 0xE0, 0x1), (0x38, 0xE1, 0x2), (0x3A, 0xE2, 0x20), (0x37, 0xE3, 0x8), (0x3E, 0xE4, 0x2000), (0x3C, 0xE5, 0x4), (0x3D, 0xE6, 0x40), (0x36, 0xE7, 0x10)];
+    MODS.iter().find(|m| m.0 == code).map(|m| (m.1, flags & m.2 != 0))
+}
+
+/// What a capture saw, in wire terms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Captured {
+    /// The pointer went out past the edge toward the peer, `at` along it (see [`past`]).
+    Enter(u16),
+    Move(i32, i32),
+    Button(u8, bool, u8),
+    Wheel(i32, i32),
+    Key(u16, bool),
+    /// The crossing ended here (escape key, a stall, the queue full): let go over there.
+    Leave,
+}
+
+/// The sending side of crossings: numbers each one and keeps its running move totals.
+#[derive(Default)]
+pub struct Driver {
+    route: u32,
+    mn: u32,
+    total: (i32, i32),
+}
+
+impl Driver {
+    /// `side`: where the peer is from here, as in `KvmEnter`; it is entered by the opposite edge.
+    pub fn frame(&mut self, c: Captured, side: u8) -> Frame {
+        match c {
+            Captured::Enter(at) => {
+                (self.route, self.mn, self.total) = (self.route.wrapping_add(1), 0, (0, 0));
+                Frame::KvmEnter { route: self.route, side: side ^ 1, at }
+            }
+            Captured::Move(dx, dy) => {
+                self.mn += 1;
+                self.total = (self.total.0.wrapping_add(dx), self.total.1.wrapping_add(dy));
+                Frame::KvmMove { route: self.route, mn: self.mn, cx: self.total.0, cy: self.total.1 }
+            }
+            Captured::Button(button, down, clicks) => Frame::KvmButton { button, down, clicks },
+            Captured::Wheel(dx, dy) => Frame::KvmWheel { dx: dx.clamp(-32768, 32767) as i16, dy: dy.clamp(-32768, 32767) as i16 },
+            Captured::Key(hid, down) => Frame::KvmKey { hid, down },
+            Captured::Leave => Frame::KvmLeave,
+        }
+    }
+}
+
+/// Keys this OS has that winit's table leaves out (its reverse table has some of them) or gets
+/// wrong: it has the volume keys one up from Apple's `Events.h` (`kVK_VolumeUp` 0x48,
+/// `kVK_VolumeDown` 0x49, `kVK_Mute` 0x4A), so volume down went as mute.
 #[cfg(target_os = "macos")]
-const MISSING: &[(KeyCode, u32)] = &[(KeyCode::CapsLock, 0x39), (KeyCode::IntlBackslash, 0x0A), (KeyCode::IntlRo, 0x5E), (KeyCode::NumpadComma, 0x5F), (KeyCode::AudioVolumeMute, 0x4A)];
+const MISSING: &[(KeyCode, u32)] = &[(KeyCode::CapsLock, 0x39), (KeyCode::IntlBackslash, 0x0A), (KeyCode::IntlRo, 0x5E), (KeyCode::NumpadComma, 0x5F), (KeyCode::AudioVolumeMute, 0x4A), (KeyCode::AudioVolumeUp, 0x48), (KeyCode::AudioVolumeDown, 0x49)];
 #[cfg(windows)]
 const MISSING: &[(KeyCode, u32)] = &[];
 
@@ -934,6 +999,50 @@ pub(crate) mod tests {
         // The pad's route has no entry edge: never answers.
         inj.apply(Frame::KvmLeave);
         assert_eq!(inj.apply(mv(6, 1, -500, 0)), None);
+    }
+
+    #[test]
+    fn the_escape_key_is_ctrl_alt_shift_esc_on_either_side() {
+        assert!(escape(0x29, 0x07), "left Ctrl, Shift, Alt");
+        assert!(escape(0x29, 0x70 | 0x08), "right ones, ⌘ too");
+        assert!(!escape(0x29, 0x03) && !escape(0x29, 0x05) && !escape(0x29, 0x06), "two of three");
+        assert!(!escape(0x2A, 0x07), "another key");
+    }
+
+    /// A modifier's flagsChanged says which side by its own bit: one Shift let go while the
+    /// other is held is an up, though the Shift flag stays.
+    #[test]
+    fn modifier_changes_say_which_side_and_which_way() {
+        assert_eq!(mac_modifier(0x38, 0x2_0002), Some((0xE1, true)));
+        assert_eq!(mac_modifier(0x38, 0x2_0004), Some((0xE1, false)), "left up, right still held");
+        assert_eq!(mac_modifier(0x3C, 0x2_0004), Some((0xE5, true)));
+        assert_eq!(mac_modifier(0x36, 0x10_0010), Some((0xE7, true)));
+        assert_eq!(mac_modifier(0x3E, 0x4_0000), Some((0xE4, false)), "only the left Control's bit");
+        assert_eq!(mac_modifier(0x00, 0x2_0002), None, "not a modifier");
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn this_os_s_codes_map_back_to_their_keys() {
+        for &(_, h) in KEYS {
+            if let Some(c) = scancode(h) {
+                assert_eq!(hid_of(c), Some(h), "{h:#x} is {c:#x} here");
+            }
+        }
+    }
+
+    /// Each crossing is a new route entered by the edge facing this device, and its moves are
+    /// totals from where it entered.
+    #[test]
+    fn crossings_number_their_routes_and_total_their_moves() {
+        let mut d = Driver::default();
+        assert_eq!(d.frame(Captured::Enter(100), 1), Frame::KvmEnter { route: 1, side: 0, at: 100 });
+        assert_eq!(d.frame(Captured::Move(3, -1), 1), mv(1, 1, 3, -1));
+        assert_eq!(d.frame(Captured::Move(4, 0), 1), mv(1, 2, 7, -1));
+        assert_eq!(d.frame(Captured::Wheel(0, 99_999), 1), Frame::KvmWheel { dx: 0, dy: i16::MAX });
+        assert_eq!(d.frame(Captured::Leave, 1), Frame::KvmLeave);
+        assert_eq!(d.frame(Captured::Enter(7), 2), Frame::KvmEnter { route: 2, side: 3, at: 7 });
+        assert_eq!(d.frame(Captured::Move(1, 1), 2), mv(2, 1, 1, 1));
     }
 
     fn mv(route: u32, mn: u32, cx: i32, cy: i32) -> Frame {

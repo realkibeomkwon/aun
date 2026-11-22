@@ -18,11 +18,16 @@ pub struct Settings {
     /// Remote control from here: send ⌘ as Ctrl and Ctrl as ⌘ (the Windows key), so a Mac's ⌘C
     /// is Ctrl+C on a PC and a PC's Ctrl+C is ⌘C on a Mac.
     pub swap: bool,
+    /// Move the pointer over to the peer past a screen edge, with this keyboard going with it.
+    /// Off until switched on: it takes this device's input while across.
+    pub cross: bool,
+    /// Where the peer's screen is from here: 0 left, 1 right (as in `KvmEnter`).
+    pub side: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { clipboard: true, dock: true, downloads: None, secrets: false, kvm: false, swap: true }
+        Settings { clipboard: true, dock: true, downloads: None, secrets: false, kvm: false, swap: true, cross: false, side: 1 }
     }
 }
 
@@ -36,6 +41,8 @@ impl Settings {
                 Some(("secrets", v)) => s.secrets = v == "1",
                 Some(("kvm", v)) => s.kvm = v == "1",
                 Some(("swap", v)) => s.swap = v == "1",
+                Some(("cross", v)) => s.cross = v == "1",
+                Some(("side", "0")) => s.side = 0,
                 Some(("downloads", v)) if !v.is_empty() => s.downloads = Some(v.into()),
                 _ => {}
             }
@@ -45,7 +52,7 @@ impl Settings {
 
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let mut text = format!("clipboard={}\ndock={}\nsecrets={}\nkvm={}\nswap={}\n", self.clipboard as u8, self.dock as u8, self.secrets as u8, self.kvm as u8, self.swap as u8);
+        let mut text = format!("clipboard={}\ndock={}\nsecrets={}\nkvm={}\nswap={}\ncross={}\nside={}\n", self.clipboard as u8, self.dock as u8, self.secrets as u8, self.kvm as u8, self.swap as u8, self.cross as u8, self.side);
         // One line per key: a folder whose name has a line break isn't kept.
         if let Some(d) = self.downloads.as_ref().and_then(|d| d.to_str()).filter(|d| !d.contains(['\n', '\r'])) {
             text += &format!("downloads={d}\n");
@@ -63,11 +70,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aun-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(Settings::load(&dir), Settings::default(), "no file: defaults");
-        let off = Settings { clipboard: false, dock: false, downloads: Some("/Users/me/받은 파일=새".into()), secrets: true, kvm: true, swap: false };
+        let off = Settings { clipboard: false, dock: false, downloads: Some("/Users/me/받은 파일=새".into()), secrets: true, kvm: true, swap: false, cross: true, side: 0 };
         off.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), off);
         std::fs::write(dir.join("settings.txt"), "junk\nclipboard=0\nfuture=7\n").unwrap();
-        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true, downloads: None, secrets: false, kvm: false, swap: true });
+        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true, downloads: None, secrets: false, kvm: false, swap: true, cross: false, side: 1 });
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
