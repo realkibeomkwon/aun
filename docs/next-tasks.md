@@ -167,3 +167,5 @@ Windows(2026-11-21): Windows 11 Pro PC, release 빌드. 변경 전 `42967de`와 
   - 추가 시험(2026-11-22, 사용자 확인): Tab은 받는 쪽에 들어가고 보내는 쪽 Aun의 포커스를 옮기지 않는다. 키 반복이 되고 떼면 멈춘다. Shift를 누른 채 다른 버튼이나 "그만"을 누르면 받는 쪽 Shift가 떼어진다.
   - Mac 보내는 쪽 ⌘Q: 키가 상대에게 가고(Windows에서 Win+Q로 검색 창이 열림) 동시에 AppKit 메뉴가 Mac Aun을 종료한다. 링크가 끊기며 Windows의 Win 키는 떼어졌다. 한 키가 두 곳에서 처리되는 문제로 남겨 둔다(Quit 메뉴 단축키를 바꿀지는 사용자 결정, 3단계의 수정 키 맞바꾸기와 함께 정한다).
   - 남은 문제: ad-hoc 서명이라 새 빌드마다 macOS 권한을 다시 추가해야 한다. 서명 인증서를 고정하면 유지될 가능성이 있다(미확인).
+  - 원인 확인(2026-11-22): CI 44971190007과 44912189217의 `Aun.app`에 `codesign -d -r-`를 하면 둘 다 `designated => cdhash H"..."`이고 해시가 다르다. ad-hoc 서명은 지정 요구사항(designated requirement)이 cdhash뿐이라 빌드마다 다른 앱이 된다.
+  - 조치: `bundle-mac.sh`가 `MAC_SIGN_IDENTITY`가 있으면 그 인증서로 서명하고, 없으면 ad-hoc으로 서명한다. CI는 `MAC_SIGN_P12`(base64 .p12)와 `MAC_SIGN_P12_PASSWORD` 시크릿이 있으면 임시 키체인에 넣고 그 인증서로 서명한다. 임시 자체 서명 인증서로 서로 다른 두 빌드를 서명하면 둘 다 `identifier "dev.aun.desk" and certificate leaf = H"<같은 값>"`이 됐다. 인증서와 시크릿은 사용자가 만든다. 인증서로 서명한 첫 빌드는 권한을 한 번 더 지웠다 추가해야 한다(요구사항 형태가 바뀜). 그 뒤 두 빌드를 연달아 설치해도 권한이 유지되는지는 실기기 미확인.

@@ -13,8 +13,8 @@ cargo run --release -p aun
 
 Build on each machine (`cargo build --release -p aun`, Windows needs the MSVC build tools).
 
-Packages: `scripts/bundle-mac.sh` makes `target/release/Aun.app` and `Aun-mac.zip` (ad-hoc signed,
-so the first open needs right-click > Open or System Settings > Privacy & Security). On Windows,
+Packages: `scripts/bundle-mac.sh` makes `target/release/Aun.app` and `Aun-mac.zip` (signed with
+`MAC_SIGN_IDENTITY` if set, else ad-hoc; no Developer ID either way, so the first open needs right-click > Open or System Settings > Privacy & Security). On Windows,
 `target/release/aun.exe` is the whole app (icon, version info, static C runtime; SmartScreen warns
 once since it isn't signed). CI uploads both as artifacts. `swift scripts/icon.swift` redraws
 `assets/` from the tray icon's design.

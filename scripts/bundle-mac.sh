@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds target/release/Aun.app (ad-hoc signed) and target/release/Aun-mac.zip.
+# Builds target/release/Aun.app and target/release/Aun-mac.zip.
+# Signs with MAC_SIGN_IDENTITY (a keychain identity) when set, else ad-hoc.
 # Run from anywhere on a Mac. The binary is for this Mac's architecture only.
 set -eu
 cd "$(dirname "$0")/.."
@@ -37,8 +38,10 @@ cat > "$app/Contents/Info.plist" <<EOF
 EOF
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 
-# Ad-hoc: no Developer ID, so Gatekeeper asks once on first open.
-codesign --force --sign - "$app"
+# No Developer ID, so Gatekeeper asks once on first open either way.
+# A fixed identity makes the designated requirement "identifier + certificate leaf",
+# so macOS privacy grants survive updates; ad-hoc pins the cdhash, which every build changes.
+codesign --force --sign "${MAC_SIGN_IDENTITY:--}" "$app"
 codesign --verify --strict "$app"
 
 ditto -c -k --norsrc --noextattr --keepParent "$app" target/release/Aun-mac.zip
