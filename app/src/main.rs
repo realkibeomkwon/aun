@@ -19,6 +19,9 @@ const MESSAGE_FOR: Duration = Duration::from_secs(5);
 const FLASH_FOR: Duration = Duration::from_millis(1500);
 /// Pixels the remote pointer moves per point moved on the pad.
 const PAD_GAIN: f32 = 2.0;
+/// macOS announces one input source switch more than once, 3-7 ms apart (seen 2026-11-22):
+/// announcements this close are one switch.
+const SAME_SWITCH: Duration = Duration::from_millis(100);
 /// The pad's ⌘/Ctrl switch (`Settings::swap`), off and on.
 const SWAP: [&str; 2] = ["⌘·Ctrl 맞바꾸기 꺼짐", "⌘·Ctrl 맞바꾸기 켜짐"];
 
@@ -62,6 +65,8 @@ struct Pad {
     lang: Vec<(rune::PhysicalKeyCode, u16)>,
     /// The pad has the keyboard: clicked or typed on, not lost it since.
     focused: bool,
+    /// When the last input source switch was sent.
+    switched: Option<Instant>,
 }
 
 struct Ui {
@@ -147,7 +152,7 @@ impl Ui {
         self.route = self.route.wrapping_add(1);
         let lang = aun_core::kvm::lang_keys();
         aun_core::log(format_args!("pad: keys sent as 한/영 (0x90) or 한자 (0x91): {lang:?}"));
-        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang, focused: false });
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang, focused: false, switched: None });
     }
 
     /// Lets go of what the pad holds at the peer, then closes it.
@@ -210,7 +215,11 @@ impl Ui {
     /// the key itself (Caps Lock, F18, ⌃Space) goes to the system only and never reaches the pad.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS announces it
     fn input_source_changed(&mut self) {
-        let Some(p) = self.pad.as_ref().filter(|p| p.focused) else { return };
+        let Some(p) = self.pad.as_mut().filter(|p| p.focused) else { return };
+        if p.switched.is_some_and(|t| t.elapsed() < SAME_SWITCH) {
+            return;
+        }
+        p.switched = Some(Instant::now());
         let id = p.id;
         self.input(id, Frame::KvmKey { hid: 0x90, down: true });
         self.input(id, Frame::KvmKey { hid: 0x90, down: false });
@@ -1247,10 +1256,15 @@ mod tests {
         ui.sent.borrow_mut().clear();
         ui.input_source_changed();
         assert!(ui.sent.borrow().is_empty(), "after focus went");
+        std::thread::sleep(SAME_SWITCH);
         ui.pad_key(&PhysicalInput::Modifiers(Default::default())); // the keyboard is back
         ui.input_source_changed();
+        ui.input_source_changed(); // macOS announced the same switch twice, 3-7 ms apart
         let k = |hid, down| Frame::KvmKey { hid, down };
         assert_eq!(*ui.sent.borrow(), [k(0x90, true), k(0x90, false)]);
+        std::thread::sleep(SAME_SWITCH);
+        ui.input_source_changed();
+        assert_eq!(ui.sent.borrow().len(), 4, "a switch after that is another one");
     }
 
     /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and
