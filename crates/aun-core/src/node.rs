@@ -844,7 +844,7 @@ impl Node {
                             told = true;
                             crate::log(format_args!("input from {} (injection allowed by the OS: {})", files.peer, kvm::allowed(false)));
                             if !kvm::allowed(false) {
-                                (self.0.notify)(Note::Info("손쉬운 사용 권한이 없어 원격 조작을 받을 수 없어요".into()));
+                                (self.0.notify)(Note::Info("macOS가 입력 제어를 허용하지 않아 원격 조작을 받을 수 없어요".into()));
                             }
                         }
                         input.apply(f);

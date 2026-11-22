@@ -130,7 +130,7 @@ impl Ui {
         self.save(tx);
         // macOS drops posted input without Accessibility; asking opens the system's request.
         if on && self.node.is_some() && !aun_core::kvm::allowed(true) {
-            self.say("시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 Aun을 허용하세요", tx);
+            self.say("시스템 설정 > 개인정보 보호 및 보안에서 Aun을 허용하세요 (macOS 27은 \"System & App Protection Override\", 그 전은 \"손쉬운 사용\". 목록에 없으면 + 로 추가)", tx);
         }
     }
 
@@ -320,9 +320,10 @@ fn peer_row(p: &PeerView, s: &Ui, t: Theme) -> El {
     let id = p.id;
     let k = aun_core::hex(&id[..6]);
     let dot = if p.connected { tok::accent(0, true) } else { t.control_off };
-    let info = col().grow(1.0).gap(2.0)
-        .child(text(p.name.clone()).font(type_::BODY).color(t.text))
-        .child(text(status(p)).font(type_::LABEL).color(t.text_secondary));
+    // The text gives way (wraps) before the buttons do: a narrow window cut the last one off.
+    let info = col().grow(1.0).shrink().min_w(0.0).gap(2.0)
+        .child(text(p.name.clone()).font(type_::BODY).color(t.text).wrap_anywhere())
+        .child(text(status(p)).font(type_::LABEL).color(t.text_secondary).wrap());
     let mut r = row().key(format!("peer-{k}")).w_full().min_h(52.0).px(space::S3).py(space::S2).gap(space::S3).center_y()
         .radius(radius::MD).fill(if s.over == Some(id) { t.hover } else { t.card }).border(1.0, t.card_border)
         .child(el().size(8.0, 8.0).radius(4.0).fill(dot)).child(info);
@@ -1099,6 +1100,21 @@ mod tests {
         rt.frame(0.0);
         let (x, _) = rt.find("t-show-1").expect("the reveal button");
         assert!(x < 480.0, "the button is inside the window: {x}");
+    }
+
+    /// A connected device has three buttons; at the narrowest window none of them is cut off.
+    #[test]
+    fn a_connected_device_s_buttons_stay_inside_the_window() {
+        for w in [420.0, 480.0] {
+            let mut ui = Ui::new(None, None);
+            ui.peers = vec![PeerView { id: [3; 32], name: "Kibeoms-Mac-mini".into(), addr: None, paired: true, nearby: true, connected: true, kvm: true }];
+            let mut rt = Runtime::new(ui, view, (w, 560.0), Env { system_dark: false, scale: 2.0 });
+            rt.frame(0.0);
+            for key in ["send-030303030303", "pad-030303030303", "forget-030303030303"] {
+                let (r, _) = rt.presented(key).unwrap_or_else(|| panic!("{key}"));
+                assert!(r[0] + r[2] <= w - 24.0, "{key} ends at {} in a {w} pt window", r[0] + r[2]);
+            }
+        }
     }
 
     #[test]
