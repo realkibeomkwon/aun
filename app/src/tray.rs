@@ -37,7 +37,7 @@ pub struct Tray(rune::Tray, std::cell::Cell<(bool, bool)>);
 impl Tray {
     pub fn new(h: AppHandle<Ui>, clip: bool) -> Option<Tray> {
         use rune::{TrayEvent, TrayIcon, TraySpec};
-        let spec = TraySpec::new("dev.aun.desk", "Aun", TrayIcon::rgba(32, 32, icon(32))).tooltip("Aun").menu(menu(clip, false));
+        let spec = TraySpec::new("dev.aun.desk", "Aun", TrayIcon::rgba(32, 32, TRAY_ICON.to_vec())).tooltip("Aun").menu(menu(clip, false));
         let tray = rune::Tray::new(spec, move |e| match e {
             TrayEvent::Activate { .. } => h.open(),
             TrayEvent::Menu(id) => pick(&h, &id),
@@ -68,29 +68,9 @@ fn menu(clip: bool, copied: bool) -> Vec<rune::TrayItem> {
     v
 }
 
-/// Two overlapping screens in white on a blue rounded square, `n × n` straight RGBA.
+/// The app icon's square at 32 × 32, straight RGBA, drawn by `scripts/icon.swift`.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn icon(n: usize) -> Vec<u8> {
-    let f = n as f32 / 32.0;
-    let inside = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32| x >= x0 * f && x < x1 * f && y >= y0 * f && y < y1 * f;
-    let mut px = Vec::with_capacity(n * n * 4);
-    for y in 0..n {
-        for x in 0..n {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            // Rounded corners: radius 6 at 32 px.
-            let (r, c) = (6.0 * f, |v: f32| v.clamp(6.0 * f, n as f32 - 6.0 * f));
-            let corner = (fx - c(fx)).hypot(fy - c(fy)) > r;
-            let back = inside(fx, fy, 4.0, 7.0, 20.0, 19.0) && !inside(fx, fy, 6.0, 9.0, 18.0, 17.0);
-            let front = inside(fx, fy, 12.0, 13.0, 28.0, 25.0) && !inside(fx, fy, 14.0, 15.0, 26.0, 23.0);
-            px.extend_from_slice(match () {
-                _ if corner => &[0, 0, 0, 0],
-                _ if back || front => &[255, 255, 255, 255],
-                _ => &[37, 99, 235, 255],
-            });
-        }
-    }
-    px
-}
+const TRAY_ICON: &[u8] = include_bytes!("../../assets/tray.rgba");
 
 #[cfg(target_os = "macos")]
 pub use mac::Tray;
@@ -102,7 +82,7 @@ mod mac {
     use objc2::runtime::NSObject;
     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem};
-    use objc2_foundation::NSString;
+    use objc2_foundation::{NSData, NSSize, NSString};
 
     type OnPick = Box<dyn Fn(&str)>;
 
@@ -162,10 +142,13 @@ mod mac {
             // NSVariableStatusItemLength
             let item = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
             if let Some(button) = item.button(mtm) {
-                let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str("rectangle.on.rectangle"), Some(&NSString::from_str("Aun")));
-                match image {
+                // The app icon's two pointers as a template image, 36 px for 18 pt (`scripts/icon.swift`).
+                let png = NSData::with_bytes(include_bytes!("../../assets/menubar.png"));
+                match NSImage::initWithData(mtm.alloc(), &png) {
                     Some(img) => {
+                        img.setSize(NSSize::new(18.0, 18.0));
                         img.setTemplate(true);
+                        img.setAccessibilityDescription(Some(&NSString::from_str("Aun")));
                         button.setImage(Some(&img));
                     }
                     None => button.setTitle(&NSString::from_str("Aun")),
@@ -213,10 +196,8 @@ mod tests {
     #[test]
     fn the_tray_icon_matches_its_size_and_has_clear_corners() {
         // rune::Tray refuses pixels that aren't width × height × 4 bytes.
-        for n in [16, 32] {
-            let px = icon(n);
-            assert_eq!(px.len(), n * n * 4);
-            assert_eq!(px[3], 0, "the top-left corner is transparent");
-        }
+        assert_eq!(TRAY_ICON.len(), 32 * 32 * 4);
+        assert_eq!(TRAY_ICON[3], 0, "the top-left corner is transparent");
+        assert!(TRAY_ICON[(16 * 32 + 16) * 4 + 3] > 250, "the middle is opaque");
     }
 }
