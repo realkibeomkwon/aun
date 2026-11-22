@@ -225,8 +225,6 @@ pub struct Os {
     /// the user's Mac the first `f` after one arrives as Globe+F (2026-11-22, not reproduced here).
     #[cfg(target_os = "macos")]
     probe: u8,
-    #[cfg(target_os = "macos")]
-    src: mac::Source,
 }
 
 /// Whether this process may inject input. macOS asks for Accessibility (and, with `prompt`,
@@ -276,12 +274,24 @@ mod mac {
 
     const OPTION: u64 = 0x8_0000;
     const RETURN: u16 = 0x24;
-    /// `kCGEventFlagMaskSecondaryFn`, `kVK_Function`, and the flag every event has at rest.
-    const FN: u64 = 0x80_0000;
+    /// `kCGEventFlagMaskSecondaryFn` and `kCGEventFlagMaskNumericPad`.
+    pub const FN: u64 = 0x80_0000;
+    pub const NUMPAD: u64 = 0x20_0000;
+    /// Key codes that carry each, as a fresh private event source gives them (all of 0..0x80,
+    /// measured 2026-11-22).
+    const FN_CODES: [u16; 31] = [0x3F, 0x40, 0x47, 0x4F, 0x50, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x67, 0x69, 0x6A, 0x6B, 0x6D, 0x6F, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E];
+    const PAD_CODES: [u16; 21] = [0x41, 0x43, 0x45, 0x4B, 0x4C, 0x4E, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5B, 0x5C, 0x7B, 0x7C, 0x7D, 0x7E];
+
+    /// The function and keypad flags a key's events have of their own. An event made from the
+    /// session takes them from the last one posted too: after an injected F19 (the input source
+    /// shortcut), the PC's next `f` came as Globe+F and filled the screen (2026-11-22).
+    pub fn own_flags(code: u16) -> u64 {
+        (if FN_CODES.contains(&code) { FN } else { 0 }) | (if PAD_CODES.contains(&code) { NUMPAD } else { 0 })
+    }
+
+    /// `kVK_Function`, and the flag every event has at rest.
     const FN_KEY: u16 = 0x3F;
     const NON_COALESCED: u64 = 0x100;
-    /// `kCGEventSourceStatePrivate`.
-    const PRIVATE_STATE: i32 = -1;
     /// HID Lang1 (한/영 on a Korean keyboard) and Lang2 (한자).
     const LANG1: u16 = 0x90;
     const LANG2: u16 = 0x91;
@@ -323,7 +333,6 @@ mod mac {
         fn CGEventSetFlags(e: Ref, flags: u64);
         fn CGEventGetFlags(e: Ref) -> u64;
         fn CGEventSourceFlagsState(state: i32) -> u64;
-        fn CGEventSourceCreate(state: i32) -> Ref;
         fn CGEventSetType(e: Ref, kind: u32);
         fn CGEventPost(tap: u32, e: Ref);
         fn CGGetActiveDisplayList(max: u32, out: *mut u32, count: *mut u32) -> i32;
@@ -343,30 +352,6 @@ mod mac {
         fn AXIsProcessTrustedWithOptions(options: Ref) -> bool;
         static kAXTrustedCheckOptionPrompt: Ref;
     }
-
-    /// The event source events are made from: a private one, so they carry their own key's flags
-    /// and not the session's. Made from the session's, an `f` after an injected F-key or arrow
-    /// inherited its function flag even after the flags were put back (2026-11-22, Globe+F).
-    pub struct Source(Ref);
-
-    impl Default for Source {
-        fn default() -> Self {
-            // SAFETY: a new source, released on drop.
-            Source(unsafe { CGEventSourceCreate(PRIVATE_STATE) })
-        }
-    }
-
-    impl Drop for Source {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: made by `CGEventSourceCreate`, released once.
-                unsafe { CFRelease(self.0) };
-            }
-        }
-    }
-
-    // SAFETY: one link's thread uses it at a time; CoreGraphics sources aren't tied to a thread.
-    unsafe impl Send for Source {}
 
     pub fn trusted(prompt: bool) -> bool {
         // SAFETY: a one-entry dictionary of CF constants, released after the call that reads it.
@@ -432,7 +417,8 @@ mod mac {
             unsafe {
                 let flags = self.flags();
                 if flags != 0 {
-                    CGEventSetFlags(e, flags);
+                    // A key's own function and keypad flags stay: a Shift-arrow is still an arrow.
+                    CGEventSetFlags(e, flags | CGEventGetFlags(e) & (FN | NUMPAD));
                 }
                 CGEventPost(HID_TAP, e);
                 let fn_on = CGEventGetFlags(e) & FN != 0;
@@ -450,7 +436,7 @@ mod mac {
         fn settle(&self) {
             // SAFETY: a new event, posted and released here.
             unsafe {
-                let e = CGEventCreateKeyboardEvent(self.src.0, FN_KEY, false);
+                let e = CGEventCreateKeyboardEvent(std::ptr::null_mut(), FN_KEY, false);
                 if !e.is_null() {
                     CGEventSetType(e, FLAGS_CHANGED);
                     CGEventSetFlags(e, self.flags() | NON_COALESCED);
@@ -472,7 +458,7 @@ mod mac {
             };
             // SAFETY: a new event, posted and released by `post`.
             unsafe {
-                let e = CGEventCreateMouseEvent(self.src.0, kind, to, button);
+                let e = CGEventCreateMouseEvent(std::ptr::null_mut(), kind, to, button);
                 if !e.is_null() {
                     // Games and 3D views read only the deltas.
                     CGEventSetIntegerValueField(e, DELTA_X, dx.into());
@@ -486,7 +472,7 @@ mod mac {
             let kind = DOWN[button as usize] + !down as u32;
             // SAFETY: as above.
             unsafe {
-                let e = CGEventCreateMouseEvent(self.src.0, kind, location(), button.into());
+                let e = CGEventCreateMouseEvent(std::ptr::null_mut(), kind, location(), button.into());
                 if !e.is_null() {
                     CGEventSetIntegerValueField(e, CLICK_STATE, clicks.into());
                 }
@@ -496,7 +482,7 @@ mod mac {
 
         fn wheel(&mut self, dx: i32, dy: i32) {
             // SAFETY: as above.
-            self.post(unsafe { CGEventCreateScrollWheelEvent2(self.src.0, PIXEL, 2, dy, dx, 0) });
+            self.post(unsafe { CGEventCreateScrollWheelEvent2(std::ptr::null_mut(), PIXEL, 2, dy, dx, 0) });
         }
 
         fn key(&mut self, hid: u16, down: bool) {
@@ -514,11 +500,11 @@ mod mac {
                 for d in [true, false].into_iter().filter(|_| down) {
                     // SAFETY: a new event, posted and released here.
                     unsafe {
-                        let e = CGEventCreateKeyboardEvent(self.src.0, code, d);
+                        let e = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, d);
                         if !e.is_null() {
                             // Added to the event's own: an F-key without its function flag
                             // doesn't fire a shortcut set to it (seen with F19, 2026-11-22).
-                            CGEventSetFlags(e, CGEventGetFlags(e) | flags);
+                            CGEventSetFlags(e, CGEventGetFlags(e) & !(FN | NUMPAD) | own_flags(code) | flags);
                             CGEventPost(HID_TAP, e);
                             CFRelease(e);
                         }
@@ -537,7 +523,7 @@ mod mac {
             }
             // SAFETY: a new event, posted and released by `post`.
             unsafe {
-                let e = CGEventCreateKeyboardEvent(self.src.0, code as u16, down);
+                let e = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code as u16, down);
                 if e.is_null() {
                     return;
                 }
@@ -545,6 +531,8 @@ mod mac {
                     // Apps see a modifier as flags changing, not as a key going down.
                     CGEventSetType(e, FLAGS_CHANGED);
                     CGEventSetFlags(e, self.flags());
+                } else {
+                    CGEventSetFlags(e, CGEventGetFlags(e) & !(FN | NUMPAD) | own_flags(code as u16));
                 }
                 if down && self.probe > 0 {
                     self.probe -= 1;
@@ -700,6 +688,22 @@ pub(crate) mod tests {
         fn key(&mut self, hid: u16, down: bool) {
             self.0.lock().unwrap().push(format!("key {hid:#x} {}", if down { "down" } else { "up" }));
         }
+    }
+
+    /// A key's own flags, as a clean event source gives them (measured 2026-11-22): the function
+    /// flag on F-keys and the keys around the arrows, the keypad flag on the keypad and arrows.
+    /// Injected events get exactly these, never ones left over in the session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keys_carry_only_their_own_function_and_keypad_flags() {
+        use mac::{own_flags, FN, NUMPAD};
+        assert_eq!(own_flags(0x03), 0, "f");
+        assert_eq!(own_flags(0x50), FN, "F19");
+        assert_eq!(own_flags(0x7A), FN, "F1");
+        assert_eq!(own_flags(0x7C), FN | NUMPAD, "right arrow");
+        assert_eq!(own_flags(0x75), FN, "forward delete");
+        assert_eq!(own_flags(0x53), NUMPAD, "keypad 1");
+        assert_eq!(own_flags(0x24), 0, "return");
     }
 
     /// 한/영 on a Mac is whichever input source shortcut is on: this Mac's own setup (Caps Lock
