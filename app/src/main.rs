@@ -364,6 +364,18 @@ impl Ui {
                     self.say("상대가 응답하지 않아 원격 조작을 멈췄어요 (상대에서 원격 조작 허용이 켜져 있는지 확인하세요)", tx);
                 }
             }
+            Note::Blocked { id, route: _route } => {
+                const WHY: &str = "상대 PC에서 관리자 권한 창이 앞에 있어 입력이 들어가지 않아요. 그 창은 PC의 마우스로 다루세요";
+                #[cfg(target_os = "macos")]
+                if let Some(c) = &self.cross
+                    && c.blocked(id, _route)
+                {
+                    self.say(format!("{WHY} (이 기기로 돌아왔어요)"), tx);
+                }
+                if self.pad.as_ref().is_some_and(|p| p.id == id) {
+                    self.say(WHY, tx);
+                }
+            }
             Note::Returned { id: _id, route: _route, at: _at } => {
                 #[cfg(target_os = "macos")]
                 if let Some(c) = &self.cross {
