@@ -1,6 +1,8 @@
 //! Aun's engine: discovery, pairing, encrypted links, clipboard, file transfer and injected
 //! mouse input. No UI.
 
+#[cfg(target_os = "macos")]
+pub mod capture;
 pub mod clip;
 pub mod discovery;
 pub mod kvm;

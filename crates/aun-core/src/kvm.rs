@@ -80,6 +80,21 @@ pub fn mac_modifier(code: u16, flags: u64) -> Option<(u16, bool)> {
     MODS.iter().find(|m| m.0 == code).map(|m| (m.1, flags & m.2 != 0))
 }
 
+/// Control and ⌘ (the Windows key) swapped, left and right, when `swap` (the app's setting).
+pub fn swapped(hid: u16, swap: bool) -> u16 {
+    match hid {
+        0xE0 | 0xE4 if swap => hid + 3,
+        0xE3 | 0xE7 if swap => hid - 3,
+        _ => hid,
+    }
+}
+
+/// macOS: the box around every display, in global display points.
+#[cfg(target_os = "macos")]
+pub(crate) fn screen_bounds() -> Option<Bounds> {
+    mac::bounds()
+}
+
 /// What a capture saw, in wire terms.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Captured {
@@ -239,6 +254,9 @@ pub trait Sink {
     fn wheel(&mut self, dx: i32, dy: i32);
     /// `hid`: see [`hid`]. A down while held is a repeat.
     fn key(&mut self, hid: u16, down: bool);
+    /// Before letting go of a held Windows key (⌘) the driver didn't let go of itself: keeps it
+    /// from acting alone as it goes up (Windows opens Start).
+    fn mask(&mut self) {}
 }
 
 impl<S: Sink + ?Sized> Sink for Box<S> {
@@ -256,6 +274,9 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
     }
     fn key(&mut self, hid: u16, down: bool) {
         (**self).key(hid, down)
+    }
+    fn mask(&mut self) {
+        (**self).mask()
     }
 }
 
@@ -335,6 +356,10 @@ impl<S: Sink> Injector<S> {
 
     /// Lets go of every key and button held down here, keys last pressed first.
     pub fn release(&mut self) {
+        // Left across by the escape key with ⌘·Ctrl swapped, Ctrl is held there as Win.
+        if self.keys.iter().any(|&k| matches!(k, 0xE3 | 0xE7)) {
+            self.sink.mask();
+        }
         while let Some(k) = self.keys.pop() {
             self.sink.key(k, false);
         }
@@ -804,14 +829,7 @@ mod win {
                 // SAFETY: plain reads of the keyboard state.
                 let held = [VK_LWIN, VK_RWIN, VK_MENU].iter().any(|&k| unsafe { GetAsyncKeyState(k.into()) } < 0);
                 if down && held {
-                    for up in [0, KEYEVENTF_KEYUP] {
-                        let mask = INPUT {
-                            r#type: INPUT_KEYBOARD,
-                            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: MASK_KEY, wScan: 0, dwFlags: up, time: 0, dwExtraInfo: MARK } },
-                        };
-                        // SAFETY: one initialised INPUT of the size given.
-                        unsafe { SendInput(1, &mask, size_of::<INPUT>() as i32) };
-                    }
+                    self.mask();
                 }
                 let input = INPUT {
                     r#type: INPUT_KEYBOARD,
@@ -836,6 +854,17 @@ mod win {
             };
             // SAFETY: one initialised INPUT of the size given.
             unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+        }
+
+        fn mask(&mut self) {
+            for up in [0, KEYEVENTF_KEYUP] {
+                let mask = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: MASK_KEY, wScan: 0, dwFlags: up, time: 0, dwExtraInfo: MARK } },
+                };
+                // SAFETY: one initialised INPUT of the size given.
+                unsafe { SendInput(1, &mask, size_of::<INPUT>() as i32) };
+            }
         }
     }
 }
@@ -884,6 +913,26 @@ pub(crate) mod tests {
         fn key(&mut self, hid: u16, down: bool) {
             self.0.lock().unwrap().push(format!("key {hid:#x} {}", if down { "down" } else { "up" }));
         }
+        fn mask(&mut self) {
+            self.0.lock().unwrap().push("mask".into());
+        }
+    }
+
+    /// A Windows key still held when the driver leaves (Ctrl sent as Win, then the escape key)
+    /// goes up masked; one the driver let go of itself, as for Start, isn't masked.
+    #[test]
+    fn a_windows_key_left_held_goes_up_masked() {
+        let rec = Rec::default();
+        let mut inj = Injector::new(rec.clone());
+        for (hid, down) in [(0xE3, true), (0xE3, false)] {
+            inj.apply(Frame::KvmKey { hid, down });
+        }
+        inj.apply(Frame::KvmLeave);
+        for hid in [0xE3, 0xE2, 0xE1] {
+            inj.apply(Frame::KvmKey { hid, down: true });
+        }
+        inj.apply(Frame::KvmLeave);
+        assert_eq!(*rec.0.lock().unwrap(), ["key 0xe3 down", "key 0xe3 up", "key 0xe3 down", "key 0xe2 down", "key 0xe1 down", "mask", "key 0xe1 up", "key 0xe2 up", "key 0xe3 up"]);
     }
 
     /// A key's own flags, as a clean event source gives them (measured 2026-11-22): the function

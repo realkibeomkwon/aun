@@ -107,6 +107,9 @@ struct Ui {
     autostart: bool,
     handle: Option<AppHandle<Ui>>,
     tray: Option<tray::Tray>,
+    /// Crossing to a peer past the screen edge (`Settings::cross`), while on.
+    #[cfg(target_os = "macos")]
+    cross: Option<aun_core::capture::Cross>,
 }
 
 impl Ui {
@@ -116,7 +119,7 @@ impl Ui {
         let autostart = dir.is_some() && autostart::enabled();
         let mut ui = Ui {
             node, pad: None, route: 0, #[cfg(test)] sent: Default::default(), me, peers: vec![], code: None, pairing: None, ip_input: TextEdit::new(""), code_input: TextEdit::new(""), transfers: vec![], message: None, flash: None, copied: vec![], copied_dirs: 0, over: None,
-            dir, settings, autostart, handle: None, tray: None,
+            dir, settings, autostart, handle: None, tray: None, #[cfg(target_os = "macos")] cross: None,
         };
         ui.refresh();
         ui
@@ -207,7 +210,7 @@ impl Ui {
                 }
                 let hid = p.lang.iter().find(|l| l.0 == key).map(|l| l.1).or_else(|| aun_core::kvm::hid(key));
                 let Some(hid) = hid else { return true };
-                let hid = swapped(hid, swap);
+                let hid = aun_core::kvm::swapped(hid, swap);
                 let at = p.keys.iter().position(|&k| k == hid);
                 match (pressed, at) {
                     (true, None) => p.keys.push(hid),
@@ -248,7 +251,7 @@ impl Ui {
 
     /// Whether ⌘ on this keyboard (whatever it is sent as) is down on the pad.
     fn command_held(&self) -> bool {
-        self.pad.as_ref().is_some_and(|p| p.keys.iter().any(|&k| matches!(swapped(k, self.settings.swap), 0xE3 | 0xE7)))
+        self.pad.as_ref().is_some_and(|p| p.keys.iter().any(|&k| matches!(aun_core::kvm::swapped(k, self.settings.swap), 0xE3 | 0xE7)))
     }
 
     fn pad_move(&mut self, dx: f32, dy: f32) {
@@ -292,6 +295,33 @@ impl Ui {
             self.pad = None;
             menu_off(false);
         }
+        // shortcut: the first connected peer that takes input; one peer is all this desk has.
+        #[cfg(target_os = "macos")]
+        if let Some(c) = &self.cross {
+            c.set_peer(self.peers.iter().find(|p| p.connected && p.kvm).map(|p| p.id));
+        }
+    }
+
+    /// Crossing past the screen edge, on or off. On, it tells the way back first.
+    #[cfg(target_os = "macos")]
+    fn set_cross(&mut self, on: bool, tx: &mut Tx) {
+        self.cross = None; // the old tap goes first: input back here
+        self.settings.cross = on;
+        if on && let Some(n) = &self.node {
+            match aun_core::capture::Cross::start(n.clone(), self.settings.side, self.settings.swap) {
+                Ok(c) => {
+                    self.cross = Some(c);
+                    self.refresh();
+                    self.say("상대 화면 쪽 가장자리로 포인터를 밀면 건너가요. 돌아오려면 반대로 밀거나 ⌃⌥⇧Esc를 누르세요", tx);
+                }
+                Err(e) => {
+                    aun_core::log(format_args!("cross: not started: {e}"));
+                    self.settings.cross = false;
+                    self.say("시스템 설정 > 개인정보 보호 및 보안 > 입력 모니터링에서 Aun을 허용한 뒤 다시 켜세요", tx);
+                }
+            }
+        }
+        self.save(tx);
     }
 
     fn say(&mut self, m: impl Into<String>, tx: &mut Tx) {
@@ -325,7 +355,18 @@ impl Ui {
                 self.close_pad();
                 self.say("상대가 응답하지 않아 원격 조작을 멈췄어요", tx);
             }
-            Note::InputLost(_) | Note::Returned { .. } => {} // the pad sends no KvmEnter
+            Note::InputLost(_id) => {
+                #[cfg(target_os = "macos")]
+                if let Some(c) = &self.cross {
+                    c.lost(_id);
+                }
+            }
+            Note::Returned { id: _id, route: _route, at: _at } => {
+                #[cfg(target_os = "macos")]
+                if let Some(c) = &self.cross {
+                    c.returned(_id, _route, _at);
+                }
+            }
             Note::Copied(paths) => {
                 let n = paths.len();
                 self.copied = paths.into_iter().filter(|p| p.is_file()).collect();
@@ -573,6 +614,18 @@ fn view(s: &Ui, cx: &mut Cx<Ui>) -> El {
         .child(button("kvm".into(), if s.settings.kvm { "원격 조작 허용 켜짐" } else { "원격 조작 허용 꺼짐" }, t, s.settings.kvm, |s, tx| {
             s.set_kvm(!s.settings.kvm, tx)
         }));
+    #[cfg(target_os = "macos")]
+    {
+        prefs = prefs
+            .child(button("cross".into(), if s.settings.cross { "가장자리로 건너가기 켜짐" } else { "가장자리로 건너가기 꺼짐" }, t, s.settings.cross, |s, tx| {
+                s.set_cross(!s.settings.cross, tx)
+            }))
+            .child(button("cross-side".into(), if s.settings.side == 0 { "상대 화면: 왼쪽" } else { "상대 화면: 오른쪽" }, t, false, |s, tx| {
+                s.settings.side ^= 1;
+                let on = s.settings.cross;
+                s.set_cross(on, tx);
+            }));
+    }
     if cfg!(target_os = "macos") {
         prefs = prefs.child(button("dock".into(), if s.settings.dock { "Dock 아이콘 표시" } else { "Dock 아이콘 숨김" }, t, s.settings.dock, |s, tx| {
             s.set_dock(!s.settings.dock, tx)
@@ -730,19 +783,14 @@ fn pad(s: &Ui, t: Theme) -> Option<El> {
             .child(text(format!("{} 원격 조작 중", p.name)).font(type_::LABEL).color(t.text).grow(1.0))
             .child(button("pad-swap".into(), SWAP[s.settings.swap as usize], t, s.settings.swap, |s, tx| {
                 s.settings.swap = !s.settings.swap;
+                #[cfg(target_os = "macos")]
+                if let Some(c) = &s.cross {
+                    c.set_swap(s.settings.swap);
+                }
                 s.save(tx);
             }))
             .child(button("pad-close".into(), "그만", t, false, |s, _| s.close_pad())))
         .child(area))
-}
-
-/// Control and ⌘ (the Windows key) swapped, left and right, when `swap` (`Settings::swap`).
-fn swapped(hid: u16, swap: bool) -> u16 {
-    match hid {
-        0xE0 | 0xE4 if swap => hid + 3,
-        0xE3 | 0xE7 if swap => hid - 3,
-        _ => hid,
-    }
 }
 
 /// macOS: takes the menu bar away (`true`) and puts it back, so no menu key equivalent runs.
@@ -1063,7 +1111,7 @@ fn main() {
         // Runs on the main thread once the loop starts, window or not.
         let h = app.handle();
         let power = node.clone();
-        app.handle().update(move |s, _| {
+        app.handle().update(move |s, _tx| {
             if let Some(n) = power {
                 aun_core::power::watch(n);
             }
@@ -1074,12 +1122,28 @@ fn main() {
                 aun_core::kvm::on_input_source_change(move || h.update(|s: &mut Ui, _| s.input_source_changed()));
             }
             aun_core::log(format_args!("tray {}", if s.tray.is_some() { "up" } else { "unavailable" }));
+            #[cfg(target_os = "macos")]
+            if s.settings.cross {
+                s.set_cross(true, _tx);
+            }
             s.handle = Some(h);
         });
         node
     };
     let dir = (!headless).then_some(dir);
+    // Across to the peer, the mouse is detached from the cursor: put it back on the way out,
+    // whatever the way (docs/kvm-design.md 7.5).
+    #[cfg(target_os = "macos")]
+    {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            aun_core::capture::release_cursor();
+            default(info);
+        }));
+    }
     app.init(move || Ui::new(node, dir)).run();
+    #[cfg(target_os = "macos")]
+    aun_core::capture::release_cursor();
 }
 
 #[cfg(test)]
