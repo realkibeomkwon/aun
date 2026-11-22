@@ -9,7 +9,7 @@
 //! [`State::end`], which can run on any thread and twice.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -33,6 +33,7 @@ type Callback = extern "C" fn(proxy: Ref, kind: u32, event: Ref, user: *mut c_vo
 unsafe extern "C" {
     fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, callback: Callback, user: *mut c_void) -> Ref;
     fn CGEventTapEnable(tap: Ref, enable: bool);
+    fn CGEventCreate(source: Ref) -> Ref;
     fn CGEventGetIntegerValueField(e: Ref, field: u32) -> i64;
     fn CGEventGetFlags(e: Ref) -> u64;
     fn CGEventGetLocation(e: Ref) -> Point;
@@ -108,6 +109,39 @@ struct State {
     /// The screens' box as last read, as `f64` bits: read again when the pointer seems past it.
     bounds: [AtomicU64; 4],
     tap: AtomicPtr<c_void>,
+    /// Why the last crossing ended ([`Why`]), for the sender's log.
+    why: AtomicU8,
+    /// Where the cursor was as the last crossing ended, before it was put back.
+    gone: [AtomicU64; 2],
+}
+
+/// Why a crossing ended, logged by the sender (the tap callback may not log).
+struct Why;
+impl Why {
+    const RETURNED: u8 = 0;
+    const ESCAPE: u8 = 1;
+    const QUEUE_FULL: u8 = 2;
+    const TAP_TIMEOUT: u8 = 3;
+    const TAP_USER: u8 = 4;
+    const LOST: u8 = 5;
+    const NO_PEER: u8 = 6;
+    const NOT_SENT: u8 = 7;
+    const STOPPED: u8 = 8;
+    const NAMES: [&str; 9] = ["came back", "escape key", "queue full", "tap disabled by timeout", "tap disabled by user input", "no word back", "no peer", "a frame not sent", "stopped"];
+}
+
+/// Where the cursor is now, in global display points.
+fn cursor() -> (f64, f64) {
+    // SAFETY: an event made only to read the location, released at once.
+    unsafe {
+        let e = CGEventCreate(std::ptr::null_mut());
+        if e.is_null() {
+            return (0.0, 0.0);
+        }
+        let p = CGEventGetLocation(e);
+        CFRelease(e);
+        (p.x, p.y)
+    }
 }
 
 impl State {
@@ -128,10 +162,13 @@ impl State {
     /// came back there (`KvmReturn`), else where it went out, and owes the peer a `KvmLeave`.
     /// Without `at` (escape, a stall, the link gone) a new crossing waits until the pointer has
     /// moved away from the edge.
-    fn end(&self, at: Option<u16>) {
+    fn end(&self, at: Option<u16>, why: u8) {
         if !self.crossed.swap(false, Ordering::SeqCst) {
             return;
         }
+        self.why.store(why, Ordering::Relaxed);
+        let (x, y) = cursor(); // before the warp below, for the sender's log
+        self.gone.each_ref().iter().zip([x, y]).for_each(|(a, v)| a.store(v.to_bits(), Ordering::Relaxed));
         self.armed.store(at.is_some(), Ordering::Relaxed);
         let at = at.unwrap_or(self.at.load(Ordering::Relaxed) as u16);
         let (x, y) = kvm::entry(self.reread(), self.side, at);
@@ -157,7 +194,7 @@ impl State {
         if self.out.try_send(c).is_ok() {
             return true;
         }
-        self.end(None); // the sender is stuck: input back here (docs 7.4)
+        self.end(None, Why::QUEUE_FULL); // the sender is stuck: input back here (docs 7.4)
         false
     }
 }
@@ -174,7 +211,7 @@ extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
     let field = |f| unsafe { CGEventGetIntegerValueField(e, f) };
     if kind == DISABLED_BY_TIMEOUT || kind == DISABLED_BY_USER {
         // Too slow once (or turned off): input back here, and the tap on again (docs 7.4).
-        st.end(None);
+        st.end(None, if kind == DISABLED_BY_TIMEOUT { Why::TAP_TIMEOUT } else { Why::TAP_USER });
         // SAFETY: the tap this callback belongs to.
         unsafe { CGEventTapEnable(st.tap.load(Ordering::Relaxed), true) };
         return e;
@@ -224,7 +261,7 @@ extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
         KEY_DOWN | KEY_UP => {
             let Some(hid) = kvm::hid_of(field(KEYCODE) as u32) else { return std::ptr::null_mut() };
             if kind == KEY_DOWN && kvm::escape(hid, mods(flags)) {
-                st.end(None);
+                st.end(None, Why::ESCAPE);
                 return std::ptr::null_mut();
             }
             Captured::Key(hid, kind == KEY_DOWN)
@@ -281,6 +318,8 @@ impl Cross {
             at: AtomicU32::new(0),
             bounds: [b.x0, b.y0, b.x1, b.y1].map(|v| AtomicU64::new(v.to_bits())),
             tap: AtomicPtr::new(std::ptr::null_mut()),
+            why: AtomicU8::new(Why::STOPPED),
+            gone: [AtomicU64::new(0), AtomicU64::new(0)],
         });
         let (made_tx, made) = mpsc::sync_channel(1);
         let user = Arc::into_raw(st.clone()) as usize;
@@ -307,7 +346,7 @@ impl Cross {
                 CFRelease(src);
                 CFRelease(port);
                 let st = Arc::from_raw(user as *const State);
-                st.end(None);
+                st.end(None, Why::STOPPED);
             }
         }).map_err(|e| e.to_string())?;
         let rl = made.recv().ok().flatten().ok_or("event tap not made (a permission missing?)")?;
@@ -324,7 +363,7 @@ impl Cross {
         *self.target.lock().unwrap() = id;
         self.st.peer.store(id.is_some(), Ordering::Relaxed);
         if id.is_none() {
-            self.st.end(None);
+            self.st.end(None, Why::NO_PEER);
         }
     }
 
@@ -335,7 +374,7 @@ impl Cross {
     /// The pointer came back from `id` (`Note::Returned`): input back here at that point.
     pub fn returned(&self, id: Id, route: u32, at: u16) {
         if *self.target.lock().unwrap() == Some(id) && self.route.load(Ordering::SeqCst) == route {
-            self.st.end(Some(at));
+            self.st.end(Some(at), Why::RETURNED);
         }
     }
 
@@ -343,7 +382,7 @@ impl Cross {
     pub fn lost(&self, id: Id) -> bool {
         let across = self.st.crossed.load(Ordering::SeqCst);
         if *self.target.lock().unwrap() == Some(id) {
-            self.st.end(None);
+            self.st.end(None, Why::LOST);
             return across;
         }
         false
@@ -353,7 +392,7 @@ impl Cross {
 impl Drop for Cross {
     fn drop(&mut self) {
         self.st.peer.store(false, Ordering::Relaxed);
-        self.st.end(None);
+        self.st.end(None, Why::STOPPED);
         // SAFETY: the tap (alive until its thread invalidates it after the run loop stops), then
         // that thread's run loop. Off first, so a stop that lands before the loop runs leaves no
         // live tap.
@@ -377,7 +416,12 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
     let mut d = Driver::default();
     let (mut started, mut left) = (0u32, 0u32);
     let mut to: Option<Id> = None;
-    let leave = |to: Option<Id>, left: &mut u32| {
+    let mut entered = (0.0, 0.0);
+    let leave = |to: Option<Id>, left: &mut u32, st: &State, entered: (f64, f64)| {
+        // Diagnostic (2026-11-22 device test): why it ended, and whether this Mac's cursor moved
+        // while across (it should stay put at the edge).
+        let [x, y] = st.gone.each_ref().map(|a| f64::from_bits(a.load(Ordering::Relaxed)));
+        crate::log(format_args!("cross: out ({}); the cursor moved {:.0},{:.0} while across", Why::NAMES[usize::from(st.why.load(Ordering::Relaxed)).min(8)], x - entered.0, y - entered.1));
         *left += 1;
         if let Some(id) = to {
             node.send_input(id, crate::wire::Frame::KvmLeave);
@@ -400,13 +444,15 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
         for c in first.into_iter().chain(rx.try_iter()) {
             if let Captured::Enter(_) = c {
                 if started != left {
-                    leave(to, &mut left); // the previous one ended before this could start
+                    leave(to, &mut left, &st, entered); // the previous one ended before this could start
                 }
                 started += 1;
                 to = *target.lock().unwrap();
+                entered = cursor();
+                crate::log(format_args!("cross: in at {:.0},{:.0}", entered.0, entered.1));
             }
             let Some(id) = to else {
-                st.end(None);
+                st.end(None, Why::NO_PEER);
                 continue;
             };
             let f = match d.frame(c, st.side) {
@@ -419,11 +465,11 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
             // A move or scroll dropped on a full queue is no reason: the next move carries it.
             let must = f.must_arrive();
             if !node.send_input(id, f) && must {
-                st.end(None); // no link that speaks input, or stuck: nothing to drive
+                st.end(None, Why::NOT_SENT); // no link that speaks input, or stuck: nothing to drive
             }
         }
         if started != left && st.ends.load(Ordering::SeqCst) > left {
-            leave(to, &mut left);
+            leave(to, &mut left, &st, entered);
         }
     }
 }

@@ -967,6 +967,10 @@ impl Node {
                         let _ = files.tx.fast.try_send(None);
                         let _ = live.wake.try_send(());
                     }
+                    // Diagnostic (2026-11-22 device test): lines the two logs up.
+                    if matches!(f, Frame::KvmEnter { .. } | Frame::KvmLeave) {
+                        crate::log(format_args!("input from {}: {f:?}", files.peer));
+                    }
                     let mut input = live.input.lock().unwrap();
                     if !self.kvm() {
                         input.release();

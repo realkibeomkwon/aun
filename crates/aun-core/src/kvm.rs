@@ -756,8 +756,23 @@ mod win {
             r#type: INPUT_MOUSE,
             Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data as u32, dwFlags: flags, time: 0, dwExtraInfo: MARK } },
         };
+        push(&input);
+    }
+
+    /// Whether the last `SendInput` failed, to log only the changes.
+    static FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Injects one input. Diagnostic (2026-11-22 device test, remote control stopped after a
+    /// hot corner showed the desktop): logs when injection starts failing, with the error, and
+    /// when it works again.
+    fn push(input: &INPUT) {
         // SAFETY: one initialised INPUT of the size given.
-        unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+        let ok = unsafe { SendInput(1, input, size_of::<INPUT>() as i32) } == 1;
+        if FAILING.swap(!ok, std::sync::atomic::Ordering::Relaxed) == ok {
+            // SAFETY: a plain read of this thread's last error.
+            let e = if ok { 0 } else { unsafe { windows_sys::Win32::Foundation::GetLastError() } };
+            crate::log(format_args!("input: SendInput {}", if ok { "works again".to_owned() } else { format!("failed (error {e})") }));
+        }
     }
 
     /// See `super::lang_keys`.
@@ -853,8 +868,7 @@ mod win {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: 0, dwFlags: if down { 0 } else { KEYEVENTF_KEYUP }, time: 0, dwExtraInfo: MARK } },
                 };
-                // SAFETY: one initialised INPUT of the size given.
-                unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+                push(&input);
                 return;
             }
             let Some(sc) = super::scancode(hid) else { return };
@@ -870,8 +884,7 @@ mod win {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: 0, wScan: (sc & 0xFF) as u16, dwFlags: flags, time: 0, dwExtraInfo: MARK } },
             };
-            // SAFETY: one initialised INPUT of the size given.
-            unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+            push(&input);
         }
 
         fn mask(&mut self) {
@@ -880,8 +893,7 @@ mod win {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: MASK_KEY, wScan: 0, dwFlags: up, time: 0, dwExtraInfo: MARK } },
                 };
-                // SAFETY: one initialised INPUT of the size given.
-                unsafe { SendInput(1, &mask, size_of::<INPUT>() as i32) };
+                push(&mask);
             }
         }
     }
