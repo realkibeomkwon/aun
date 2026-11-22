@@ -22,6 +22,8 @@ const PAD_GAIN: f32 = 2.0;
 /// macOS announces one input source switch more than once, 3-7 ms apart (seen 2026-11-22):
 /// announcements this close are one switch.
 const SAME_SWITCH: Duration = Duration::from_millis(100);
+/// How long after an input source shortcut on the pad the switch it makes may be announced.
+const COMBO_SWITCH: Duration = Duration::from_secs(3);
 /// The pad's ⌘/Ctrl switch (`Settings::swap`), off and on.
 const SWAP: [&str; 2] = ["⌘·Ctrl 맞바꾸기 꺼짐", "⌘·Ctrl 맞바꾸기 켜짐"];
 
@@ -70,6 +72,8 @@ struct Pad {
     /// Keys that, with these modifiers (macOS flags), switch this Mac's input source
     /// (`kvm::input_source_combos`): kept here, the switch goes as 한/영.
     combos: Vec<(rune::PhysicalKeyCode, u64)>,
+    /// When a shortcut in `combos` went as 한/영: the switch macOS announces after it is that one.
+    combo_at: Option<Instant>,
 }
 
 struct Ui {
@@ -155,7 +159,7 @@ impl Ui {
         self.route = self.route.wrapping_add(1);
         let lang = aun_core::kvm::lang_keys();
         aun_core::log(format_args!("pad: keys sent as 한/영 (0x90) or 한자 (0x91): {lang:?}"));
-        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang, focused: false, switched: None, combos: aun_core::kvm::input_source_combos() });
+        self.pad = Some(Pad { id, name, route: self.route, mn: 0, total: (0.0, 0.0), last: None, held: None, wheel: (0.0, 0.0), keys: Vec::new(), lang, focused: false, switched: None, combos: aun_core::kvm::input_source_combos(), combo_at: None });
     }
 
     /// Lets go of what the pad holds at the peer, then closes it.
@@ -192,7 +196,14 @@ impl Ui {
             rune::PhysicalInput::Key { key, pressed, mods, .. } => {
                 let held = [(mods.shift, 0x2_0000), (mods.ctrl, 0x4_0000), (mods.alt, 0x8_0000), (mods.logo, 0x10_0000)].iter().filter(|m| m.0).fold(0, |f, m| f | m.1);
                 if pressed && p.combos.contains(&(key, held)) {
-                    return true; // its up finds nothing held and goes nowhere either
+                    // As 한/영 now, while its modifier is down at the peer: macOS switches only
+                    // when the modifier comes up, after it went up there (a Win alone: Start).
+                    // The key's up finds nothing held and goes nowhere.
+                    p.combo_at = Some(Instant::now());
+                    for down in [true, false] {
+                        self.input(id, Frame::KvmKey { hid: 0x90, down });
+                    }
+                    return true;
                 }
                 let hid = p.lang.iter().find(|l| l.0 == key).map(|l| l.1).or_else(|| aun_core::kvm::hid(key));
                 let Some(hid) = hid else { return true };
@@ -227,6 +238,9 @@ impl Ui {
             return;
         }
         p.switched = Some(Instant::now());
+        if p.combo_at.take().is_some_and(|t| t.elapsed() < COMBO_SWITCH) {
+            return; // sent when the shortcut was pressed
+        }
         let id = p.id;
         self.input(id, Frame::KvmKey { hid: 0x90, down: true });
         self.input(id, Frame::KvmKey { hid: 0x90, down: false });
@@ -1275,19 +1289,25 @@ mod tests {
     }
 
     /// ⌃Space set to switch the Mac's input source reaches the pad as Control and Space too: the
-    /// Space stays here (the switch itself goes as 한/영), or the PC would get Win+Space.
+    /// Space stays here and goes as 한/영 at once, while Control (Win at the PC) is still down,
+    /// whichever key comes up first. (macOS switches when Control comes up: let go first, a 한/영
+    /// sent then came after Win and the PC opened Start.) The switch announced after it is the
+    /// same one.
     #[test]
-    fn the_input_source_shortcut_s_key_stays_here() {
+    fn the_input_source_shortcut_goes_as_hangul_while_its_modifier_is_down() {
         use rune::{PhysicalInput, PhysicalKeyCode as K};
         let key = |key, pressed, ctrl| PhysicalInput::Key { key, mods: rune::Mods { ctrl, ..Default::default() }, pressed, repeat: false };
         let mut ui = Ui::new(None, None);
         ui.open_pad([3; 32], "PC".into());
         ui.pad.as_mut().unwrap().combos = vec![(K::Space, 0x4_0000)];
-        for e in [key(K::ControlLeft, true, true), key(K::Space, true, true), key(K::Space, false, true), key(K::ControlLeft, false, false), key(K::Space, true, false)] {
-            ui.pad_key(&e);
-        }
+        ui.pad_key(&key(K::ControlLeft, true, true));
+        ui.pad_key(&key(K::Space, true, true));
+        ui.pad_key(&key(K::ControlLeft, false, false));
+        ui.input_source_changed(); // macOS switches now
+        ui.pad_key(&key(K::Space, false, false));
+        ui.pad_key(&key(K::Space, true, false)); // a plain Space
         let k = |hid, down| Frame::KvmKey { hid, down };
-        assert_eq!(*ui.sent.borrow(), [k(0xE3, true), k(0xE3, false), k(0x2C, true)]);
+        assert_eq!(*ui.sent.borrow(), [k(0xE3, true), k(0x90, true), k(0x90, false), k(0xE3, false), k(0x2C, true)]);
     }
 
     /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and
