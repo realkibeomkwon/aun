@@ -149,6 +149,7 @@ impl Ui {
         if let Some(p) = self.pad.take() {
             self.input(p.id, Frame::KvmLeave);
         }
+        menu_off(false);
     }
 
     fn input(&self, id: Id, f: Frame) {
@@ -175,12 +176,7 @@ impl Ui {
         let sent: Vec<Frame> = match *e {
             rune::PhysicalInput::Key { key, pressed, .. } => {
                 let Some(hid) = aun_core::kvm::hid(key) else { return true };
-                // Control and ⌘ (the Windows key), left and right.
-                let hid = match hid {
-                    0xE0 | 0xE4 if swap => hid + 3,
-                    0xE3 | 0xE7 if swap => hid - 3,
-                    _ => hid,
-                };
+                let hid = swapped(hid, swap);
                 let at = p.keys.iter().position(|&k| k == hid);
                 match (pressed, at) {
                     (true, None) => p.keys.push(hid),
@@ -197,7 +193,14 @@ impl Ui {
         for f in sent {
             self.input(id, f);
         }
+        // ⌘ held here: AppKit would also run the menu item (⌘Q quits Aun) for the key going there.
+        menu_off(self.command_held());
         true
+    }
+
+    /// Whether ⌘ on this keyboard (whatever it is sent as) is down on the pad.
+    fn command_held(&self) -> bool {
+        self.pad.as_ref().is_some_and(|p| p.keys.iter().any(|&k| matches!(swapped(k, self.settings.swap), 0xE3 | 0xE7)))
     }
 
     fn pad_move(&mut self, dx: f32, dy: f32) {
@@ -239,6 +242,7 @@ impl Ui {
         // Its link went: the peer let go of what it held when it dropped.
         if self.pad.as_ref().is_some_and(|p| !self.peers.iter().any(|v| v.id == p.id && v.kvm)) {
             self.pad = None;
+            menu_off(false);
         }
     }
 
@@ -676,6 +680,37 @@ fn pad(s: &Ui, t: Theme) -> Option<El> {
             }))
             .child(button("pad-close".into(), "그만", t, false, |s, _| s.close_pad())))
         .child(area))
+}
+
+/// Control and ⌘ (the Windows key) swapped, left and right, when `swap` (`Settings::swap`).
+fn swapped(hid: u16, swap: bool) -> u16 {
+    match hid {
+        0xE0 | 0xE4 if swap => hid + 3,
+        0xE3 | 0xE7 if swap => hid - 3,
+        _ => hid,
+    }
+}
+
+/// macOS: takes the menu bar away (`true`) and puts it back, so no menu key equivalent runs.
+/// Elsewhere, and off the main thread (tests), nothing.
+fn menu_off(off: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSApplication, NSMenu};
+        thread_local!(static TAKEN: std::cell::RefCell<Option<objc2::rc::Retained<NSMenu>>> = const { std::cell::RefCell::new(None) });
+        let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+        let app = NSApplication::sharedApplication(mtm);
+        TAKEN.with_borrow_mut(|taken| match (off, taken.is_some()) {
+            (true, false) => {
+                *taken = app.mainMenu();
+                app.setMainMenu(None);
+            }
+            (false, true) => app.setMainMenu(taken.take().as_deref()),
+            _ => {}
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = off;
 }
 
 fn copied_text(s: &Ui) -> String {
@@ -1132,6 +1167,28 @@ mod tests {
         let sent: Vec<_> = rt.state.sent.borrow().iter().map(|f| format!("{f:?}")).collect();
         let k = |hid: u16, down: bool| format!("{:?}", Frame::KvmKey { hid, down });
         assert_eq!(sent, [k(0xE0, true), k(6, true), k(6, false), k(0xE0, false), k(0xE7, true), k(0xE7, false), k(0xE7, true)]);
+    }
+
+    /// The menu bar goes while ⌘ on this keyboard is down on the pad (sent as Ctrl or not), and
+    /// only then: Control is not ⌘, and letting go or losing focus brings it back.
+    #[test]
+    fn command_held_on_the_pad_is_this_keyboard_s_command() {
+        use rune::{PhysicalInput, PhysicalKeyCode as K};
+        let key = |key, pressed| PhysicalInput::Key { key, mods: Default::default(), pressed, repeat: false };
+        for swap in [true, false] {
+            let mut ui = Ui::new(None, None);
+            ui.settings.swap = swap;
+            ui.open_pad([3; 32], "PC".into());
+            ui.pad_key(&key(K::ControlLeft, true));
+            assert!(!ui.command_held(), "Control (swap {swap})");
+            ui.pad_key(&key(K::SuperRight, true));
+            assert!(ui.command_held(), "right ⌘ (swap {swap})");
+            ui.pad_key(&key(K::SuperRight, false));
+            assert!(!ui.command_held(), "⌘ up (swap {swap})");
+            ui.pad_key(&key(K::SuperLeft, true));
+            ui.pad_key(&PhysicalInput::FocusLost);
+            assert!(!ui.command_held(), "focus lost (swap {swap})");
+        }
     }
 
     /// Shift held on the pad, then a click on another control: the pad loses the keyboard, and
