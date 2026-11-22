@@ -111,8 +111,8 @@ struct State {
     tap: AtomicPtr<c_void>,
     /// Why the last crossing ended ([`Why`]), for the sender's log.
     why: AtomicU8,
-    /// Where the cursor was as the last crossing ended, before it was put back.
-    gone: [AtomicU64; 2],
+    /// Where the cursor went out, kept there while across (see the move case in [`tap`]).
+    lock: [AtomicU64; 2],
 }
 
 /// Why a crossing ended, logged by the sender (the tap callback may not log).
@@ -167,8 +167,6 @@ impl State {
             return;
         }
         self.why.store(why, Ordering::Relaxed);
-        let (x, y) = cursor(); // before the warp below, for the sender's log
-        self.gone.each_ref().iter().zip([x, y]).for_each(|(a, v)| a.store(v.to_bits(), Ordering::Relaxed));
         self.armed.store(at.is_some(), Ordering::Relaxed);
         let at = at.unwrap_or(self.at.load(Ordering::Relaxed) as u16);
         let (x, y) = kvm::entry(self.reread(), self.side, at);
@@ -245,6 +243,7 @@ extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
             return e;
         }
         st.at.store(at.into(), Ordering::Relaxed);
+        st.lock.iter().zip([p.x, p.y]).for_each(|(a, v)| a.store(v.to_bits(), Ordering::Relaxed));
         st.crossed.store(true, Ordering::SeqCst);
         // SAFETY: a plain call. The pointer stays where it is; the deltas still come.
         unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
@@ -253,7 +252,15 @@ extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
     // SAFETY: as above.
     let flags = unsafe { CGEventGetFlags(e) };
     let c = match kind {
-        MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED => Captured::Move(field(DELTA_X) as i32, field(DELTA_Y) as i32),
+        MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED => {
+            // Detached above, the cursor still follows the mouse unless Aun is the front app (seen
+            // 2026-11-22 from a background process): put it back each time. Measured then: the
+            // deltas keep coming at the same rate and don't take the warp in.
+            let [x, y] = st.lock.each_ref().map(|a| f64::from_bits(a.load(Ordering::Relaxed)));
+            // SAFETY: a plain call taking a value.
+            unsafe { CGWarpMouseCursorPosition(Point { x, y }) };
+            Captured::Move(field(DELTA_X) as i32, field(DELTA_Y) as i32)
+        }
         LEFT_DOWN | LEFT_UP => Captured::Button(0, kind == LEFT_DOWN, field(CLICK_STATE).clamp(1, 255) as u8),
         RIGHT_DOWN | RIGHT_UP => Captured::Button(1, kind == RIGHT_DOWN, field(CLICK_STATE).clamp(1, 255) as u8),
         OTHER_DOWN | OTHER_UP if field(BUTTON_NUMBER) == 2 => Captured::Button(2, kind == OTHER_DOWN, field(CLICK_STATE).clamp(1, 255) as u8),
@@ -319,7 +326,7 @@ impl Cross {
             bounds: [b.x0, b.y0, b.x1, b.y1].map(|v| AtomicU64::new(v.to_bits())),
             tap: AtomicPtr::new(std::ptr::null_mut()),
             why: AtomicU8::new(Why::STOPPED),
-            gone: [AtomicU64::new(0), AtomicU64::new(0)],
+            lock: [AtomicU64::new(0), AtomicU64::new(0)],
         });
         let (made_tx, made) = mpsc::sync_channel(1);
         let user = Arc::into_raw(st.clone()) as usize;
@@ -416,12 +423,8 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
     let mut d = Driver::default();
     let (mut started, mut left) = (0u32, 0u32);
     let mut to: Option<Id> = None;
-    let mut entered = (0.0, 0.0);
-    let leave = |to: Option<Id>, left: &mut u32, st: &State, entered: (f64, f64)| {
-        // Diagnostic (2026-11-22 device test): why it ended, and whether this Mac's cursor moved
-        // while across (it should stay put at the edge).
-        let [x, y] = st.gone.each_ref().map(|a| f64::from_bits(a.load(Ordering::Relaxed)));
-        crate::log(format_args!("cross: out ({}); the cursor moved {:.0},{:.0} while across", Why::NAMES[usize::from(st.why.load(Ordering::Relaxed)).min(8)], x - entered.0, y - entered.1));
+    let leave = |to: Option<Id>, left: &mut u32, st: &State| {
+        crate::log(format_args!("cross: out ({})", Why::NAMES[usize::from(st.why.load(Ordering::Relaxed)).min(Why::NAMES.len() - 1)]));
         *left += 1;
         if let Some(id) = to {
             node.send_input(id, crate::wire::Frame::KvmLeave);
@@ -444,12 +447,12 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
         for c in first.into_iter().chain(rx.try_iter()) {
             if let Captured::Enter(_) = c {
                 if started != left {
-                    leave(to, &mut left, &st, entered); // the previous one ended before this could start
+                    leave(to, &mut left, &st); // the previous one ended before this could start
                 }
                 started += 1;
                 to = *target.lock().unwrap();
-                entered = cursor();
-                crate::log(format_args!("cross: in at {:.0},{:.0}", entered.0, entered.1));
+                let (x, y) = cursor();
+                crate::log(format_args!("cross: in at {x:.0},{y:.0}"));
             }
             let Some(id) = to else {
                 st.end(None, Why::NO_PEER);
@@ -469,7 +472,7 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
             }
         }
         if started != left && st.ends.load(Ordering::SeqCst) > left {
-            leave(to, &mut left, &st, entered);
+            leave(to, &mut left, &st);
         }
     }
 }
