@@ -221,10 +221,6 @@ pub struct Os {
     /// modifiers as flags, set on each one: a Shift-click is a click with the Shift flag.
     #[cfg(target_os = "macos")]
     mods: u8,
-    /// macOS: key downs left to log the flags of after an input source shortcut. Diagnostic: on
-    /// the user's Mac the first `f` after one arrives as Globe+F (2026-11-22, not reproduced here).
-    #[cfg(target_os = "macos")]
-    probe: u8,
 }
 
 /// Whether this process may inject input. macOS asks for Accessibility (and, with `prompt`,
@@ -332,7 +328,6 @@ mod mac {
         fn CGEventCreateKeyboardEvent(source: Ref, key: u16, down: bool) -> Ref;
         fn CGEventSetFlags(e: Ref, flags: u64);
         fn CGEventGetFlags(e: Ref) -> u64;
-        fn CGEventSourceFlagsState(state: i32) -> u64;
         fn CGEventSetType(e: Ref, kind: u32);
         fn CGEventPost(tap: u32, e: Ref);
         fn CGGetActiveDisplayList(max: u32, out: *mut u32, count: *mut u32) -> i32;
@@ -512,7 +507,6 @@ mod mac {
                 }
                 if down {
                     self.settle(); // the shortcut's own modifiers and function flag
-                    self.probe = 3;
                 }
                 return;
             }
@@ -533,11 +527,6 @@ mod mac {
                     CGEventSetFlags(e, self.flags());
                 } else {
                     CGEventSetFlags(e, CGEventGetFlags(e) & !(FN | NUMPAD) | own_flags(code as u16));
-                }
-                if down && self.probe > 0 {
-                    self.probe -= 1;
-                    let posted = if self.flags() != 0 { self.flags() } else { CGEventGetFlags(e) };
-                    crate::log(format_args!("input: a key after 한/영: flags {posted:#x}, system {:#x}", CGEventSourceFlagsState(0)));
                 }
                 self.post(e);
             }
