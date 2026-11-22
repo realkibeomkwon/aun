@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -144,30 +144,47 @@ struct Live {
     driving: Mutex<Option<Instant>>,
     /// The peer has been sending input: from its first input frame to its `KvmLeave`.
     driven: AtomicBool,
+    /// Wakes the link's watchdog ([`watch`]) when input starts either way.
+    wake: SyncSender<()>,
 }
 
 impl Live {
-    fn new(sink: Box<dyn Sink + Send>) -> Self {
-        Live { heard: Mutex::new(Instant::now()), input: Mutex::new(Injector::new(sink)), driving: Mutex::new(None), driven: AtomicBool::new(false) }
+    fn new(sink: Box<dyn Sink + Send>) -> (Self, Receiver<()>) {
+        let (wake, woken) = mpsc::sync_channel(1);
+        (Live { heard: Mutex::new(Instant::now()), input: Mutex::new(Injector::new(sink)), driving: Mutex::new(None), driven: AtomicBool::new(false), wake }, woken)
     }
 
-    /// Acts on silence from the peer, and says how long the writer may wait for a frame.
-    fn check(&self, peer: &str, lost: &dyn Fn()) -> Duration {
+    fn active(&self) -> bool {
+        self.driving.lock().unwrap().is_some() || self.driven.load(Ordering::Relaxed)
+    }
+
+    /// Acts on silence from the peer.
+    fn check(&self, peer: &str, lost: &dyn Fn()) {
         let heard = self.heard.lock().unwrap().elapsed();
-        let mut driving = self.driving.lock().unwrap();
         // Counted from the first input too: the peer pinged only every 10 s before it.
-        if driving.is_some_and(|since| heard.min(since.elapsed()) > DRIVER_LOST) {
-            *driving = None;
+        let stalled = self.driving.lock().unwrap().take_if(|since| heard.min(since.elapsed()) > DRIVER_LOST).is_some();
+        if stalled {
             crate::log(format_args!("input to {peer}: no word back for {} ms, stopped", heard.as_millis()));
             lost();
         }
-        let driven = self.driven.load(Ordering::Relaxed);
-        if driven && heard > DRIVEN_LOST {
-            self.driven.store(false, Ordering::Relaxed);
+        if heard > DRIVEN_LOST && self.driven.swap(false, Ordering::Relaxed) {
             self.input.lock().unwrap().release();
             crate::log(format_args!("input from {peer}: silent for {} ms, let go of what it held", heard.as_millis()));
         }
-        if driving.is_some() || self.driven.load(Ordering::Relaxed) { BEAT } else { PING }
+    }
+}
+
+/// A link's watchdog: every [`BEAT`] while input goes either way, asleep otherwise. On a thread
+/// of its own, since the writer can sit in a socket write for as long as the link stalls (a file
+/// chunk filling the send buffer). Ends with the link.
+fn watch(live: Weak<Live>, woken: Receiver<()>, peer: String, lost: impl Fn()) {
+    loop {
+        let Some(active) = live.upgrade().map(|l| l.active()) else { return };
+        let gone = if active { matches!(woken.recv_timeout(BEAT), Err(RecvTimeoutError::Disconnected)) } else { woken.recv().is_err() };
+        match live.upgrade() {
+            Some(l) if !gone => l.check(&peer, &lost),
+            _ => return,
+        }
     }
 }
 
@@ -431,7 +448,11 @@ impl Node {
         let Some((tx, live)) = self.st().peers.get(&id).and_then(|p| p.link.as_ref()).filter(|l| l.kvm).map(|l| (l.tx.clone(), l.live.clone())) else { return false };
         {
             let mut driving = live.driving.lock().unwrap();
+            let was = driving.is_some();
             *driving = if matches!(f, Frame::KvmLeave) { None } else { Some(driving.unwrap_or_else(Instant::now)) };
+            if !was && driving.is_some() {
+                let _ = live.wake.try_send(());
+            }
         }
         let must = matches!(f, Frame::KvmButton { .. } | Frame::KvmLeave | Frame::KvmKey { .. });
         let end = Instant::now() + Duration::from_millis(250);
@@ -861,7 +882,8 @@ impl Node {
         // Authenticated. Register, then run the writer on its own thread and read here.
         let (tx, fast, bulk) = queue();
         let make = self.0.sink.lock().unwrap().clone();
-        let live = Arc::new(Live::new(make()));
+        let (live, woken) = Live::new(make());
+        let live = Arc::new(live);
         let (conn, dup) = {
             let mut st = self.st();
             st.next += 1;
@@ -905,8 +927,10 @@ impl Node {
         self.wake_clip();
         let up = Instant::now();
         let wsock = sock.try_clone()?;
-        let (node, wlive, wname) = (self.clone(), live.clone(), name.clone());
-        spawn("aun-write", move || writer(w, fast, bulk, wsock, &wlive, &wname, &|| (node.0.notify)(Note::InputLost(remote))));
+        let wlive = live.clone();
+        spawn("aun-write", move || writer(w, fast, bulk, wsock, &wlive));
+        let (node, weak, wname) = (self.clone(), Arc::downgrade(&live), name.clone());
+        spawn("aun-watch", move || watch(weak, woken, wname, || (node.0.notify)(Note::InputLost(remote))));
 
         let mut rx_files = Incoming::new(self, name.clone(), remote, tx);
         let res = self.read_loop(&mut r, &mut rx_files, &live);
@@ -941,6 +965,7 @@ impl Node {
                     let on = !matches!(f, Frame::KvmLeave);
                     if live.driven.swap(on, Ordering::Relaxed) != on {
                         let _ = files.tx.fast.try_send(None);
+                        let _ = live.wake.try_send(());
                     }
                     let mut input = live.input.lock().unwrap();
                     if !self.kvm() {
@@ -1041,11 +1066,11 @@ fn handshake(sock: &TcpStream, key: &[u8], initiator: bool) -> io::Result<(State
 /// Writes queued frames, every fast one ahead of the next bulk one (see [`Tx`]). Flushes when
 /// the queues run dry so small frames share one Noise message, and after fast frames written
 /// between bulk ones so they don't sit in the buffer behind the next chunk. Wakes every [`BEAT`]
-/// while input goes either way, to answer and to watch for silence ([`Live::check`]).
-fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Receiver<Frame>, sock: TcpStream, live: &Live, peer: &str, lost: &dyn Fn()) {
+/// while input goes either way, so the peer hears from this side ([`watch`] judges silence).
+fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Receiver<Frame>, sock: TcpStream, live: &Live) {
     let res = (|| -> io::Result<()> {
         loop {
-            let wait = live.check(peer, lost);
+            let wait = if live.active() { BEAT } else { PING };
             match fast.recv_timeout(wait) {
                 Ok(Some(f)) => wire::write_frame(&mut w, &f)?,
                 Ok(None) => {}
@@ -1323,7 +1348,7 @@ mod tests {
     }
 
     fn idle() -> Live {
-        Live::new(Box::new(kvm::tests::Rec::default()))
+        Live::new(Box::new(kvm::tests::Rec::default())).0
     }
 
     #[test]
@@ -1336,7 +1361,7 @@ mod tests {
         tx.send(Frame::Clip("a".into())).unwrap();
         tx.send(Frame::Clip("b".into())).unwrap();
         let w = SealWriter::new(Arc::new(ti), out.try_clone().unwrap());
-        thread::spawn(move || writer(w, fast, bulk, out, &idle(), "peer", &|| {}));
+        thread::spawn(move || writer(w, fast, bulk, out, &idle()));
         inp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut r = OpenReader::new(Arc::new(tr), inp);
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::Clip("a".into()));
@@ -1358,7 +1383,7 @@ mod tests {
         // Queued while the file lane is full, as a key pressed mid-transfer is.
         tx.try_send(Frame::KvmKey { hid: 4, down: true }).unwrap();
         let w = SealWriter::new(Arc::new(ti), out.try_clone().unwrap());
-        thread::spawn(move || writer(w, fast, bulk, out, &idle(), "peer", &|| {}));
+        thread::spawn(move || writer(w, fast, bulk, out, &idle()));
         inp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut r = OpenReader::new(Arc::new(tr), inp);
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::KvmKey { hid: 4, down: true });

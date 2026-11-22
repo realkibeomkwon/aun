@@ -659,3 +659,41 @@ fn a_crossing_comes_back_through_the_edge_it_entered_by() {
     assert_eq!(back, Some(Note::Returned { id: host.id(), route: 9, at: (30.0f64 / 99.0 * 65535.0).round() as u16 }));
     assert_eq!(*rec.0.lock().unwrap(), ["enter 0 0", "move 20 30 held 0", "move -21 0 held 0"]);
 }
+
+/// The same with a large file going each way when the link stalls: each side's writer is then
+/// stuck writing a chunk, and the judgment mustn't wait on it.
+#[test]
+fn a_stalled_link_lets_go_of_held_input_while_files_go_both_ways() {
+    use aun_core::wire::Frame;
+    let (host, hn) = node("stallf-host", "Host");
+    let (guest, gn) = node("stallf-guest", "Guest");
+    let rec = Rec::default();
+    let r = rec.clone();
+    host.set_sink(move || Box::new(r.clone()));
+    host.set_kvm(true);
+    let frozen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    guest.pair(relay(addr(&host), frozen.clone()), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    let log = || rec.0.lock().unwrap().clone();
+    assert!(guest.send_input(host.id(), Frame::KvmKey { hid: 0xE1, down: true }));
+    until("the shift", || log().len() == 1);
+
+    for (from, to, rx, tag) in [(&guest, &host, &gn, "stallf-guest"), (&host, &guest, &hn, "stallf-host")] {
+        let f = dir(tag).join("big.bin");
+        std::fs::File::create(&f).unwrap().set_len(1 << 30).unwrap(); // sparse: reads as zeros
+        from.send_file(to.id(), f);
+        next_transfer(rx, "the big file under way", |n| matches!(n, Note::Transfer { done: 1.., finished: false, incoming: false, .. }));
+    }
+    frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+    let at = Instant::now();
+    let lost = std::iter::from_fn(|| gn.recv_timeout(Duration::from_secs(5)).ok()).find(|n| matches!(n, Note::InputLost(_)));
+    assert_eq!(lost, Some(Note::InputLost(host.id())), "told within 5 s");
+    let told = at.elapsed();
+    until("the release", || log().len() == 2);
+    let released = at.elapsed();
+    assert!(told < Duration::from_millis(900), "told after {told:?}");
+    assert!(released < Duration::from_millis(1600), "let go after {released:?}");
+    for tag in ["stallf-guest", "stallf-host"] {
+        let _ = std::fs::remove_dir_all(dir(tag)); // files still open on Windows: left for the OS
+    }
+}
