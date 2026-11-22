@@ -69,6 +69,9 @@ pub enum Note {
     /// The pointer of a crossing to this peer came back out through the edge it entered by,
     /// `at` along it (`Frame::KvmReturn`).
     Returned { id: Id, route: u32, at: u16 },
+    /// The peer can't take input now (`Frame::KvmBlocked`): a window above Aun's rights is in
+    /// front there.
+    Blocked { id: Id, route: u32 },
     /// A file going out or coming in. `path` is the source, or where an incoming file lands.
     /// `cancelled` (with `failed`) when either side called it off. `peer_id` is who it is with,
     /// to send it again.
@@ -109,7 +112,7 @@ fn queue() -> (Tx, Receiver<Option<Frame>>, Receiver<Frame>) {
 
 impl Tx {
     fn is_fast(f: &Frame) -> bool {
-        matches!(f, Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. } | Frame::KvmReturn { .. } | Frame::Ping | Frame::FileFrom { .. } | Frame::FileCancel { .. })
+        matches!(f, Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. } | Frame::KvmReturn { .. } | Frame::KvmBlocked { .. } | Frame::Ping | Frame::FileFrom { .. } | Frame::FileCancel { .. })
     }
 
     /// Waits for room; Err once the link is gone.
@@ -991,6 +994,10 @@ impl Node {
                 }
                 Frame::Ping => {}
                 Frame::KvmReturn { route, at } => (self.0.notify)(Note::Returned { id: files.remote, route, at }),
+                Frame::KvmBlocked { route } => {
+                    crate::log(format_args!("input to {}: blocked there (a window above Aun's rights in front)", files.peer));
+                    (self.0.notify)(Note::Blocked { id: files.remote, route });
+                }
                 Frame::Clip(text) if text.len() <= clip::MAX_TEXT => self.to_clipboard(clip::Content::Text(text)),
                 Frame::Clip(_) => {}
                 Frame::ClipImage(png) => self.to_clipboard(clip::Content::Png(png)),

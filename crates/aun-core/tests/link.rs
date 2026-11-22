@@ -506,7 +506,7 @@ fn a_stopped_send_resumes_where_it_stopped() {
 
 /// Records what it is given; its pointer moves on a 100 × 100 screen.
 #[derive(Clone, Default)]
-struct Rec(std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::sync::Arc<std::sync::Mutex<(f64, f64)>>);
+struct Rec(std::sync::Arc<std::sync::Mutex<Vec<String>>>, std::sync::Arc<std::sync::Mutex<(f64, f64)>>, std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 const SCREEN: aun_core::kvm::Bounds = aun_core::kvm::Bounds { x0: 0.0, y0: 0.0, x1: 100.0, y1: 100.0 };
 
@@ -517,6 +517,9 @@ impl aun_core::kvm::Sink for Rec {
         let out = edge.and_then(|side| aun_core::kvm::past(SCREEN, side, *p, dx.into(), dy.into()));
         *p = ((p.0 + f64::from(dx)).clamp(0.0, 99.0), (p.1 + f64::from(dy)).clamp(0.0, 99.0));
         out
+    }
+    fn blocked(&mut self) -> bool {
+        self.2.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn enter(&mut self, side: u8, at: u16) {
         *self.1.lock().unwrap() = aun_core::kvm::entry(SCREEN, side, at);
@@ -710,4 +713,23 @@ fn input_a_peer_does_not_allow_tells_the_sender() {
     assert!(guest.send_input(host.id(), Frame::KvmEnter { route: 1, side: 0, at: 0 }));
     let lost = std::iter::from_fn(|| gn.recv_timeout(Duration::from_secs(3)).ok()).find(|n| matches!(n, Note::InputLost(_)));
     assert_eq!(lost, Some(Note::InputLost(host.id())));
+}
+
+/// A driven side that can't inject (a window above Aun's rights in front there) tells the driver,
+/// with the crossing's route.
+#[test]
+fn a_blocked_peer_tells_the_driver() {
+    use aun_core::wire::Frame;
+    let (host, _hn) = node("blocked-host", "Host");
+    let (guest, gn) = node("blocked-guest", "Guest");
+    let rec = Rec::default();
+    rec.2.store(true, std::sync::atomic::Ordering::Relaxed);
+    let r = rec.clone();
+    host.set_sink(move || Box::new(r.clone()));
+    host.set_kvm(true);
+    guest.pair(addr(&host), host.show_code());
+    until("pairing", || connected(&guest, &host) && connected(&host, &guest));
+    assert!(guest.send_input(host.id(), Frame::KvmEnter { route: 3, side: 0, at: 0 }));
+    let n = std::iter::from_fn(|| gn.recv_timeout(Duration::from_secs(5)).ok()).find(|n| matches!(n, Note::Blocked { .. }));
+    assert_eq!(n, Some(Note::Blocked { id: host.id(), route: 3 }));
 }

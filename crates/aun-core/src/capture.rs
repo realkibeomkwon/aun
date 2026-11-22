@@ -127,7 +127,8 @@ impl Why {
     const NO_PEER: u8 = 6;
     const NOT_SENT: u8 = 7;
     const STOPPED: u8 = 8;
-    const NAMES: [&str; 9] = ["came back", "escape key", "queue full", "tap disabled by timeout", "tap disabled by user input", "no word back", "no peer", "a frame not sent", "stopped"];
+    const BLOCKED: u8 = 9;
+    const NAMES: [&str; 10] = ["came back", "escape key", "queue full", "tap disabled by timeout", "tap disabled by user input", "no word back", "no peer", "a frame not sent", "stopped", "blocked there"];
 }
 
 /// Where the cursor is now, in global display points.
@@ -383,6 +384,16 @@ impl Cross {
         if *self.target.lock().unwrap() == Some(id) && self.route.load(Ordering::SeqCst) == route {
             self.st.end(Some(at), Why::RETURNED);
         }
+    }
+
+    /// `id` can't take input now (`Note::Blocked`): input back here. True if that ended a crossing.
+    pub fn blocked(&self, id: Id, route: u32) -> bool {
+        let across = self.st.crossed.load(Ordering::SeqCst);
+        if across && *self.target.lock().unwrap() == Some(id) && self.route.load(Ordering::SeqCst) == route {
+            self.st.end(None, Why::BLOCKED);
+            return true;
+        }
+        false
     }
 
     /// `id` stopped answering (`Note::InputLost`): input back here. True if that ended a crossing.

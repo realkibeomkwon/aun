@@ -262,6 +262,11 @@ pub trait Sink {
     /// Before letting go of a held Windows key (⌘) the driver didn't let go of itself: keeps it
     /// from acting alone as it goes up (Windows opens Start).
     fn mask(&mut self) {}
+    /// Whether input injected now goes nowhere (Windows: a window above this process's rights is
+    /// in front, and UIPI drops what is sent to it without saying so).
+    fn blocked(&mut self) -> bool {
+        false
+    }
 }
 
 impl<S: Sink + ?Sized> Sink for Box<S> {
@@ -283,6 +288,9 @@ impl<S: Sink + ?Sized> Sink for Box<S> {
     fn mask(&mut self) {
         (**self).mask()
     }
+    fn blocked(&mut self) -> bool {
+        (**self).blocked()
+    }
 }
 
 /// One link's input: the moves applied so far and the buttons and keys it holds down.
@@ -295,16 +303,37 @@ pub struct Injector<S: Sink> {
     keys: Vec<u16>,
     /// The edge the pointer of a crossing came in by (`KvmEnter`): out through it, it goes back.
     edge: Option<u8>,
+    /// The route of the last crossing or move, and whether the driver was told it is blocked.
+    route: u32,
+    told: bool,
 }
 
 impl<S: Sink> Injector<S> {
     pub fn new(sink: S) -> Self {
-        Injector { sink, last: None, held: 0, keys: Vec::new(), edge: None }
+        Injector { sink, last: None, held: 0, keys: Vec::new(), edge: None, route: 0, told: false }
     }
 
-    /// Applies one frame from the driver; returns the answer to send it back, if any (a
-    /// `KvmReturn` once the pointer goes back out through the edge it came in by).
+    /// Applies one frame from the driver; returns the answer to send it back, if any: a
+    /// `KvmReturn` once the pointer goes back out through the edge it came in by, or a
+    /// `KvmBlocked` once input here starts going nowhere.
     pub fn apply(&mut self, f: Frame) -> Option<Frame> {
+        if let Frame::KvmEnter { route, .. } | Frame::KvmMove { route, .. } = f {
+            self.route = route;
+        }
+        let input = !matches!(f, Frame::KvmLeave);
+        let back = self.apply_one(f);
+        if input && self.sink.blocked() {
+            if !self.told {
+                self.told = true;
+                return Some(Frame::KvmBlocked { route: self.route });
+            }
+        } else {
+            self.told = false;
+        }
+        back
+    }
+
+    fn apply_one(&mut self, f: Frame) -> Option<Frame> {
         match f {
             Frame::KvmEnter { route: _, side, at } => {
                 // A move numbered 1 of this route starts from here, as any new route's does.
@@ -392,6 +421,9 @@ pub struct Os {
     /// modifiers as flags, set on each one: a Shift-click is a click with the Shift flag.
     #[cfg(target_os = "macos")]
     mods: u8,
+    /// Windows: the front window last looked at, and whether it is above Aun's rights.
+    #[cfg(windows)]
+    front: (usize, bool),
 }
 
 /// Whether this process may inject input. macOS asks for Accessibility (and, with `prompt`,
@@ -775,6 +807,52 @@ mod win {
         }
     }
 
+    /// Whether the process owning window `hwnd` runs at a higher integrity level than this one
+    /// (an app run as administrator, Task Manager): Windows then drops input this process
+    /// injects while it is in front (UIPI). A process whose level can't be read counts as higher.
+    fn above_us(hwnd: usize) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+        /// The integrity level (the label SID's last sub-authority) of `process`'s token.
+        fn level(process: HANDLE) -> Option<u32> {
+            // SAFETY: a token opened and closed here; the label is read into a buffer big enough
+            // for a TOKEN_MANDATORY_LABEL and its SID, and its SID points into that buffer.
+            unsafe {
+                let mut token: HANDLE = std::ptr::null_mut();
+                if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+                    return None;
+                }
+                let mut buf = [0u64; 16];
+                let mut len = 0;
+                let ok = GetTokenInformation(token, TokenIntegrityLevel, buf.as_mut_ptr().cast(), size_of_val(&buf) as u32, &mut len) != 0;
+                CloseHandle(token);
+                if !ok {
+                    return None;
+                }
+                let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+                let n = *GetSidSubAuthorityCount(sid);
+                Some(*GetSidSubAuthority(sid, u32::from(n).checked_sub(1)?))
+            }
+        }
+        let mut pid = 0;
+        // SAFETY: a plain read; `hwnd` came from GetForegroundWindow.
+        unsafe { GetWindowThreadProcessId(hwnd as _, &mut pid) };
+        // SAFETY: a handle opened and closed here; the pseudo-handle needs no closing.
+        unsafe {
+            let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if p.is_null() {
+                return true;
+            }
+            let theirs = level(p);
+            CloseHandle(p);
+            match (theirs, level(GetCurrentProcess())) {
+                (Some(t), Some(m)) => t > m,
+                _ => true,
+            }
+        }
+    }
+
     /// See `super::lang_keys`.
     pub fn lang_keys() -> Vec<(KeyCode, u16)> {
         // SAFETY: this thread's layout and a lookup in it.
@@ -887,6 +965,16 @@ mod win {
             push(&input);
         }
 
+        fn blocked(&mut self) -> bool {
+            // SAFETY: a plain read.
+            let front = unsafe { GetForegroundWindow() } as usize;
+            if self.front.0 != front {
+                self.front = (front, front != 0 && above_us(front));
+                crate::log(format_args!("input: the front window is {} Aun's rights", if self.front.1 { "above" } else { "within" }));
+            }
+            self.front.1
+        }
+
         fn mask(&mut self) {
             for up in [0, KEYEVENTF_KEYUP] {
                 let mask = INPUT {
@@ -917,7 +1005,7 @@ pub(crate) mod tests {
 
     /// Records what it is given; its pointer moves on a 100 × 100 screen.
     #[derive(Clone, Default)]
-    pub struct Rec(pub Arc<Mutex<Vec<String>>>, Arc<Mutex<(f64, f64)>>);
+    pub struct Rec(pub Arc<Mutex<Vec<String>>>, Arc<Mutex<(f64, f64)>>, pub Arc<std::sync::atomic::AtomicBool>);
 
     pub const SCREEN: Bounds = Bounds { x0: 0.0, y0: 0.0, x1: 100.0, y1: 100.0 };
 
@@ -946,6 +1034,26 @@ pub(crate) mod tests {
         fn mask(&mut self) {
             self.0.lock().unwrap().push("mask".into());
         }
+        fn blocked(&mut self) -> bool {
+            self.2.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    /// Input here going nowhere is told to the driver once each time it starts, with the route.
+    #[test]
+    fn blocked_input_is_told_once_each_time_it_starts() {
+        let rec = Rec::default();
+        let mut inj = Injector::new(rec.clone());
+        let block = |on| rec.2.store(on, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(inj.apply(Frame::KvmEnter { route: 4, side: 0, at: 0 }), None);
+        block(true);
+        assert_eq!(inj.apply(mv(4, 1, 1, 0)), Some(Frame::KvmBlocked { route: 4 }));
+        assert_eq!(inj.apply(mv(4, 2, 2, 0)), None, "once");
+        assert_eq!(inj.apply(Frame::KvmKey { hid: 4, down: true }), None);
+        block(false);
+        assert_eq!(inj.apply(mv(4, 3, 3, 0)), None);
+        block(true);
+        assert_eq!(inj.apply(Frame::KvmButton { button: 0, down: true, clicks: 1 }), Some(Frame::KvmBlocked { route: 4 }), "again");
     }
 
     /// A Windows key still held when the driver leaves (Ctrl sent as Win, then the escape key)
