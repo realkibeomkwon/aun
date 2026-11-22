@@ -555,5 +555,8 @@ fn injected_input_is_allowed_only_when_switched_on_and_let_go_when_the_link_drop
     guest.set_sleeping(true);
     until("the release", || log().len() == 6);
     assert_eq!(log(), ["wheel 0 3", "button 0 down", "move 7 -2 held 1", "key 0xe1 down", "key 0xe1 up", "button 0 up"]);
+    // The guest drops its own link entry once its reader ends, which can come after the host's
+    // release (seen on Windows CI).
+    until("the guest to drop the link", || !connected(&guest, &host));
     assert!(!guest.send_input(host.id(), Frame::KvmLeave), "no link, nothing sent");
 }
