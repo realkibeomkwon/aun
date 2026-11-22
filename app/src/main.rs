@@ -208,6 +208,7 @@ impl Ui {
 
     /// macOS switched the input source. With the pad focused, that was 한/영 meant for the peer:
     /// the key itself (Caps Lock, F18, ⌃Space) goes to the system only and never reaches the pad.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS announces it
     fn input_source_changed(&mut self) {
         let Some(p) = self.pad.as_ref().filter(|p| p.focused) else { return };
         let id = p.id;
