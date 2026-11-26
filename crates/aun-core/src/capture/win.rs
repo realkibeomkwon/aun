@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
@@ -30,6 +30,27 @@ thread_local! {
     static MODS: Cell<u8> = const { Cell::new(0) };
     static LAST_DOWN: Cell<(u8, u32, u8)> = const { Cell::new((0, 0, 0)) };
     static WHEEL: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+}
+
+/// Diagnostic (2026-11-26 device test: `a` pressed across went nowhere, and the escape key took
+/// two presses): keys the hook took but found no wire key for, and the modifiers held at each
+/// Esc that didn't end the crossing. Only failures are kept, so nothing typed is.
+#[derive(Default)]
+pub(super) struct Shared {
+    unmapped: AtomicU32,
+    /// The last one's virtual key, scan code and flags, 16 bits each.
+    last_unmapped: AtomicU64,
+    /// The last Esc that didn't count: its count and the modifiers held, as wire bits.
+    esc_missed: AtomicU32,
+    esc_mods: AtomicU32,
+}
+
+/// What [`Shared`] holds for this crossing, for its last log line; cleared for the next.
+pub(super) fn diag(st: &State) -> String {
+    let d = &st.os;
+    let (n, last) = (d.unmapped.swap(0, Ordering::Relaxed), d.last_unmapped.swap(0, Ordering::Relaxed));
+    let (esc, mods) = (d.esc_missed.swap(0, Ordering::Relaxed), d.esc_mods.swap(0, Ordering::Relaxed));
+    format!("; {n} keys with no wire key, last vk {:#x} scan {:#x} flags {:#x}; {esc} Esc not escaping, last with modifiers {mods:#04x}", last >> 32, (last >> 16) & 0xFFFF, last & 0xFFFF)
 }
 
 pub(super) fn cursor() -> (f64, f64) {
@@ -169,7 +190,11 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             _ => None,
         },
     };
-    let Some(hid) = hid else { return SWALLOW };
+    let Some(hid) = hid else {
+        st.os.unmapped.fetch_add(1, Ordering::Relaxed);
+        st.os.last_unmapped.store(u64::from(k.vkCode & 0xFFFF) << 32 | u64::from(k.scanCode & 0xFFFF) << 16 | u64::from(k.flags & 0xFFFF), Ordering::Relaxed);
+        return SWALLOW;
+    };
     if (0xE0..=0xE7).contains(&hid) {
         let bit = 1 << (hid - 0xE0);
         MODS.set(if down { MODS.get() | bit } else { MODS.get() & !bit });
@@ -177,6 +202,10 @@ unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if down && kvm::escape(hid, MODS.get()) {
         st.end(None, Why::ESCAPE);
         return SWALLOW;
+    }
+    if down && hid == 0x29 {
+        st.os.esc_missed.fetch_add(1, Ordering::Relaxed);
+        st.os.esc_mods.store(MODS.get().into(), Ordering::Relaxed);
     }
     st.send(Captured::Key(hid, down));
     SWALLOW

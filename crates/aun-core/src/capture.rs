@@ -56,6 +56,8 @@ struct State {
     lock: [AtomicU64; 2],
     #[cfg(target_os = "macos")]
     os: mac::Shared,
+    #[cfg(windows)]
+    os: win::Shared,
 }
 
 /// Why a crossing ended, logged by the sender (the tap callback may not log).
@@ -91,6 +93,8 @@ impl State {
             lock: [AtomicU64::new(0), AtomicU64::new(0)],
             #[cfg(target_os = "macos")]
             os: mac::Shared::new(),
+            #[cfg(windows)]
+            os: win::Shared::default(),
         }
     }
 
@@ -278,7 +282,7 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
     let mut taken = [0u32; 3];
     let leave = |to: Option<Id>, left: &mut u32, st: &State, taken: &mut [u32; 3]| {
         let why = Why::NAMES[usize::from(st.why.load(Ordering::Relaxed)).min(Why::NAMES.len() - 1)];
-        crate::log(format_args!("cross: out ({why}; took {} moves, {} keys, {} scrolls)", taken[0], taken[1], taken[2]));
+        crate::log(format_args!("cross: out ({why}; took {} moves, {} keys, {} scrolls{})", taken[0], taken[1], taken[2], os::diag(st)));
         *taken = [0; 3];
         *left += 1;
         if let Some(id) = to {

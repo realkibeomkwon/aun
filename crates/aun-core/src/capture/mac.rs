@@ -90,6 +90,11 @@ impl Shared {
     }
 }
 
+/// More for the crossing's last log line: nothing here.
+pub(super) fn diag(_st: &State) -> String {
+    String::new()
+}
+
 /// Where the cursor is now, in global display points.
 pub(super) fn cursor() -> (f64, f64) {
     // SAFETY: an event made only to read the location, released at once.
