@@ -138,6 +138,52 @@ impl Tx {
     }
 }
 
+/// A pause in a route's moves past this, then moves landing together, reads as the link
+/// holding them back (docs/kvm-design.md 8, 4-0).
+const GAP: Duration = Duration::from_millis(30);
+/// Moves landing within this of the first after a [`GAP`]: a 1000 Hz mouse makes at most 2.
+const CLUMP: Duration = Duration::from_millis(1);
+/// That many in a clump counts as a stall.
+const STALL: u32 = 5;
+
+/// How a route's moves arrived (docs/kvm-design.md 8, 4-0): whether TCP held them back on
+/// Wi-Fi before a UDP path is worth building. A pause of the hand has no clump after it.
+#[derive(Default)]
+struct Arrivals {
+    last: Option<Instant>,
+    longest: Duration,
+    /// The first move after the last gap, and how many landed within [`CLUMP`] of it.
+    clump: Option<(Instant, u32)>,
+    biggest: u32,
+    stalls: u32,
+}
+
+impl Arrivals {
+    fn moved(&mut self, now: Instant) {
+        if let Some(last) = self.last.replace(now) {
+            let gap = now.saturating_duration_since(last);
+            self.longest = self.longest.max(gap);
+            if gap > GAP {
+                self.clump = Some((now, 1));
+            } else if let Some((from, n)) = &mut self.clump {
+                if now.saturating_duration_since(*from) <= CLUMP {
+                    *n += 1;
+                    self.biggest = self.biggest.max(*n);
+                    self.stalls += (*n == STALL) as u32;
+                } else {
+                    self.clump = None;
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Arrivals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "longest move gap {} ms, {} stalls, biggest clump {}", self.longest.as_millis(), self.stalls, self.biggest)
+    }
+}
+
 /// What a link's reader and writer share to keep input from sticking (docs/kvm-design.md 7).
 struct Live {
     /// When the last frame came in.
@@ -986,6 +1032,7 @@ impl Node {
     fn read_loop(&self, r: &mut impl Read, files: &mut Incoming, live: &Live) -> io::Result<()> {
         let mut told = false;
         let mut got = (0u32, 0u32);
+        let mut moves = Arrivals::default();
         loop {
             files.tell_cancels();
             let f = wire::read_frame(r)?;
@@ -1005,11 +1052,13 @@ impl Node {
                     match f {
                         Frame::KvmKey { .. } => got.0 += 1,
                         Frame::KvmWheel { .. } => got.1 += 1,
+                        Frame::KvmMove { .. } => moves.moved(Instant::now()),
                         _ => {}
                     }
                     if matches!(f, Frame::KvmEnter { .. } | Frame::KvmLeave) {
-                        crate::log(format_args!("input from {}: {f:?} ({} keys, {} scrolls before)", files.peer, got.0, got.1));
+                        crate::log(format_args!("input from {}: {f:?} ({} keys, {} scrolls before; {moves})", files.peer, got.0, got.1));
                         got = (0, 0);
+                        moves = Arrivals::default();
                     }
                     let mut input = live.input.lock().unwrap();
                     if !self.kvm() {
@@ -1310,6 +1359,33 @@ impl<'a> Incoming<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pause of the hand then steady moves isn't a stall; moves held back and let go at once are.
+    #[test]
+    fn moves_landing_in_a_clump_after_a_pause_count_as_a_stall() {
+        let t0 = Instant::now();
+        let at = |ms: f64| t0 + Duration::from_secs_f64(ms / 1000.0);
+        let mut a = Arrivals::default();
+        // 1000 Hz, a 200 ms pause of the hand, 1000 Hz again.
+        for i in 0..10 {
+            a.moved(at(i as f64));
+        }
+        for i in 0..10 {
+            a.moved(at(209.0 + i as f64));
+        }
+        assert_eq!((a.stalls, a.longest.as_millis()), (0, 200), "{a}");
+        // The link held 40 ms of moves, then they landed within 0.1 ms.
+        for i in 0..40 {
+            a.moved(at(258.0 + i as f64 * 0.002));
+        }
+        assert_eq!((a.stalls, a.biggest), (1, 40), "{a}");
+        // Steady again, then another clump: counted once more.
+        a.moved(at(260.0));
+        for i in 0..6 {
+            a.moved(at(300.0 + i as f64 * 0.01));
+        }
+        assert_eq!(a.stalls, 2, "{a}");
+    }
 
     fn transports() -> (StatelessTransportState, StatelessTransportState) {
         transports_for(wire::NOISE)
