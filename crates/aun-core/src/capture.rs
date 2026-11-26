@@ -273,8 +273,13 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
     let mut d = Driver::default();
     let (mut started, mut left) = (0u32, 0u32);
     let mut to: Option<Id> = None;
-    let leave = |to: Option<Id>, left: &mut u32, st: &State| {
-        crate::log(format_args!("cross: out ({})", Why::NAMES[usize::from(st.why.load(Ordering::Relaxed)).min(Why::NAMES.len() - 1)]));
+    // Moves, keys and scrolls taken in this crossing, for the log (2026-11-26: typing and touchpad
+    // scrolling across from the PC didn't land; this says whether the hook saw them).
+    let mut taken = [0u32; 3];
+    let leave = |to: Option<Id>, left: &mut u32, st: &State, taken: &mut [u32; 3]| {
+        let why = Why::NAMES[usize::from(st.why.load(Ordering::Relaxed)).min(Why::NAMES.len() - 1)];
+        crate::log(format_args!("cross: out ({why}; took {} moves, {} keys, {} scrolls)", taken[0], taken[1], taken[2]));
+        *taken = [0; 3];
         *left += 1;
         if let Some(id) = to {
             node.send_input(id, crate::wire::Frame::KvmLeave);
@@ -297,13 +302,19 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
         for c in first.into_iter().chain(rx.try_iter()) {
             if let Captured::Enter(_) = c {
                 if started != left {
-                    leave(to, &mut left, &st); // the previous one ended before this could start
+                    leave(to, &mut left, &st, &mut taken); // the previous one ended before this could start
                 }
                 started += 1;
                 to = *target.lock().unwrap();
                 let (x, y) = os::cursor();
                 let b = st.bounds();
                 crate::log(format_args!("cross: in at {x:.0},{y:.0} (screens {:.0},{:.0} to {:.0},{:.0})", b.x0, b.y0, b.x1, b.y1));
+            }
+            match c {
+                Captured::Move(..) => taken[0] += 1,
+                Captured::Key(..) => taken[1] += 1,
+                Captured::Wheel(..) => taken[2] += 1,
+                _ => {}
             }
             let Some(id) = to else {
                 st.end(None, Why::NO_PEER);
@@ -323,7 +334,7 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
             }
         }
         if started != left && st.ends.load(Ordering::SeqCst) > left {
-            leave(to, &mut left, &st);
+            leave(to, &mut left, &st, &mut taken);
         }
     }
 }

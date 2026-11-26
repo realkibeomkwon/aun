@@ -136,8 +136,9 @@ extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
     }
     if !st.crossed.load(Ordering::SeqCst) {
         // Only a plain move starts one: a button or modifier down here would never come up here.
+        // Nor while the peer drives this Mac: both would be driving each other.
         // SAFETY: as above.
-        if kind != MOVED || unsafe { CGEventGetFlags(e) } & MODIFIERS != 0 || !st.peer.load(Ordering::Relaxed) {
+        if kind != MOVED || unsafe { CGEventGetFlags(e) } & MODIFIERS != 0 || !st.peer.load(Ordering::Relaxed) || crate::node::driven() {
             return e;
         }
         // SAFETY: as above.

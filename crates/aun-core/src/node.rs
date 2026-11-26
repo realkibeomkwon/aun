@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
@@ -151,7 +151,29 @@ struct Live {
     wake: SyncSender<()>,
 }
 
+/// Links whose peer is driving this device now ([`Live::driven`] set).
+static DRIVEN: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a peer is driving this device: then a crossing from here doesn't start, or both
+/// would drive each other's pointer at once (seen 2026-11-26).
+pub(crate) fn driven() -> bool {
+    DRIVEN.load(Ordering::Relaxed) > 0
+}
+
 impl Live {
+    /// Sets [`Live::driven`], keeping [`DRIVEN`] counted; true if it changed.
+    fn set_driven(&self, on: bool) -> bool {
+        let changed = self.driven.swap(on, Ordering::Relaxed) != on;
+        if changed {
+            if on {
+                DRIVEN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DRIVEN.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        changed
+    }
+
     fn new(sink: Box<dyn Sink + Send>) -> (Self, Receiver<()>) {
         let (wake, woken) = mpsc::sync_channel(1);
         (Live { heard: Mutex::new(Instant::now()), input: Mutex::new(Injector::new(sink)), driving: Mutex::new(None), driven: AtomicBool::new(false), wake }, woken)
@@ -170,10 +192,16 @@ impl Live {
             crate::log(format_args!("input to {peer}: no word back for {} ms, stopped", heard.as_millis()));
             lost();
         }
-        if heard > DRIVEN_LOST && self.driven.swap(false, Ordering::Relaxed) {
+        if heard > DRIVEN_LOST && self.set_driven(false) {
             self.input.lock().unwrap().release();
             crate::log(format_args!("input from {peer}: silent for {} ms, let go of what it held", heard.as_millis()));
         }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.set_driven(false);
     }
 }
 
@@ -957,6 +985,7 @@ impl Node {
 
     fn read_loop(&self, r: &mut impl Read, files: &mut Incoming, live: &Live) -> io::Result<()> {
         let mut told = false;
+        let mut got = (0u32, 0u32);
         loop {
             files.tell_cancels();
             let f = wire::read_frame(r)?;
@@ -966,13 +995,21 @@ impl Node {
                     // Driven, this side answers every BEAT: the writer may be asleep for 10 s.
                     // Not allowed here, nothing answers: the driver stops after DRIVER_LOST.
                     let on = !matches!(f, Frame::KvmLeave) && self.kvm();
-                    if live.driven.swap(on, Ordering::Relaxed) != on {
+                    if live.set_driven(on) {
                         let _ = files.tx.fast.try_send(None);
                         let _ = live.wake.try_send(());
                     }
-                    // Diagnostic (2026-11-22 device test): lines the two logs up.
+                    // Diagnostic (2026-11-22 device test): lines the two logs up. With the keys and
+                    // scrolls that came between (2026-11-26: typing and touchpad scrolling across
+                    // from the PC didn't land).
+                    match f {
+                        Frame::KvmKey { .. } => got.0 += 1,
+                        Frame::KvmWheel { .. } => got.1 += 1,
+                        _ => {}
+                    }
                     if matches!(f, Frame::KvmEnter { .. } | Frame::KvmLeave) {
-                        crate::log(format_args!("input from {}: {f:?}", files.peer));
+                        crate::log(format_args!("input from {}: {f:?} ({} keys, {} scrolls before)", files.peer, got.0, got.1));
+                        got = (0, 0);
                     }
                     let mut input = live.input.lock().unwrap();
                     if !self.kvm() {
@@ -1402,5 +1439,27 @@ mod tests {
             assert!(matches!(wire::read_frame(&mut r).unwrap(), Frame::FileData { .. }));
         }
         drop(tx);
+    }
+
+    /// A device driven by its peer doesn't start a crossing of its own; once the peer lets go,
+    /// or its link goes, it may again. Counted across links, so one link letting go of a state
+    /// it never had can't clear another's. The count is shared with any other test in this
+    /// binary driving a link, so this one compares with where it started.
+    #[test]
+    fn a_device_counts_as_driven_from_the_peer_s_input_until_it_lets_go_or_the_link_goes() {
+        let sink = || -> Box<dyn Sink + Send> { Box::new(crate::kvm::tests::Rec::default()) };
+        let (a, _wa) = Live::new(sink());
+        let (b, _wb) = Live::new(sink());
+        let base = DRIVEN.load(Ordering::Relaxed);
+        assert!(a.set_driven(true));
+        assert!(!a.set_driven(true), "more input from the same peer");
+        assert!(!b.set_driven(false), "a link never driven letting go");
+        assert_eq!(DRIVEN.load(Ordering::Relaxed), base + 1);
+        assert!(driven());
+        b.set_driven(true);
+        assert!(a.set_driven(false), "KvmLeave");
+        assert_eq!(DRIVEN.load(Ordering::Relaxed), base + 1, "the other link still drives");
+        drop(b);
+        assert_eq!(DRIVEN.load(Ordering::Relaxed), base, "a driven link gone");
     }
 }

@@ -72,7 +72,8 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     let pt = (f64::from(m.pt.x), f64::from(m.pt.y));
     let msg = w as u32;
     if !st.crossed.load(Ordering::SeqCst) {
-        if msg != WM_MOUSEMOVE || !st.peer.load(Ordering::Relaxed) {
+        // Not while the peer drives this PC: both would be driving each other.
+        if msg != WM_MOUSEMOVE || !st.peer.load(Ordering::Relaxed) || crate::node::driven() {
             return pass();
         }
         let b = st.reread();
