@@ -43,6 +43,14 @@ pub(super) struct Shared {
     /// The last Esc that didn't count: its count and the modifiers held, as wire bits.
     esc_missed: AtomicU32,
     esc_mods: AtomicU32,
+    /// Every keyboard hook call while across, before any check, and the ones let through for
+    /// each reason: whether the hook is called at all for the keys that went missing (2026-11-26:
+    /// only with Aun's own window in front), and the virtual key of the first let through.
+    calls: AtomicU32,
+    passed: [AtomicU32; 3],
+    first_passed: AtomicU32,
+    /// Whether this process's window was in front as the crossing started.
+    pub(super) front_is_aun: std::sync::atomic::AtomicBool,
 }
 
 /// What [`Shared`] holds for this crossing, for its last log line; cleared for the next.
@@ -50,7 +58,16 @@ pub(super) fn diag(st: &State) -> String {
     let d = &st.os;
     let (n, last) = (d.unmapped.swap(0, Ordering::Relaxed), d.last_unmapped.swap(0, Ordering::Relaxed));
     let (esc, mods) = (d.esc_missed.swap(0, Ordering::Relaxed), d.esc_mods.swap(0, Ordering::Relaxed));
-    format!("; {n} keys with no wire key, last vk {:#x} scan {:#x} flags {:#x}; {esc} Esc not escaping, last with modifiers {mods:#04x}", last >> 32, (last >> 16) & 0xFFFF, last & 0xFFFF)
+    let calls = d.calls.swap(0, Ordering::Relaxed);
+    let [neg, mark, idle] = d.passed.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    let first = d.first_passed.swap(0, Ordering::Relaxed);
+    let front = d.front_is_aun.load(Ordering::Relaxed);
+    format!(
+        "; {n} keys with no wire key, last vk {:#x} scan {:#x} flags {:#x}; {esc} Esc not escaping, last with modifiers {mods:#04x}; keyboard hook called {calls} times across, let through {neg} for code, {mark} as Aun's own, {idle} as not across, first vk {first:#x}; Aun in front at the start: {front}",
+        last >> 32,
+        (last >> 16) & 0xFFFF,
+        last & 0xFFFF
+    )
 }
 
 pub(super) fn cursor() -> (f64, f64) {
@@ -64,6 +81,14 @@ pub(super) fn cursor() -> (f64, f64) {
 pub(super) fn give_back((x, y): (f64, f64)) {
     // SAFETY: a plain call taking values.
     unsafe { SetCursorPos(x as i32, y as i32) };
+}
+
+/// Whether the window in front belongs to this process.
+fn front_is_aun() -> bool {
+    let mut pid = 0;
+    // SAFETY: plain reads.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
+    pid == std::process::id()
 }
 
 /// Whether a modifier or mouse button is down: then no crossing starts (its up would come here).
@@ -111,6 +136,7 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             return pass();
         }
         st.at.store(at.into(), Ordering::Relaxed);
+        st.os.front_is_aun.store(front_is_aun(), Ordering::Relaxed);
         MODS.set(0);
         WHEEL.set((0, 0));
         // SAFETY: a plain call; the point read back is where it landed (a gap between screens
@@ -168,13 +194,29 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
 
 unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     let st = ST.load(Ordering::Acquire);
+    // SAFETY: as in `mouse`; only atomics read here.
+    if code < 0 && !st.is_null() && unsafe { &*st }.crossed.load(Ordering::SeqCst) {
+        let d = unsafe { &(*st).os };
+        d.calls.fetch_add(1, Ordering::Relaxed);
+        d.passed[0].fetch_add(1, Ordering::Relaxed);
+    }
     if code < 0 || st.is_null() {
         // SAFETY: passing the event on, as the hook contract asks.
         return unsafe { CallNextHookEx(null_mut(), code, w, l) };
     }
     // SAFETY: as in `mouse`.
     let (st, k) = unsafe { (&*st, &*(l as *const KBDLLHOOKSTRUCT)) };
-    if k.dwExtraInfo == kvm::MARK as usize || !st.crossed.load(Ordering::SeqCst) {
+    let across = st.crossed.load(Ordering::SeqCst);
+    if across {
+        st.os.calls.fetch_add(1, Ordering::Relaxed);
+    }
+    let mark = k.dwExtraInfo == kvm::MARK as usize;
+    if mark || !across {
+        // Diagnostic: counted from the first key of a crossing on (`calls` counts it already).
+        if st.os.calls.load(Ordering::Relaxed) > 0 {
+            st.os.passed[if mark { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+            let _ = st.os.first_passed.compare_exchange(0, k.vkCode, Ordering::Relaxed, Ordering::Relaxed);
+        }
         // SAFETY: as above.
         return unsafe { CallNextHookEx(null_mut(), code, w, l) };
     }
