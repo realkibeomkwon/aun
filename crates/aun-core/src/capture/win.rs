@@ -83,6 +83,23 @@ pub(super) fn give_back((x, y): (f64, f64)) {
     unsafe { SetCursorPos(x as i32, y as i32) };
 }
 
+/// A crossing started (on the sender thread, not the hook's). With Aun's own window in front,
+/// Windows doesn't call this process's keyboard hook for most keys (2026-11-26: across, `a` and
+/// the first Esc never reached it, 8 calls for 13 keys pressed; with Notepad in front all came;
+/// why is not known): the shell's desktop takes the front instead. Aun is the front process, so
+/// it may hand the front on.
+pub(super) fn entered(st: &State) {
+    if !st.os.front_is_aun.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: plain calls; a null shell window (no Explorer) is left alone.
+    let moved = unsafe {
+        let shell = GetShellWindow();
+        !shell.is_null() && SetForegroundWindow(shell) != 0
+    };
+    crate::log(format_args!("cross: Aun's window was in front, the desktop {}", if moved { "is now" } else { "could not be put in front" }));
+}
+
 /// Whether the window in front belongs to this process.
 fn front_is_aun() -> bool {
     let mut pid = 0;

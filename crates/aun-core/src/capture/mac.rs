@@ -90,6 +90,9 @@ impl Shared {
     }
 }
 
+/// A crossing started (on the sender thread): nothing to do here.
+pub(super) fn entered(_st: &State) {}
+
 /// More for the crossing's last log line: nothing here.
 pub(super) fn diag(_st: &State) -> String {
     String::new()

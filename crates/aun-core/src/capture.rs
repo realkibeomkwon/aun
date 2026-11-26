@@ -310,6 +310,7 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
                 }
                 started += 1;
                 to = *target.lock().unwrap();
+                os::entered(&st);
                 let (x, y) = os::cursor();
                 let b = st.bounds();
                 crate::log(format_args!("cross: in at {x:.0},{y:.0} (screens {:.0},{:.0} to {:.0},{:.0})", b.x0, b.y0, b.x1, b.y1));
