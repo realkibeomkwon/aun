@@ -1263,15 +1263,17 @@ fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Rec
                         wrote = true;
                     }
                 }
+                // Here, not after the loop: a file going out keeps the bulk lane full until it ends.
+                if live.driven.load(Ordering::Relaxed) && told.elapsed() >= SEEN {
+                    wire::write_frame(&mut w, &Frame::KvmSeen { n: live.seen.load(Ordering::Relaxed) })?;
+                    told = Instant::now();
+                    wrote = true;
+                }
                 let Ok(f) = bulk.try_recv() else { break };
                 if wrote {
                     w.flush()?;
                 }
                 wire::write_frame(&mut w, &f)?;
-            }
-            if live.driven.load(Ordering::Relaxed) && told.elapsed() >= SEEN {
-                wire::write_frame(&mut w, &Frame::KvmSeen { n: live.seen.load(Ordering::Relaxed) })?;
-                told = Instant::now();
             }
             w.flush()?;
         }
@@ -1641,6 +1643,36 @@ mod tests {
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::KvmSeen { n: 7 });
         live.seen.store(9, Ordering::Relaxed);
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::KvmSeen { n: 9 }, "again within a moment");
+        live.driven.store(false, Ordering::Relaxed);
+        drop(tx);
+    }
+
+    /// Driven while sending a file: the bulk lane never runs dry, and the answer still goes out
+    /// ahead of the chunks, or the driver would stop after DRIVER_LOST on any link.
+    #[test]
+    fn a_driven_side_tells_what_it_took_while_sending_a_file() {
+        let (ti, tr) = transports();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let out = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (inp, _) = l.accept().unwrap();
+        let (tx, fast, bulk) = queue();
+        let live = Arc::new(idle());
+        live.seen.store(7, Ordering::Relaxed);
+        live.driven.store(true, Ordering::Relaxed);
+        let (w, wl) = (SealWriter::new(Arc::new(ti), out.try_clone().unwrap()), live.clone());
+        thread::spawn(move || writer(w, fast, bulk, out, &wl));
+        let ftx = tx.clone();
+        thread::spawn(move || while ftx.send(Frame::FileData { id: 1, data: vec![0; wire::FILE_CHUNK] }).is_ok() {});
+        let mut r = OpenReader::new(Arc::new(tr), inp);
+        let start = Instant::now();
+        let mut seen = 0;
+        while seen < 3 {
+            match wire::read_frame(&mut r).unwrap() {
+                Frame::KvmSeen { n: 7 } => seen += 1,
+                Frame::FileData { .. } => assert!(start.elapsed() < Duration::from_secs(2), "{seen} answers in 2 s of file data"),
+                f => panic!("{f:?}"),
+            }
+        }
         live.driven.store(false, Ordering::Relaxed);
         drop(tx);
     }
