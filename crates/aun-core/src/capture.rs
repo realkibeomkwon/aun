@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::kvm::{self, Bounds, Captured, Driver};
 use crate::store::Id;
@@ -280,9 +280,13 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
     // Moves, keys and scrolls taken in this crossing, for the log (2026-11-26: typing and touchpad
     // scrolling across from the PC didn't land; this says whether the hook saw them).
     let mut taken = [0u32; 3];
-    let leave = |to: Option<Id>, left: &mut u32, st: &State, taken: &mut [u32; 3]| {
+    // The most this side's send buffer held while across, sampled every 50 ms (macOS): whether a
+    // file going out held the input back (2026-11-27, docs/kvm-design.md 8, 4-0).
+    let (mut unsent, mut sampled): (Option<usize>, Option<Instant>) = (None, None);
+    let leave = |to: Option<Id>, left: &mut u32, st: &State, taken: &mut [u32; 3], unsent: &mut Option<usize>| {
         let why = Why::NAMES[usize::from(st.why.load(Ordering::Relaxed)).min(Why::NAMES.len() - 1)];
-        crate::log(format_args!("cross: out ({why}; took {} moves, {} keys, {} scrolls{})", taken[0], taken[1], taken[2], os::diag(st)));
+        let buffered = unsent.take().map_or(String::new(), |b| format!(", at most {} KB in the send buffer", b >> 10));
+        crate::log(format_args!("cross: out ({why}; took {} moves, {} keys, {} scrolls{buffered}{})", taken[0], taken[1], taken[2], os::diag(st)));
         *taken = [0; 3];
         *left += 1;
         if let Some(id) = to {
@@ -306,7 +310,7 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
         for c in first.into_iter().chain(rx.try_iter()) {
             if let Captured::Enter(_) = c {
                 if started != left {
-                    leave(to, &mut left, &st, &mut taken); // the previous one ended before this could start
+                    leave(to, &mut left, &st, &mut taken, &mut unsent); // the previous one ended before this could start
                 }
                 started += 1;
                 to = *target.lock().unwrap();
@@ -338,8 +342,17 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
                 st.end(None, Why::NOT_SENT); // no link that speaks input, or stuck: nothing to drive
             }
         }
+        if started != left
+            && let Some(id) = to
+            && sampled.is_none_or(|t| t.elapsed() >= Duration::from_millis(50))
+        {
+            sampled = Some(Instant::now());
+            if let Some(b) = node.unsent(id) {
+                unsent = Some(unsent.unwrap_or(0).max(b));
+            }
+        }
         if started != left && st.ends.load(Ordering::SeqCst) > left {
-            leave(to, &mut left, &st, &mut taken);
+            leave(to, &mut left, &st, &mut taken, &mut unsent);
         }
     }
 }

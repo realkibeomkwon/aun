@@ -26,8 +26,9 @@ pub const FILE_CHUNK: usize = 256 << 10;
 /// The `Kvm*` frames this build speaks, sent in `Hello`. Peers use them only when both say the
 /// same version (0, as an older build reads: none); a change to their layout bumps it.
 /// 3: each side writes every 250 ms while input goes either way (`node::BEAT`); an older
-/// peer's silence would read as a stalled link. 4: `KvmBlocked`.
-pub const KVM: u8 = 4;
+/// peer's silence would read as a stalled link. 4: `KvmBlocked`. 5: `KvmSeen`, which the driver
+/// waits for (an older peer never sends it).
+pub const KVM: u8 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -72,6 +73,9 @@ pub enum Frame {
     /// The driven side can't inject now (Windows: a window above Aun's rights in front, UIPI):
     /// the driver ends `route` and says why. Sent once each time it starts being so.
     KvmBlocked { route: u32 },
+    /// From the driven side while driven: it has taken `n` input frames on this link so far. The
+    /// driver stops when what it sent goes unanswered (a link stalled one way, docs/kvm-design.md 7).
+    KvmSeen { n: u32 },
 }
 
 impl Frame {
@@ -150,6 +154,7 @@ pub fn write_frame(w: &mut impl Write, f: &Frame) -> io::Result<()> {
         Frame::KvmEnter { route, side, at } => (b.push(17), b.extend_from_slice(&route.to_be_bytes()), b.push(*side), b.extend_from_slice(&at.to_be_bytes())).3,
         Frame::KvmReturn { route, at } => (b.push(18), b.extend_from_slice(&route.to_be_bytes()), b.extend_from_slice(&at.to_be_bytes())).2,
         Frame::KvmBlocked { route } => (b.push(19), b.extend_from_slice(&route.to_be_bytes())).1,
+        Frame::KvmSeen { n } => (b.push(20), b.extend_from_slice(&n.to_be_bytes())).1,
         Frame::FileData { .. } | Frame::ClipImage(_) => unreachable!(),
     }
     w.write_all(&(b.len() as u32).to_be_bytes())?;
@@ -226,6 +231,7 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Frame> {
             None => return Err(bad("short")),
         },
         19 => Frame::KvmBlocked { route: u32_at(&b, 1)? },
+        20 => Frame::KvmSeen { n: u32_at(&b, 1)? },
         18 => match b.get(5..7) {
             Some(&[h, l]) => Frame::KvmReturn { route: u32_at(&b, 1)?, at: u16::from_be_bytes([h, l]) },
             _ => return Err(bad("short")),
@@ -366,6 +372,7 @@ mod tests {
         round(Frame::KvmEnter { route: u32::MAX, side: 3, at: 0x8001 });
         round(Frame::KvmReturn { route: 7, at: u16::MAX });
         round(Frame::KvmBlocked { route: 9 });
+        round(Frame::KvmSeen { n: u32::MAX });
     }
 
     /// A build from before the cancel byte still talks to this one: its abort reads as a failure.

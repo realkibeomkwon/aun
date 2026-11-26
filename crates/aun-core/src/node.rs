@@ -37,6 +37,10 @@ const BEAT: Duration = Duration::from_millis(250);
 const DRIVER_LOST: Duration = Duration::from_millis(500);
 /// Silence from the sending side after which the receiving side lets go of what it holds.
 const DRIVEN_LOST: Duration = Duration::from_secs(1);
+/// How often the driven side says what it has taken (`KvmSeen`), well inside [`DRIVER_LOST`].
+const SEEN: Duration = Duration::from_millis(100);
+/// Input sent within this of the oldest unanswered mark shares it: a few marks a second at most.
+const MARK: Duration = Duration::from_millis(50);
 const CODE_TRIES: u32 = 3;
 const STACK: usize = 256 << 10;
 /// How often paired devices at a typed address are redialled, and a wake from sleep looked for.
@@ -112,7 +116,7 @@ fn queue() -> (Tx, Receiver<Option<Frame>>, Receiver<Frame>) {
 
 impl Tx {
     fn is_fast(f: &Frame) -> bool {
-        matches!(f, Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. } | Frame::KvmReturn { .. } | Frame::KvmBlocked { .. } | Frame::Ping | Frame::FileFrom { .. } | Frame::FileCancel { .. })
+        matches!(f, Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. } | Frame::KvmReturn { .. } | Frame::KvmBlocked { .. } | Frame::KvmSeen { .. } | Frame::Ping | Frame::FileFrom { .. } | Frame::FileCancel { .. })
     }
 
     /// Waits for room; Err once the link is gone.
@@ -195,6 +199,41 @@ struct Live {
     driven: AtomicBool,
     /// Wakes the link's watchdog ([`watch`]) when input starts either way.
     wake: SyncSender<()>,
+    /// Driving: input frames sent on this link, and when the ones not yet answered went.
+    unseen: Mutex<Unseen>,
+    /// Driven: input frames taken on this link, told back in `KvmSeen`.
+    seen: AtomicU32,
+}
+
+/// The input this side sent that the peer hasn't said it took ([`Frame::KvmSeen`]). Hearing the
+/// peer isn't enough: on 2026-11-27 a file going out from the Mac held its input back over 1 s
+/// while the PC's pings still came in, and the Mac kept the keyboard and mouse.
+#[derive(Default)]
+struct Unseen {
+    sent: u32,
+    /// (the last frame sent within [`MARK`] of `when`, `when`), oldest first.
+    marks: VecDeque<(u32, Instant)>,
+}
+
+impl Unseen {
+    fn sent(&mut self, now: Instant) {
+        self.sent = self.sent.wrapping_add(1);
+        match self.marks.back_mut() {
+            Some((n, when)) if now.saturating_duration_since(*when) < MARK => *n = self.sent,
+            _ => self.marks.push_back((self.sent, now)),
+        }
+    }
+
+    fn seen(&mut self, n: u32) {
+        while self.marks.front().is_some_and(|&(m, _)| n.wrapping_sub(m) as i32 >= 0) {
+            self.marks.pop_front();
+        }
+    }
+
+    /// How long the oldest input not yet taken has waited.
+    fn waited(&self, now: Instant) -> Duration {
+        self.marks.front().map_or(Duration::ZERO, |&(_, when)| now.saturating_duration_since(when))
+    }
 }
 
 /// Links whose peer is driving this device now ([`Live::driven`] set).
@@ -222,7 +261,7 @@ impl Live {
 
     fn new(sink: Box<dyn Sink + Send>) -> (Self, Receiver<()>) {
         let (wake, woken) = mpsc::sync_channel(1);
-        (Live { heard: Mutex::new(Instant::now()), input: Mutex::new(Injector::new(sink)), driving: Mutex::new(None), driven: AtomicBool::new(false), wake }, woken)
+        (Live { heard: Mutex::new(Instant::now()), input: Mutex::new(Injector::new(sink)), driving: Mutex::new(None), driven: AtomicBool::new(false), wake, unseen: Mutex::default(), seen: AtomicU32::new(0) }, woken)
     }
 
     fn active(&self) -> bool {
@@ -232,10 +271,15 @@ impl Live {
     /// Acts on silence from the peer.
     fn check(&self, peer: &str, lost: &dyn Fn()) {
         let heard = self.heard.lock().unwrap().elapsed();
+        let waited = self.unseen.lock().unwrap().waited(Instant::now());
         // Counted from the first input too: the peer pinged only every 10 s before it.
-        let stalled = self.driving.lock().unwrap().take_if(|since| heard.min(since.elapsed()) > DRIVER_LOST).is_some();
+        let stalled = self.driving.lock().unwrap().take_if(|since| heard.min(since.elapsed()) > DRIVER_LOST || waited > DRIVER_LOST).is_some();
         if stalled {
-            crate::log(format_args!("input to {peer}: no word back for {} ms, stopped", heard.as_millis()));
+            if waited > DRIVER_LOST {
+                crate::log(format_args!("input to {peer}: not taken there for {} ms (heard from it {} ms ago), stopped", waited.as_millis(), heard.as_millis()));
+            } else {
+                crate::log(format_args!("input to {peer}: no word back for {} ms, stopped", heard.as_millis()));
+            }
             lost();
         }
         if heard > DRIVEN_LOST && self.set_driven(false) {
@@ -529,19 +573,50 @@ impl Node {
             if !was && driving.is_some() {
                 let _ = live.wake.try_send(());
             }
+            if driving.is_none() {
+                live.unseen.lock().unwrap().marks.clear(); // its answer no longer matters
+            }
         }
         let must = f.must_arrive();
         let end = Instant::now() + Duration::from_millis(250);
         let mut f = f;
         loop {
+            let leave = matches!(f, Frame::KvmLeave);
             match tx.try_send(f) {
-                Ok(()) => return true,
+                Ok(()) => {
+                    let mut unseen = live.unseen.lock().unwrap();
+                    unseen.sent = unseen.sent.wrapping_add(leave as u32);
+                    if !leave {
+                        unseen.sent(Instant::now());
+                    }
+                    return true;
+                }
                 Err(mpsc::TrySendError::Full(back)) if must && Instant::now() < end => {
                     f = back;
                     thread::sleep(Duration::from_millis(2));
                 }
                 Err(_) => return false,
             }
+        }
+    }
+
+    /// Bytes in this side's send buffer to `id`, macOS only (`SO_NWRITE`): input written after them
+    /// waits for them (docs/kvm-design.md 8, 4-0, the 2026-11-27 stall).
+    pub fn unsent(&self, id: Id) -> Option<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let st = self.st();
+            let fd = st.peers.get(&id)?.link.as_ref()?.sock.as_raw_fd();
+            let (mut v, mut n) = (0i32, std::mem::size_of::<i32>() as libc::socklen_t);
+            // SAFETY: an int option read into an int, on a socket the lock keeps open.
+            let ok = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_NWRITE, (&mut v as *mut i32).cast(), &mut n) } == 0;
+            ok.then_some(v.max(0) as usize)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = id;
+            None
         }
     }
 
@@ -1039,7 +1114,8 @@ impl Node {
             *live.heard.lock().unwrap() = Instant::now();
             match f {
                 f @ (Frame::KvmMove { .. } | Frame::KvmButton { .. } | Frame::KvmWheel { .. } | Frame::KvmLeave | Frame::KvmKey { .. } | Frame::KvmEnter { .. }) => {
-                    // Driven, this side answers every BEAT: the writer may be asleep for 10 s.
+                    live.seen.fetch_add(1, Ordering::Relaxed);
+                    // Driven, this side answers every SEEN: the writer may be asleep for 10 s.
                     // Not allowed here, nothing answers: the driver stops after DRIVER_LOST.
                     let on = !matches!(f, Frame::KvmLeave) && self.kvm();
                     if live.set_driven(on) {
@@ -1079,6 +1155,7 @@ impl Node {
                     }
                 }
                 Frame::Ping => {}
+                Frame::KvmSeen { n } => live.unseen.lock().unwrap().seen(n),
                 Frame::KvmReturn { route, at } => (self.0.notify)(Note::Returned { id: files.remote, route, at }),
                 Frame::KvmBlocked { route } => {
                     crate::log(format_args!("input to {}: blocked there (a window above Aun's rights in front)", files.peer));
@@ -1163,14 +1240,18 @@ fn handshake(sock: &TcpStream, key: &[u8], initiator: bool) -> io::Result<(State
 /// Writes queued frames, every fast one ahead of the next bulk one (see [`Tx`]). Flushes when
 /// the queues run dry so small frames share one Noise message, and after fast frames written
 /// between bulk ones so they don't sit in the buffer behind the next chunk. Wakes every [`BEAT`]
-/// while input goes either way, so the peer hears from this side ([`watch`] judges silence).
+/// while input goes either way, so the peer hears from this side ([`watch`] judges silence), and
+/// says what it has taken every [`SEEN`] while driven.
 fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Receiver<Frame>, sock: TcpStream, live: &Live) {
     let res = (|| -> io::Result<()> {
+        let mut told = Instant::now();
         loop {
-            let wait = if live.active() { BEAT } else { PING };
+            let driven = live.driven.load(Ordering::Relaxed);
+            let wait = if driven { SEEN.saturating_sub(told.elapsed()) } else if live.active() { BEAT } else { PING };
             match fast.recv_timeout(wait) {
                 Ok(Some(f)) => wire::write_frame(&mut w, &f)?,
                 Ok(None) => {}
+                Err(RecvTimeoutError::Timeout) if driven => {} // KvmSeen below
                 Err(RecvTimeoutError::Timeout) => wire::write_frame(&mut w, &Frame::Ping)?,
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -1187,6 +1268,10 @@ fn writer(mut w: SealWriter<TcpStream>, fast: Receiver<Option<Frame>>, bulk: Rec
                     w.flush()?;
                 }
                 wire::write_frame(&mut w, &f)?;
+            }
+            if live.driven.load(Ordering::Relaxed) && told.elapsed() >= SEEN {
+                wire::write_frame(&mut w, &Frame::KvmSeen { n: live.seen.load(Ordering::Relaxed) })?;
+                told = Instant::now();
             }
             w.flush()?;
         }
@@ -1490,6 +1575,73 @@ mod tests {
         let mut r = OpenReader::new(Arc::new(tr), inp);
         assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::Clip("a".into()));
         assert_eq!(wire::read_frame(&mut r).expect("second frame within 2 s, not at the next ping"), Frame::Clip("b".into()));
+        drop(tx);
+    }
+
+    /// The 2026-11-27 stall: a file going out held the Mac's input back over 1 s while the PC's
+    /// pings still came in. Hearing the peer isn't enough; input it hasn't taken stops the driver.
+    #[test]
+    fn input_the_peer_hasn_t_taken_stops_the_driver_though_the_peer_is_heard() {
+        let live = idle();
+        let lost = AtomicU32::new(0);
+        let check = || {
+            *live.heard.lock().unwrap() = Instant::now();
+            live.check("peer", &|| {
+                lost.fetch_add(1, Ordering::Relaxed);
+            });
+        };
+        *live.driving.lock().unwrap() = Some(Instant::now());
+        for _ in 0..3 {
+            live.unseen.lock().unwrap().sent(Instant::now());
+        }
+        live.unseen.lock().unwrap().seen(3);
+        thread::sleep(DRIVER_LOST + Duration::from_millis(100));
+        check();
+        assert_eq!(lost.load(Ordering::Relaxed), 0, "all taken, the peer heard");
+        live.unseen.lock().unwrap().sent(Instant::now());
+        thread::sleep(DRIVER_LOST + Duration::from_millis(100));
+        check();
+        assert_eq!(lost.load(Ordering::Relaxed), 1, "one not taken for over 500 ms");
+    }
+
+    /// Marks go once the peer has taken their frames, past the counter's wrap too; input sent
+    /// close together shares the oldest mark's time.
+    #[test]
+    fn unseen_input_waits_from_its_oldest_unanswered_send() {
+        let t = Instant::now();
+        let mut u = Unseen { sent: u32::MAX - 1, marks: VecDeque::new() };
+        u.sent(t); // u32::MAX
+        u.sent(t + Duration::from_millis(10)); // 0, same mark
+        u.sent(t + Duration::from_millis(60)); // 1, a new mark
+        assert_eq!(u.marks, [(0, t), (1, t + Duration::from_millis(60))]);
+        u.seen(u32::MAX);
+        assert_eq!(u.waited(t + Duration::from_millis(100)), Duration::from_millis(100), "0 not taken yet");
+        u.seen(0);
+        assert_eq!(u.waited(t + Duration::from_millis(100)), Duration::from_millis(40));
+        u.seen(1);
+        assert_eq!(u.waited(t + Duration::from_secs(9)), Duration::ZERO);
+    }
+
+    /// Driven, the writer says what it has taken though it has nothing else to write.
+    #[test]
+    fn a_driven_side_tells_what_it_took() {
+        let (ti, tr) = transports();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let out = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (inp, _) = l.accept().unwrap();
+        let (tx, fast, bulk) = queue();
+        let live = Arc::new(idle());
+        live.seen.store(7, Ordering::Relaxed);
+        // Not set_driven: DRIVEN is shared with another test in this binary.
+        live.driven.store(true, Ordering::Relaxed);
+        let (w, wl) = (SealWriter::new(Arc::new(ti), out.try_clone().unwrap()), live.clone());
+        thread::spawn(move || writer(w, fast, bulk, out, &wl));
+        inp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut r = OpenReader::new(Arc::new(tr), inp);
+        assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::KvmSeen { n: 7 });
+        live.seen.store(9, Ordering::Relaxed);
+        assert_eq!(wire::read_frame(&mut r).unwrap(), Frame::KvmSeen { n: 9 }, "again within a moment");
+        live.driven.store(false, Ordering::Relaxed);
         drop(tx);
     }
 
