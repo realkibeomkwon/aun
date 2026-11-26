@@ -10,7 +10,7 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -22,6 +22,14 @@ use crate::kvm::{self, Captured};
 /// The state the hooks serve: set while they are on (one `Cross` at a time; the app drops the
 /// old one first). Hooks take no user pointer.
 static ST: AtomicPtr<State> = AtomicPtr::new(null_mut());
+
+/// The window put under the parked cursor while across, for touchpad scrolling: a precision
+/// touchpad's scroll mostly skips `WH_MOUSE_LL` (2026-11-26: 0, 0 and 1 scrolls taken in three
+/// crossings) and comes as `WM_MOUSEWHEEL` to the window under the cursor. Made on the hook
+/// thread, which dispatches its messages.
+static OVERLAY: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(null_mut());
+/// Its side, in pixels, centred on the parked cursor.
+const OVERLAY_SIZE: i32 = 100;
 
 thread_local! {
     /// What the hooks keep between events, on their thread: the wire modifiers held while
@@ -49,6 +57,9 @@ pub(super) struct Shared {
     calls: AtomicU32,
     passed: [AtomicU32; 3],
     first_passed: AtomicU32,
+    /// Scrolls the overlay window took (of the crossing's scrolls): whether touchpad scrolling
+    /// reaches it.
+    overlay: AtomicU32,
     /// Whether this process's window was in front as the crossing started.
     pub(super) front_is_aun: std::sync::atomic::AtomicBool,
 }
@@ -62,8 +73,9 @@ pub(super) fn diag(st: &State) -> String {
     let [neg, mark, idle] = d.passed.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
     let first = d.first_passed.swap(0, Ordering::Relaxed);
     let front = d.front_is_aun.load(Ordering::Relaxed);
+    let overlay = d.overlay.swap(0, Ordering::Relaxed);
     format!(
-        "; {n} keys with no wire key, last vk {:#x} scan {:#x} flags {:#x}; {esc} Esc not escaping, last with modifiers {mods:#04x}; keyboard hook called {calls} times across, let through {neg} for code, {mark} as Aun's own, {idle} as not across, first vk {first:#x}; Aun in front at the start: {front}",
+        "; {overlay} scrolls by the overlay window; {n} keys with no wire key, last vk {:#x} scan {:#x} flags {:#x}; {esc} Esc not escaping, last with modifiers {mods:#04x}; keyboard hook called {calls} times across, let through {neg} for code, {mark} as Aun's own, {idle} as not across, first vk {first:#x}; Aun in front at the start: {front}",
         last >> 32,
         (last >> 16) & 0xFFFF,
         last & 0xFFFF
@@ -77,10 +89,17 @@ pub(super) fn cursor() -> (f64, f64) {
     (p.x.into(), p.y.into())
 }
 
-/// The cursor back at `(x, y)`: it was never taken from the mouse, only kept still.
+/// The cursor back at `(x, y)`: it was never taken from the mouse, only kept still. The overlay
+/// window goes away (from any thread, so without waiting on the hook thread).
 pub(super) fn give_back((x, y): (f64, f64)) {
-    // SAFETY: a plain call taking values.
-    unsafe { SetCursorPos(x as i32, y as i32) };
+    // SAFETY: plain calls taking values; a null window is skipped.
+    unsafe {
+        let w = OVERLAY.load(Ordering::Acquire);
+        if !w.is_null() {
+            ShowWindowAsync(w, SW_HIDE);
+        }
+        SetCursorPos(x as i32, y as i32);
+    }
 }
 
 /// A crossing started (on the sender thread, not the hook's). With Aun's own window in front,
@@ -159,7 +178,15 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         // SAFETY: a plain call; the point read back is where it landed (a gap between screens
         // moves it).
         unsafe { SetCursorPos(((b.x0 + b.x1) / 2.0) as i32, ((b.y0 + b.y1) / 2.0) as i32) };
-        st.lock_at(cursor());
+        let (x, y) = cursor();
+        st.lock_at((x, y));
+        let w = OVERLAY.load(Ordering::Acquire);
+        if !w.is_null() {
+            let (x, y) = (x as i32 - OVERLAY_SIZE / 2, y as i32 - OVERLAY_SIZE / 2);
+            // SAFETY: a plain call on this thread's window; never activated, or Windows would skip
+            // the keyboard hook as with Aun's window in front (`entered`).
+            unsafe { SetWindowPos(w, HWND_TOPMOST, x, y, OVERLAY_SIZE, OVERLAY_SIZE, SWP_NOACTIVATE | SWP_SHOWWINDOW) };
+        }
         st.crossed.store(true, Ordering::SeqCst);
         return SWALLOW;
     }
@@ -188,25 +215,62 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         WM_LBUTTONDOWN | WM_LBUTTONUP => button(0, msg == WM_LBUTTONDOWN),
         WM_RBUTTONDOWN | WM_RBUTTONUP => button(1, msg == WM_RBUTTONDOWN),
         WM_MBUTTONDOWN | WM_MBUTTONUP => button(2, msg == WM_MBUTTONDOWN),
-        // Wire: positive dy scrolls up, positive dx scrolls left (as the receivers read it).
-        WM_MOUSEWHEEL => {
-            let (rx, mut ry) = WHEEL.get();
-            let dy = super::wheel_px(&mut ry, units);
-            WHEEL.set((rx, ry));
-            Captured::Wheel(0, dy)
-        }
-        WM_MOUSEHWHEEL => {
-            let (mut rx, ry) = WHEEL.get();
-            let dx = super::wheel_px(&mut rx, -units);
-            WHEEL.set((rx, ry));
-            Captured::Wheel(dx, 0)
-        }
+        // A wheel swallowed here never reaches the overlay window: no scroll counts twice.
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => wheel(msg, units),
         _ => return SWALLOW, // side buttons: not on the wire
     };
     if !matches!(c, Captured::Wheel(0, 0)) {
         st.send(c);
     }
     SWALLOW
+}
+
+/// A wheel message's 120-unit `units` as wire pixels, the rest kept for the next. Wire: positive
+/// dy scrolls up, positive dx scrolls left (as the receivers read it).
+fn wheel(msg: u32, units: i32) -> Captured {
+    let (mut rx, mut ry) = WHEEL.get();
+    let c = if msg == WM_MOUSEHWHEEL { Captured::Wheel(super::wheel_px(&mut rx, -units), 0) } else { Captured::Wheel(0, super::wheel_px(&mut ry, units)) };
+    WHEEL.set((rx, ry));
+    c
+}
+
+unsafe extern "system" fn overlay(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let st = ST.load(Ordering::Acquire);
+            // SAFETY: as in `mouse`: set while this thread runs, and the `State` outlives it.
+            if let Some(st) = unsafe { st.as_ref() }.filter(|st| st.crossed.load(Ordering::SeqCst)) {
+                st.os.overlay.fetch_add(1, Ordering::Relaxed);
+                let c = wheel(msg, i32::from((w >> 16) as u16 as i16));
+                if !matches!(c, Captured::Wheel(0, 0)) {
+                    st.send(c);
+                }
+            }
+            0
+        }
+        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        // SAFETY: the default for the rest.
+        _ => unsafe { DefWindowProcW(h, msg, w, l) },
+    }
+}
+
+/// The overlay window, hidden; null if it can't be made (touchpad scrolling then stays here).
+/// Near-invisible, not transparent: a layered window passes the mouse through where alpha is 0.
+unsafe fn make_overlay(module: HINSTANCE) -> HWND {
+    let name: Vec<u16> = "AunScroll\0".encode_utf16().collect();
+    // SAFETY: plain calls; the class name outlives them (copied by Windows).
+    unsafe {
+        let class = WNDCLASSW { lpfnWndProc: Some(overlay), hInstance: module, hCursor: LoadCursorW(null_mut(), IDC_ARROW), lpszClassName: name.as_ptr(), ..Default::default() };
+        RegisterClassW(&class);
+        let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+        let w = CreateWindowExW(ex, name.as_ptr(), name.as_ptr(), WS_POPUP, 0, 0, OVERLAY_SIZE, OVERLAY_SIZE, null_mut(), null_mut(), module, std::ptr::null());
+        if w.is_null() {
+            crate::log(format_args!("cross: overlay window not made (error {})", windows_sys::Win32::Foundation::GetLastError()));
+        } else {
+            SetLayeredWindowAttributes(w, 0, 1, LWA_ALPHA);
+        }
+        w
+    }
 }
 
 unsafe extern "system" fn keyboard(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -287,6 +351,8 @@ pub(super) fn start(st: &Arc<State>) -> Result<usize, String> {
         // both are off, then this thread takes it back.
         unsafe {
             let module = GetModuleHandleW(std::ptr::null());
+            let ov = make_overlay(module);
+            OVERLAY.store(ov, Ordering::Release);
             let m = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), module, 0);
             let k = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), module, 0);
             let mut msg: MSG = std::mem::zeroed();
@@ -294,7 +360,9 @@ pub(super) fn start(st: &Arc<State>) -> Result<usize, String> {
             PeekMessageW(&mut msg, null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
             if !m.is_null() && !k.is_null() {
                 let _ = made_tx.send(Some(GetCurrentThreadId() as usize));
-                while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}
+                while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                    DispatchMessageW(&msg);
+                }
             } else {
                 crate::log(format_args!("cross: hook not made (error {})", windows_sys::Win32::Foundation::GetLastError()));
                 let _ = made_tx.send(None);
@@ -306,6 +374,10 @@ pub(super) fn start(st: &Arc<State>) -> Result<usize, String> {
             }
             let st = Arc::from_raw(ST.swap(null_mut(), Ordering::AcqRel));
             st.end(None, Why::STOPPED);
+            OVERLAY.store(null_mut(), Ordering::Release);
+            if !ov.is_null() {
+                DestroyWindow(ov);
+            }
         }
     });
     if let Err(e) = spawned {
