@@ -751,7 +751,12 @@ mod mac {
                             // Added to the event's own: an F-key without its function flag
                             // doesn't fire a shortcut set to it (seen with F19, 2026-11-22).
                             CGEventSetFlags(e, CGEventGetFlags(e) & !(FN | NUMPAD) | own_flags(code) | flags);
-                            post_marked(e);
+                            // Unmarked: marked, the shortcut stopped switching the input source
+                            // (2026-11-26, from the pad and across, with the capture tap off too;
+                            // the mark was the only change since it last worked). Safe for the
+                            // tap: it lets keys by unless this Mac is across, and a driven Mac
+                            // doesn't cross.
+                            CGEventPost(HID_TAP, e);
                             CFRelease(e);
                         }
                     }
