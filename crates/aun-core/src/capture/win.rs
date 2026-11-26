@@ -2,7 +2,7 @@
 //! with a message loop (docs/kvm-design.md 3).
 //!
 //! While across, the cursor is parked mid-screen and every move is swallowed, so it stays there:
-//! each move's point less the parked one is the move. Parked on the edge, a push further out
+//! each move's point less the cursor's is the move. Parked on the edge, a push further out
 //! would read as no move, if Windows keeps the hook's point on the screens.
 
 use std::cell::Cell;
@@ -178,8 +178,17 @@ unsafe extern "system" fn mouse(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     let units = i32::from((m.mouseData >> 16) as u16 as i16);
     let c = match msg {
         WM_MOUSEMOVE => {
+            // The move is from where the cursor is now (moves are swallowed, so it stays). If
+            // something moved it off the parked point (unconfirmed: back from Ctrl+Alt+Del, 2026-11-27,
+            // the Mac pointer then only ran along its bottom edge), it goes back there.
             let (x, y) = st.locked();
-            let (dx, dy) = ((pt.0 - x) as i32, (pt.1 - y) as i32);
+            let now = cursor();
+            if now != (x, y) {
+                crate::log(format_args!("cross: the cursor was at {:.0},{:.0}, not parked at {x:.0},{y:.0}; parked again", now.0, now.1));
+                // SAFETY: a plain call taking values.
+                unsafe { SetCursorPos(x as i32, y as i32) };
+            }
+            let (dx, dy) = ((pt.0 - now.0) as i32, (pt.1 - now.1) as i32);
             if (dx, dy) == (0, 0) {
                 return SWALLOW;
             }
