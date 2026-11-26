@@ -21,13 +21,14 @@ pub struct Settings {
     /// Move the pointer over to the peer past a screen edge, with this keyboard going with it.
     /// Off until switched on: it takes this device's input while across.
     pub cross: bool,
-    /// Where the peer's screen is from here: 0 left, 1 right (as in `KvmEnter`).
+    /// Where the peer's screen is from here: 0 left, 1 right (as in `KvmEnter`). By default the
+    /// PC is right of the Mac.
     pub side: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { clipboard: true, dock: true, downloads: None, secrets: false, kvm: false, swap: true, cross: false, side: 1 }
+        Settings { clipboard: true, dock: true, downloads: None, secrets: false, kvm: false, swap: true, cross: false, side: if cfg!(windows) { 0 } else { 1 } }
     }
 }
 
@@ -42,7 +43,7 @@ impl Settings {
                 Some(("kvm", v)) => s.kvm = v == "1",
                 Some(("swap", v)) => s.swap = v == "1",
                 Some(("cross", v)) => s.cross = v == "1",
-                Some(("side", "0")) => s.side = 0,
+                Some(("side", v @ ("0" | "1"))) => s.side = u8::from(v == "1"),
                 Some(("downloads", v)) if !v.is_empty() => s.downloads = Some(v.into()),
                 _ => {}
             }
@@ -73,8 +74,12 @@ mod tests {
         let off = Settings { clipboard: false, dock: false, downloads: Some("/Users/me/받은 파일=새".into()), secrets: true, kvm: true, swap: false, cross: true, side: 0 };
         off.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), off);
+        // Either side survives, whatever this OS's default is.
+        let right = Settings { side: 1, ..off.clone() };
+        right.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir), right);
         std::fs::write(dir.join("settings.txt"), "junk\nclipboard=0\nfuture=7\n").unwrap();
-        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true, downloads: None, secrets: false, kvm: false, swap: true, cross: false, side: 1 });
+        assert_eq!(Settings::load(&dir), Settings { clipboard: false, dock: true, downloads: None, secrets: false, kvm: false, swap: true, cross: false, side: if cfg!(windows) { 0 } else { 1 } });
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

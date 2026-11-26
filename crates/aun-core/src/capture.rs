@@ -1,15 +1,14 @@
-//! macOS: crossing over to the peer past a screen edge with this Mac's own mouse and keyboard
-//! (docs/kvm-design.md 1, 2 and 7). An event tap watches the pointer; once it pushes out past
-//! the edge toward the peer, the tap swallows every mouse and key event and a sender thread
-//! turns them into `Kvm*` frames, until the pointer comes back (`KvmReturn`), the escape key,
-//! a stall, or the link going.
+//! Crossing over to the peer past a screen edge with this device's own mouse and keyboard
+//! (docs/kvm-design.md 1, 2 and 7). A tap (macOS) or low-level hooks (Windows) watch the
+//! pointer; once it pushes out past the edge toward the peer, they swallow every mouse and key
+//! event and a sender thread turns them into `Kvm*` frames, until the pointer comes back
+//! (`KvmReturn`), the escape key, a stall, or the link going.
 //!
-//! What matters most is that this Mac gets its input back. The tap callback only reads the event
+//! What matters most is that this device gets its input back. The callback only reads the event
 //! and queues it (atomics and a `try_send`, no lock, no log); every way out goes through
 //! [`State::end`], which can run on any thread and twice.
 
-use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -18,74 +17,17 @@ use crate::kvm::{self, Bounds, Captured, Driver};
 use crate::store::Id;
 use crate::Node;
 
-type Ref = *mut c_void;
+#[cfg(target_os = "macos")]
+mod mac;
+#[cfg(target_os = "macos")]
+use mac as os;
+#[cfg(target_os = "macos")]
+pub use mac::release_cursor;
+#[cfg(windows)]
+mod win;
+#[cfg(windows)]
+use win as os;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Point {
-    x: f64,
-    y: f64,
-}
-
-type Callback = extern "C" fn(proxy: Ref, kind: u32, event: Ref, user: *mut c_void) -> Ref;
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, callback: Callback, user: *mut c_void) -> Ref;
-    fn CGEventTapEnable(tap: Ref, enable: bool);
-    fn CGEventCreate(source: Ref) -> Ref;
-    fn CGEventGetIntegerValueField(e: Ref, field: u32) -> i64;
-    fn CGEventGetFlags(e: Ref) -> u64;
-    fn CGEventGetLocation(e: Ref) -> Point;
-    fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
-    fn CGWarpMouseCursorPosition(p: Point) -> i32;
-    fn CGPreflightListenEventAccess() -> bool;
-    fn CGRequestListenEventAccess() -> bool;
-}
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFMachPortCreateRunLoopSource(alloc: Ref, port: Ref, order: isize) -> Ref;
-    fn CFMachPortInvalidate(port: Ref);
-    fn CFRunLoopGetCurrent() -> Ref;
-    fn CFRunLoopAddSource(rl: Ref, source: Ref, mode: Ref);
-    fn CFRunLoopRun();
-    fn CFRunLoopStop(rl: Ref);
-    fn CFRelease(r: Ref);
-    static kCFRunLoopCommonModes: Ref;
-}
-
-const SESSION_TAP: u32 = 1;
-const HEAD_INSERT: u32 = 0;
-const ACTIVE: u32 = 0;
-// Event types.
-const LEFT_DOWN: u32 = 1;
-const LEFT_UP: u32 = 2;
-const RIGHT_DOWN: u32 = 3;
-const RIGHT_UP: u32 = 4;
-const MOVED: u32 = 5;
-const LEFT_DRAGGED: u32 = 6;
-const RIGHT_DRAGGED: u32 = 7;
-const KEY_DOWN: u32 = 10;
-const KEY_UP: u32 = 11;
-const FLAGS_CHANGED: u32 = 12;
-const SCROLL: u32 = 22;
-const OTHER_DOWN: u32 = 25;
-const OTHER_UP: u32 = 26;
-const OTHER_DRAGGED: u32 = 27;
-const DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
-const DISABLED_BY_USER: u32 = 0xFFFF_FFFF;
-// Event fields.
-const CLICK_STATE: u32 = 1;
-const BUTTON_NUMBER: u32 = 3;
-const DELTA_X: u32 = 4;
-const DELTA_Y: u32 = 5;
-const KEYCODE: u32 = 9;
-const SCROLL_POINT_Y: u32 = 96;
-const SCROLL_POINT_X: u32 = 97;
-const SOURCE_USER_DATA: u32 = 42;
-/// Shift, Control, Option, Command (`kCGEventFlagMask*`): none may be down as a crossing starts.
-const MODIFIERS: u64 = 0x1E_0000;
-const CAPS_LOCK: u16 = 0x39;
 /// Captured events waiting for the sender thread; full, the crossing ends (docs 7.4).
 const QUEUE: usize = 1024;
 /// How far from the edge the pointer must go before a crossing that ended without coming back
@@ -108,14 +50,12 @@ struct State {
     at: AtomicU32,
     /// The screens' box as last read, as `f64` bits: read again when the pointer seems past it.
     bounds: [AtomicU64; 4],
-    tap: AtomicPtr<c_void>,
-    /// The input source shortcuts, as wire key and modifiers ([`kvm::input_source_keys`]): sent
-    /// as 한/영. Read once as the tap starts.
-    lang: Vec<(u16, u64)>,
     /// Why the last crossing ended ([`Why`]), for the sender's log.
     why: AtomicU8,
-    /// Where the cursor went out, kept there while across (see the move case in [`tap`]).
+    /// Where the cursor is kept while across.
     lock: [AtomicU64; 2],
+    #[cfg(target_os = "macos")]
+    os: mac::Shared,
 }
 
 /// Why a crossing ended, logged by the sender (the tap callback may not log).
@@ -124,7 +64,9 @@ impl Why {
     const RETURNED: u8 = 0;
     const ESCAPE: u8 = 1;
     const QUEUE_FULL: u8 = 2;
+    #[cfg(target_os = "macos")]
     const TAP_TIMEOUT: u8 = 3;
+    #[cfg(target_os = "macos")]
     const TAP_USER: u8 = 4;
     const LOST: u8 = 5;
     const NO_PEER: u8 = 6;
@@ -134,21 +76,24 @@ impl Why {
     const NAMES: [&str; 10] = ["came back", "escape key", "queue full", "tap disabled by timeout", "tap disabled by user input", "no word back", "no peer", "a frame not sent", "stopped", "blocked there"];
 }
 
-/// Where the cursor is now, in global display points.
-fn cursor() -> (f64, f64) {
-    // SAFETY: an event made only to read the location, released at once.
-    unsafe {
-        let e = CGEventCreate(std::ptr::null_mut());
-        if e.is_null() {
-            return (0.0, 0.0);
-        }
-        let p = CGEventGetLocation(e);
-        CFRelease(e);
-        (p.x, p.y)
-    }
-}
-
 impl State {
+    fn new(side: u8, out: SyncSender<Captured>, b: Bounds) -> State {
+        State {
+            side,
+            out,
+            crossed: AtomicBool::new(false),
+            peer: AtomicBool::new(false),
+            armed: AtomicBool::new(true),
+            ends: AtomicU32::new(0),
+            at: AtomicU32::new(0),
+            bounds: [b.x0, b.y0, b.x1, b.y1].map(|v| AtomicU64::new(v.to_bits())),
+            why: AtomicU8::new(Why::STOPPED),
+            lock: [AtomicU64::new(0), AtomicU64::new(0)],
+            #[cfg(target_os = "macos")]
+            os: mac::Shared::new(),
+        }
+    }
+
     fn bounds(&self) -> Bounds {
         let [x0, y0, x1, y1] = self.bounds.each_ref().map(|b| f64::from_bits(b.load(Ordering::Relaxed)));
         Bounds { x0, y0, x1, y1 }
@@ -162,6 +107,15 @@ impl State {
         b
     }
 
+    fn lock_at(&self, (x, y): (f64, f64)) {
+        self.lock.iter().zip([x, y]).for_each(|(a, v)| a.store(v.to_bits(), Ordering::Relaxed));
+    }
+
+    fn locked(&self) -> (f64, f64) {
+        let [x, y] = self.lock.each_ref().map(|a| f64::from_bits(a.load(Ordering::Relaxed)));
+        (x, y)
+    }
+
     /// Ends the crossing, if one is on: gives the pointer back at the edge, `at` along it if it
     /// came back there (`KvmReturn`), else where it went out, and owes the peer a `KvmLeave`.
     /// Without `at` (escape, a stall, the link gone) a new crossing waits until the pointer has
@@ -173,23 +127,13 @@ impl State {
         self.why.store(why, Ordering::Relaxed);
         self.armed.store(at.is_some(), Ordering::Relaxed);
         let at = at.unwrap_or(self.at.load(Ordering::Relaxed) as u16);
-        let (x, y) = kvm::entry(self.reread(), self.side, at);
-        // SAFETY: plain calls taking values.
-        unsafe {
-            CGWarpMouseCursorPosition(Point { x, y });
-            CGAssociateMouseAndMouseCursorPosition(true);
-        }
+        os::give_back(kvm::entry(self.reread(), self.side, at));
         self.ends.fetch_add(1, Ordering::SeqCst);
     }
 
     /// How far the pointer at `p` is from the edge toward the peer.
-    fn edge_distance(&self, b: Bounds, p: Point) -> f64 {
-        match self.side {
-            0 => p.x - b.x0,
-            1 => b.x1 - 1.0 - p.x,
-            2 => p.y - b.y0,
-            _ => b.y1 - 1.0 - p.y,
-        }
+    fn edge_distance(&self, b: Bounds, p: (f64, f64)) -> f64 {
+        distance(b, self.side, p)
     }
 
     fn send(&self, c: Captured) -> bool {
@@ -201,114 +145,57 @@ impl State {
     }
 }
 
-/// The wire modifiers held, from an event's per-side flag bits (see [`kvm::escape`]).
-fn mods(flags: u64) -> u8 {
-    [0x3B, 0x38, 0x3A, 0x37, 0x3E, 0x3C, 0x3D, 0x36].iter().enumerate().fold(0, |m, (i, &code)| m | (u8::from(kvm::mac_modifier(code, flags).is_some_and(|k| k.1)) << i))
+/// How far `(x, y)` is from `side`'s edge of `b`: 0 on its pixels, below 0 past it.
+fn distance(b: Bounds, side: u8, (x, y): (f64, f64)) -> f64 {
+    match side {
+        0 => x - b.x0,
+        1 => b.x1 - 1.0 - x,
+        2 => y - b.y0,
+        _ => b.y1 - 1.0 - y,
+    }
 }
 
-extern "C" fn tap(_proxy: Ref, kind: u32, e: Ref, user: *mut c_void) -> Ref {
-    // SAFETY: `user` is the `State` this tap was made with, alive until the tap is gone.
-    let st = unsafe { &*(user as *const State) };
-    // SAFETY: `e` is the event the system hands this callback, valid during it.
-    let field = |f| unsafe { CGEventGetIntegerValueField(e, f) };
-    if kind == DISABLED_BY_TIMEOUT || kind == DISABLED_BY_USER {
-        // Too slow once (or turned off): input back here, and the tap on again (docs 7.4).
-        st.end(None, if kind == DISABLED_BY_TIMEOUT { Why::TAP_TIMEOUT } else { Why::TAP_USER });
-        // SAFETY: the tap this callback belongs to.
-        unsafe { CGEventTapEnable(st.tap.load(Ordering::Relaxed), true) };
-        return e;
+/// Windows: where along `side`'s edge a move from the cursor at `from` to `to` pushes out past
+/// it. The low-level hook hands over where the pointer would go, which Windows may already have
+/// kept on the screens (unverified): so a push is a move from the edge's pixels to them or past.
+/// shortcut: a move along the edge while on it crosses too; Raw Input deltas would tell.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pushed(b: Bounds, side: u8, from: (f64, f64), to: (f64, f64)) -> Option<u16> {
+    if distance(b, side, from) > 0.0 || distance(b, side, to) > 0.0 {
+        return None;
     }
-    // What Aun itself posted (a peer driving this Mac): never a crossing, never swallowed.
-    if field(SOURCE_USER_DATA) == kvm::MARK {
-        return e;
-    }
-    if !st.crossed.load(Ordering::SeqCst) {
-        // Only a plain move starts one: a button or modifier down here would never come up here.
-        // SAFETY: as above.
-        if kind != MOVED || unsafe { CGEventGetFlags(e) } & MODIFIERS != 0 || !st.peer.load(Ordering::Relaxed) {
-            return e;
-        }
-        // SAFETY: as above.
-        let p = unsafe { CGEventGetLocation(e) };
-        let (dx, dy) = (field(DELTA_X) as f64, field(DELTA_Y) as f64);
-        if !st.armed.load(Ordering::Relaxed) {
-            if st.edge_distance(st.bounds(), p) >= REARM {
-                st.armed.store(true, Ordering::Relaxed);
-            }
-            return e;
-        }
-        if kvm::past(st.bounds(), st.side, (p.x, p.y), dx, dy).is_none() {
-            return e;
-        }
-        // Past the box last read: read it again (a display changed) before going.
-        let Some(at) = kvm::past(st.reread(), st.side, (p.x, p.y), dx, dy) else { return e };
-        // Not queued, it never started: the sender counts crossings by their Enter.
-        if st.out.try_send(Captured::Enter(at)).is_err() {
-            return e;
-        }
-        st.at.store(at.into(), Ordering::Relaxed);
-        st.lock.iter().zip([p.x, p.y]).for_each(|(a, v)| a.store(v.to_bits(), Ordering::Relaxed));
-        st.crossed.store(true, Ordering::SeqCst);
-        // SAFETY: a plain call. The pointer stays where it is; the deltas still come.
-        unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
-        return std::ptr::null_mut();
-    }
-    // SAFETY: as above.
-    let flags = unsafe { CGEventGetFlags(e) };
-    let c = match kind {
-        MOVED | LEFT_DRAGGED | RIGHT_DRAGGED | OTHER_DRAGGED => {
-            // Detached above, the cursor still follows the mouse unless Aun is the front app (seen
-            // 2026-11-22 from a background process): put it back each time. Measured then: the
-            // deltas keep coming at the same rate and don't take the warp in.
-            let [x, y] = st.lock.each_ref().map(|a| f64::from_bits(a.load(Ordering::Relaxed)));
-            // SAFETY: a plain call taking a value.
-            unsafe { CGWarpMouseCursorPosition(Point { x, y }) };
-            Captured::Move(field(DELTA_X) as i32, field(DELTA_Y) as i32)
-        }
-        LEFT_DOWN | LEFT_UP => Captured::Button(0, kind == LEFT_DOWN, field(CLICK_STATE).clamp(1, 255) as u8),
-        RIGHT_DOWN | RIGHT_UP => Captured::Button(1, kind == RIGHT_DOWN, field(CLICK_STATE).clamp(1, 255) as u8),
-        OTHER_DOWN | OTHER_UP if field(BUTTON_NUMBER) == 2 => Captured::Button(2, kind == OTHER_DOWN, field(CLICK_STATE).clamp(1, 255) as u8),
-        SCROLL => Captured::Wheel(field(SCROLL_POINT_X) as i32, field(SCROLL_POINT_Y) as i32),
-        KEY_DOWN | KEY_UP => {
-            let Some(hid) = kvm::hid_of(field(KEYCODE) as u32) else { return std::ptr::null_mut() };
-            if kind == KEY_DOWN && kvm::escape(hid, mods(flags)) {
-                st.end(None, Why::ESCAPE);
-                return std::ptr::null_mut();
-            }
-            // The input source shortcut (this Mac: Caps Lock made F18) is 한/영 over there, sent
-            // on the way down; its up goes nowhere. Swallowed, this Mac's own source stays.
-            if kvm::is_input_source_key(hid, flags, &st.lang) {
-                if kind == KEY_DOWN && st.send(Captured::Key(0x90, true)) {
-                    st.send(Captured::Key(0x90, false));
-                }
-                return std::ptr::null_mut();
-            }
-            Captured::Key(hid, kind == KEY_DOWN)
-        }
-        FLAGS_CHANGED => {
-            let code = field(KEYCODE) as u16;
-            if code == CAPS_LOCK {
-                // Comes once per press, as the lock toggles: a press there.
-                if st.send(Captured::Key(0x39, true)) {
-                    st.send(Captured::Key(0x39, false));
-                }
-                return std::ptr::null_mut();
-            }
-            let Some((hid, down)) = kvm::mac_modifier(code, flags) else { return std::ptr::null_mut() };
-            Captured::Key(hid, down)
-        }
-        _ => return std::ptr::null_mut(),
-    };
-    st.send(c);
-    std::ptr::null_mut()
+    let (dx, dy) = [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)][usize::from(side.min(3))];
+    kvm::past(b, side, (to.0.clamp(b.x0, b.x1 - 1.0), to.1.clamp(b.y0, b.y1 - 1.0)), dx, dy)
 }
 
-/// Crossing to a peer with this Mac's mouse and keyboard: the tap, and the thread sending what
-/// it takes. Dropped, the tap goes and input is back here.
+/// Windows: the click count of a button going down at `time` (ms), given the last down as
+/// `(button, time, count)`: one more when the same button comes again within `within` ms. The
+/// cursor stays put while across, so distance can't tell, unlike Windows' own count.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn clicks(last: &mut (u8, u32, u8), button: u8, time: u32, within: u32) -> u8 {
+    let n = if last.2 > 0 && last.0 == button && time.wrapping_sub(last.1) <= within { last.2.saturating_add(1) } else { 1 };
+    *last = (button, time, n);
+    n
+}
+
+/// Windows: wheel units (120 a notch) as wire pixels, keeping what's left over in `rest` so a
+/// touchpad's small steps add up.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wheel_px(rest: &mut i32, units: i32) -> i32 {
+    /// shortcut: the receiver's guess at a notch, `PX_PER_NOTCH` in kvm.rs; tune on the device.
+    const PX_PER_NOTCH: i32 = 40;
+    *rest += units * PX_PER_NOTCH;
+    let px = *rest / 120;
+    *rest -= px * 120;
+    px
+}
+
+/// Crossing to a peer with this device's mouse and keyboard: the tap, and the thread sending
+/// what it takes. Dropped, the tap goes and input is back here.
 pub struct Cross {
     st: Arc<State>,
-    /// The tap thread's run loop, to stop it.
-    rl: usize,
+    /// What stops the tap's thread (macOS: its run loop, Windows: its thread id).
+    stop: usize,
     target: Arc<Mutex<Option<Id>>>,
     route: Arc<AtomicU32>,
     swap: Arc<AtomicBool>,
@@ -316,61 +203,14 @@ pub struct Cross {
 
 impl Cross {
     /// Starts watching for the pointer at the `side` edge (0 left, 1 right, 2 top, 3 bottom).
-    /// Err when macOS doesn't let Aun see input: Input Monitoring asked for, or not granted.
+    /// Err when the OS doesn't let Aun see input (macOS: Input Monitoring asked for, or not
+    /// granted) or the tap can't be made.
     pub fn start(node: Node, side: u8, swap: bool) -> Result<Cross, String> {
-        // SAFETY: plain calls.
-        let listen = unsafe { CGPreflightListenEventAccess() };
-        crate::log(format_args!("cross: Input Monitoring granted: {listen}, Accessibility: {}", kvm::allowed(false)));
-        // SAFETY: a plain call; it opens the system's request the first time.
-        if !listen && !unsafe { CGRequestListenEventAccess() } {
-            return Err("Input Monitoring not granted".into());
-        }
         let (out, rx) = mpsc::sync_channel(QUEUE);
         let b = kvm::screen_bounds().ok_or("no display")?;
-        let st = Arc::new(State {
-            side,
-            out,
-            crossed: AtomicBool::new(false),
-            peer: AtomicBool::new(false),
-            armed: AtomicBool::new(true),
-            ends: AtomicU32::new(0),
-            at: AtomicU32::new(0),
-            bounds: [b.x0, b.y0, b.x1, b.y1].map(|v| AtomicU64::new(v.to_bits())),
-            tap: AtomicPtr::new(std::ptr::null_mut()),
-            why: AtomicU8::new(Why::STOPPED),
-            lang: kvm::input_source_keys(),
-            lock: [AtomicU64::new(0), AtomicU64::new(0)],
-        });
-        let (made_tx, made) = mpsc::sync_channel(1);
-        let user = Arc::into_raw(st.clone()) as usize;
-        std::thread::Builder::new().name("aun-tap".into()).spawn(move || {
-            let mask = [LEFT_DOWN, LEFT_UP, RIGHT_DOWN, RIGHT_UP, MOVED, LEFT_DRAGGED, RIGHT_DRAGGED, KEY_DOWN, KEY_UP, FLAGS_CHANGED, SCROLL, OTHER_DOWN, OTHER_UP, OTHER_DRAGGED].iter().fold(0u64, |m, t| m | 1 << t);
-            // SAFETY: `user` is a `State` kept alive (the raw Arc) until after this run loop
-            // stops and the tap is invalidated; the source and tap are released here.
-            unsafe {
-                let port = CGEventTapCreate(SESSION_TAP, HEAD_INSERT, ACTIVE, mask, tap, user as *mut c_void);
-                if port.is_null() {
-                    drop(Arc::from_raw(user as *const State));
-                    let _ = made_tx.send(None);
-                    return;
-                }
-                (*(user as *const State)).tap.store(port, Ordering::Relaxed);
-                let src = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), port, 0);
-                let rl = CFRunLoopGetCurrent();
-                CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
-                CGEventTapEnable(port, true);
-                let _ = made_tx.send(Some(rl as usize));
-                CFRunLoopRun();
-                CGEventTapEnable(port, false);
-                CFMachPortInvalidate(port);
-                CFRelease(src);
-                CFRelease(port);
-                let st = Arc::from_raw(user as *const State);
-                st.end(None, Why::STOPPED);
-            }
-        }).map_err(|e| e.to_string())?;
-        let rl = made.recv().ok().flatten().ok_or("event tap not made (a permission missing?)")?;
-        let cross = Cross { st: st.clone(), rl, target: Default::default(), route: Default::default(), swap: Arc::new(AtomicBool::new(swap)) };
+        let st = Arc::new(State::new(side, out, b));
+        let stop = os::start(&st)?;
+        let cross = Cross { st: st.clone(), stop, target: Default::default(), route: Default::default(), swap: Arc::new(AtomicBool::new(swap)) };
         let (target, route, swap, weak) = (cross.target.clone(), cross.route.clone(), cross.swap.clone(), Arc::downgrade(&st));
         drop(st); // the sender holds it weakly: gone with the tap, its queue closes and it ends
         std::thread::Builder::new().name("aun-cross".into()).spawn(move || sender(rx, &weak, &node, &target, &route, &swap)).map_err(|e| e.to_string())?;
@@ -423,21 +263,8 @@ impl Drop for Cross {
     fn drop(&mut self) {
         self.st.peer.store(false, Ordering::Relaxed);
         self.st.end(None, Why::STOPPED);
-        // SAFETY: the tap (alive until its thread invalidates it after the run loop stops), then
-        // that thread's run loop. Off first, so a stop that lands before the loop runs leaves no
-        // live tap.
-        unsafe {
-            CGEventTapEnable(self.st.tap.load(Ordering::Relaxed), false);
-            CFRunLoopStop(self.rl as Ref);
-        }
+        os::stop(&self.st, self.stop);
     }
-}
-
-/// Puts the cursor back with the mouse, for a panic or a quit while across: whether macOS does
-/// it when the process ends is not known (docs 7.5).
-pub fn release_cursor() {
-    // SAFETY: a plain call.
-    unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
 }
 
 /// Sends what the tap took, in order, and one `KvmLeave` per crossing that ended. Wakes every
@@ -474,8 +301,9 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
                 }
                 started += 1;
                 to = *target.lock().unwrap();
-                let (x, y) = cursor();
-                crate::log(format_args!("cross: in at {x:.0},{y:.0}"));
+                let (x, y) = os::cursor();
+                let b = st.bounds();
+                crate::log(format_args!("cross: in at {x:.0},{y:.0} (screens {:.0},{:.0} to {:.0},{:.0})", b.x0, b.y0, b.x1, b.y1));
             }
             let Some(id) = to else {
                 st.end(None, Why::NO_PEER);
@@ -497,5 +325,48 @@ fn sender(rx: Receiver<Captured>, st: &Weak<State>, node: &Node, target: &Mutex<
         if started != left && st.ends.load(Ordering::SeqCst) > left {
             leave(to, &mut left, &st);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const B: Bounds = Bounds { x0: 0.0, y0: 0.0, x1: 1920.0, y1: 1080.0 };
+
+    #[test]
+    fn a_push_crosses_only_from_the_edge() {
+        // Peer on the left: on the edge and pushed (kept on it, or past it) goes, halfway down.
+        assert_eq!(pushed(B, 0, (0.0, 540.0), (0.0, 540.0)), Some(32_798));
+        assert_eq!(pushed(B, 0, (0.0, 540.0), (-7.0, 540.0)), Some(32_798));
+        // Arriving at the edge is not yet a push; nor is leaving it, nor another edge.
+        assert_eq!(pushed(B, 0, (5.0, 540.0), (0.0, 540.0)), None);
+        assert_eq!(pushed(B, 0, (0.0, 540.0), (3.0, 540.0)), None);
+        assert_eq!(pushed(B, 0, (1919.0, 540.0), (1919.0, 540.0)), None);
+        // Peer on the right: the last pixel column is the edge.
+        assert_eq!(pushed(B, 1, (1919.0, 0.0), (1919.0, 0.0)), Some(0));
+        assert_eq!(pushed(B, 1, (1918.0, 0.0), (1919.0, 0.0)), None);
+    }
+
+    #[test]
+    fn clicks_count_up_only_for_the_same_button_in_time() {
+        let mut last = (0, 0, 0);
+        assert_eq!(clicks(&mut last, 0, 1000, 500), 1);
+        assert_eq!(clicks(&mut last, 0, 1400, 500), 2);
+        assert_eq!(clicks(&mut last, 0, 1800, 500), 3);
+        assert_eq!(clicks(&mut last, 0, 2400, 500), 1, "too late");
+        assert_eq!(clicks(&mut last, 1, 2500, 500), 1, "another button");
+        // The tick count wraps after 49 days.
+        let mut last = (0, u32::MAX - 100, 1);
+        assert_eq!(clicks(&mut last, 0, 100, 500), 2);
+    }
+
+    #[test]
+    fn small_wheel_steps_add_up_and_notches_go_whole() {
+        let mut rest = 0;
+        assert_eq!(wheel_px(&mut rest, 120), 40);
+        assert_eq!(wheel_px(&mut rest, -240), -80);
+        // A touchpad's 1-unit steps: nothing for two, then a pixel on the third.
+        assert_eq!([1, 1, 1].map(|u| wheel_px(&mut rest, u)), [0, 0, 1]);
     }
 }

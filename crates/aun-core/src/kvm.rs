@@ -82,7 +82,6 @@ pub fn mac_modifier(code: u16, flags: u64) -> Option<(u16, bool)> {
 
 /// On what Aun injects ("AUN1"), so its own capture can tell it apart: Windows `dwExtraInfo`,
 /// macOS `kCGEventSourceUserData`.
-#[cfg(target_os = "macos")]
 pub(crate) const MARK: i64 = 0x4155_4E31;
 
 /// Control and ⌘ (the Windows key) swapped, left and right, when `swap` (the app's setting).
@@ -94,10 +93,14 @@ pub fn swapped(hid: u16, swap: bool) -> u16 {
     }
 }
 
-/// macOS: the box around every display, in global display points.
+/// The box around every display: macOS global display points, Windows virtual screen pixels.
 #[cfg(target_os = "macos")]
 pub(crate) fn screen_bounds() -> Option<Bounds> {
     mac::bounds()
+}
+#[cfg(windows)]
+pub(crate) fn screen_bounds() -> Option<Bounds> {
+    Some(win::bounds())
 }
 
 /// What a capture saw, in wire terms.
@@ -789,8 +792,8 @@ mod win {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-    /// In `dwExtraInfo` of what Aun injects, so a later capture hook can tell it apart.
-    pub const MARK: usize = 0x4155_4E31; // "AUN1"
+    /// In `dwExtraInfo` of what Aun injects, so the capture hook can tell it apart.
+    pub const MARK: usize = super::MARK as usize;
     /// A virtual key no layout assigns (`0xE8`), pressed to keep Win or Alt from acting alone.
     const MASK_KEY: u16 = 0xE8;
     /// Pixels of scrolling per wheel notch (`WHEEL_DELTA`, 120).
